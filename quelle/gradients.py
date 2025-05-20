@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from accelerate.utils import send_to_device
 from torch import nn
 from tqdm.auto import trange
@@ -52,8 +53,13 @@ def build_index(
         if index is None:
             index = IndexFlat(grad.shape[0])
 
-        # Type signatures of the faiss library are completely broken
-        index.add(grad.cpu().unsqueeze(0).numpy())  # type: ignore
+        if dist.is_initialized():
+            buf = grad.new_empty(dist.get_world_size(), grad.shape[0])
+            dist.all_gather_into_tensor(buf, grad)
+
+            index.add(buf.cpu().numpy())  # type: ignore
+        else:
+            index.add(grad.cpu().unsqueeze(0).numpy())  # type: ignore
 
     return index
 
@@ -68,8 +74,9 @@ def estimate_preconditioner(
     Estimate the second moment matrix of the projected gradients.
     """
     preconditioner = None
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
-    for i in trange(num_examples):
+    for i in trange(num_examples, position=rank):
         example = send_to_device(data[i], model.device)
 
         x = example["input_ids"].unsqueeze(0)
@@ -84,6 +91,13 @@ def estimate_preconditioner(
         else:
             preconditioner.addmm_(grad[:, None], grad[None], alpha=1 / num_examples)
 
+    # Sanity check
+    assert preconditioner is not None, "num_examples must be > 0"
+
+    if dist.is_initialized():
+        dist.all_reduce(preconditioner)
+        preconditioner /= dist.get_world_size()
+
     return preconditioner
 
 
@@ -96,8 +110,9 @@ def estimate_second_moments(
     Estimate the second moments of the model's gradients using a subset of the dataset.
     """
     moments: dict[str, torch.Tensor] = {}
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
-    for i in range(num_examples):
+    for i in trange(num_examples, position=rank):
         example = send_to_device(data[i], model.device)
 
         x = example["input_ids"].unsqueeze(0)
@@ -111,7 +126,13 @@ def estimate_second_moments(
                 moments[name] = torch.zeros_like(g)
 
             # Accumulate the second moment
-            moments[name] += g.square() / num_examples
+            acc = g.square() / num_examples
+
+            if dist.is_initialized():
+                dist.all_reduce(acc)
+                acc /= dist.get_world_size()
+
+            moments[name] += acc
 
         model.zero_grad()
 
