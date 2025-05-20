@@ -1,16 +1,97 @@
 import torch
 from accelerate.utils import send_to_device
 from torch import nn
+from tqdm.auto import trange
 from transformers import PreTrainedModel
 
 from .data import MemmapDataset
+
+
+def apply_second_moments(
+    model: nn.Module,
+    moments: dict[str, torch.Tensor],
+    eps: float = 1e-8,
+):
+    """Precondition the model's gradients using the second moments."""
+    for name, param in model.named_parameters():
+        if (g := param.grad) is None:
+            continue
+
+        # We don't have any second moment for this parameter
+        if name not in moments:
+            continue
+
+        g /= moments[name].add(eps).sqrt()
+
+    return moments
+
+
+def build_index(
+    model: PreTrainedModel,
+    data: MemmapDataset,
+    moments: dict[str, torch.Tensor],
+    num_examples: int = 1000,
+):
+    """
+    Compute projected gradients using a subset of the dataset.
+    """
+    from faiss import IndexFlat
+
+    index = None
+
+    for i in trange(num_examples):
+        example = send_to_device(data[i], model.device)
+
+        x = example["input_ids"].unsqueeze(0)
+        model(x, labels=x).loss.backward()
+
+        apply_second_moments(model, moments)
+        grad = project_grads(model)
+        model.zero_grad()
+
+        if index is None:
+            index = IndexFlat(grad.shape[0])
+
+        # Type signatures of the faiss library are completely broken
+        index.add(grad.cpu().unsqueeze(0).numpy())  # type: ignore
+
+    return index
+
+
+def estimate_preconditioner(
+    model: PreTrainedModel,
+    data: MemmapDataset,
+    moments: dict[str, torch.Tensor],
+    num_examples: int = 1000,
+):
+    """
+    Estimate the second moment matrix of the projected gradients.
+    """
+    preconditioner = None
+
+    for i in trange(num_examples):
+        example = send_to_device(data[i], model.device)
+
+        x = example["input_ids"].unsqueeze(0)
+        model(x, labels=x).loss.backward()
+
+        apply_second_moments(model, moments)
+        grad = project_grads(model)
+        model.zero_grad()
+
+        if preconditioner is None:
+            preconditioner = torch.outer(grad, grad) / num_examples
+        else:
+            preconditioner.addmm_(grad[:, None], grad[None], alpha=1 / num_examples)
+
+    return preconditioner
 
 
 def estimate_second_moments(
     model: PreTrainedModel,
     data: MemmapDataset,
     num_examples: int = 1000,
-):
+) -> dict[str, torch.Tensor]:
     """
     Estimate the second moments of the model's gradients using a subset of the dataset.
     """
