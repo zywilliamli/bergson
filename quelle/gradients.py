@@ -1,6 +1,9 @@
+import faiss
+import psutil
 import torch
 import torch.distributed as dist
 from accelerate.utils import send_to_device
+from datasets import Dataset
 from torch import nn
 from tqdm.auto import trange
 from transformers import PreTrainedModel
@@ -27,11 +30,13 @@ def apply_second_moments(
     return moments
 
 
+@torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported())
 def build_index(
     model: PreTrainedModel,
-    data: MemmapDataset,
+    data: Dataset | MemmapDataset,
     moments: dict[str, torch.Tensor],
-    num_examples: int = 1000,
+    path: str,
+    num_examples: int = 0,
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -39,34 +44,76 @@ def build_index(
     from faiss import IndexFlat
 
     index = None
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    for i in trange(num_examples):
+    # Use the entire dataset
+    if num_examples <= 0:
+        num_examples = len(data)
+    else:
+        num_examples = min(num_examples, len(data))
+
+    chunk_size = num_examples
+    chunk_idx = 0
+
+    for i in trange(num_examples // world_size, position=rank):
         example = send_to_device(data[i], model.device)
 
         x = example["input_ids"].unsqueeze(0)
         model(x, labels=x).loss.backward()
 
         apply_second_moments(model, moments)
-        grad = project_grads(model)
+        grad = project_grads(model).float()
         model.zero_grad()
 
-        if index is None:
+        if index is None and rank == 0:
             index = IndexFlat(grad.shape[0])
 
-        if dist.is_initialized():
-            buf = grad.new_empty(dist.get_world_size(), grad.shape[0])
-            dist.all_gather_into_tensor(buf, grad)
+            print(f"Total dataset size: {len(data):_}")
+            if num_examples < len(data):
+                print(f"Using only {num_examples:_} examples for the index")
 
-            index.add(buf.cpu().numpy())  # type: ignore
+            # Figure out how much RAM we have
+            ram = psutil.virtual_memory().available
+            print(f"RAM available: {ram / 2**30:.2f} GB")
+
+            print(f"Grad dimension: {grad.shape[0]}")
+            grad_size = grad.element_size() * grad.numel()
+
+            # Check if we can fit the index in RAM
+            chunk_size = min(chunk_size, ram // (grad_size * 2))
+            if chunk_size < num_examples:
+                print(f"Conservatively using chunk size of {chunk_size:_} examples")
+
+        if dist.is_initialized():
+            # Master rank needs to actually add the gradients to the index
+            if rank == 0:
+                bufs = [torch.empty_like(grad) for _ in range(world_size)]
+                dist.gather(grad, bufs)
+
+                vecs = torch.stack(bufs).cpu().numpy()
+                index.add(vecs)  # type: ignore
+            else:
+                # Other ranks just send the gradients to the master rank
+                dist.gather(grad, None)
         else:
             index.add(grad.cpu().unsqueeze(0).numpy())  # type: ignore
 
-    return index
+        # Check chunk size
+        if index is not None and index.ntotal >= chunk_size:
+            # Save the index to disk
+            idx_path = path + f"/index_{chunk_idx}.faiss"
+            print(f"Saving index to {idx_path}")
+            faiss.write_index(idx_path, index)
+
+            # Reset the index
+            index = IndexFlat(grad.shape[0])
+            chunk_idx += 1
 
 
 def estimate_preconditioner(
     model: PreTrainedModel,
-    data: MemmapDataset,
+    data: Dataset | MemmapDataset,
     moments: dict[str, torch.Tensor],
     num_examples: int = 1000,
 ):
@@ -103,7 +150,7 @@ def estimate_preconditioner(
 
 def estimate_second_moments(
     model: PreTrainedModel,
-    data: MemmapDataset,
+    data: Dataset | MemmapDataset,
     num_examples: int = 1000,
 ) -> dict[str, torch.Tensor]:
     """
@@ -140,7 +187,7 @@ def estimate_second_moments(
 
 
 @torch.inference_mode()
-def project_grads(mod: nn.Module, target_dim: int = 32, *, seed: int = 0):
+def project_grads(mod: nn.Module, target_dim: int = 16, *, seed: int = 0):
     """Randomly project gradients to a lower dimension.
 
     Only matrix-valued gradients are affected since vector-valued gradients contribute
