@@ -4,197 +4,113 @@ import os
 from typing import Dict
 
 import torch
-from examples.wikitext.pipeline import get_wikitext_dataset
 from kronfluence.analyzer import Analyzer, prepare_model
 from kronfluence.arguments import FactorArguments
 from kronfluence.utils.common.factor_arguments import all_low_precision_factor_arguments
 from kronfluence.utils.dataset import DataLoaderKwargs
 from language_task import LanguageModelingTask
-from transformers import GPTNeoXForCausalLM, default_data_collator
+from torch.utils import data
+from transformers import default_data_collator
+
+from quelle.approx_unrolling.logger_config import get_logger
+from quelle.approx_unrolling.model_checkpoints import ModelCheckpointManager
 
 BATCH_TYPE = Dict[str, torch.Tensor]
+logger = get_logger(__name__)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Influence analysis on WikiText dataset."
-    )
-
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="./checkpoints",
-        help="A path that is storing the final checkpoint of the model.",
-    )
-
-    parser.add_argument(
-        "--factor_strategy",
-        type=str,
-        default="ekfac",
-        help="Strategy to compute influence factors.",
-    )
-    parser.add_argument(
-        "--query_gradient_rank",
-        type=int,
-        default=-1,
-        help="Rank for the low-rank query gradient approximation.",
-    )
-    parser.add_argument(
-        "--use_half_precision",
-        action="store_true",
-        default=False,
-        help="Whether to use half precision for computing factors and scores.",
-    )
-    parser.add_argument(
-        "--use_compile",
-        action="store_true",
-        default=False,
-        help="Whether to use torch compile for computing factors and scores.",
-    )
-    parser.add_argument(
-        "--query_batch_size",
-        type=int,
-        default=8,
-        help="Batch size for computing query gradients.",
-    )
-    parser.add_argument(
-        "--train_batch_size",
-        type=int,
-        default=8,
-        help="Batch size for computing query gradients.",
-    )
-    parser.add_argument(
-        "--per_device_batch_size",
-        type=int,
-        default=None,
-        help="Batch size for computing matrices.",
-    )
-    parser.add_argument(
-        "--compute_per_token_scores",
-        action="store_true",
-        default=False,
-        help="Boolean flag to compute per token scores.",
-    )
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        default=False,
-        help="Boolean flag to profile computations.",
-    )
-
-    args = parser.parse_args()
-
-    if args.checkpoint_dir is not None:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-    return args
-
-
-def main():
-    args = parse_args()
+def compute_EK_FAC(
+    model: torch.nn.Module,
+    task: LanguageModelingTask,
+    train_dataset: data.Dataset,
+    output_dir: str,
+    EK_FAC_args: argparse.Namespace,
+):
     logging.basicConfig(level=logging.INFO)
-    # args = SimpleNamespace(
-    #     query_batch_size=32,
-    #     train_batch_size=64,
-    #     checkpoint_dir="/home/louis/kronfluence/examples/wikitext/checkpoints",
-    #     factor_strategy="ekfac",
-    #     use_half_precision=True,
-    #     use_compile=False,
-    #     compute_per_token_scores=False,
-    #     query_gradient_rank=-1,
-    #     profile=False,
-    #     per_device_batch_size=32,
-    # )
-    # Prepare the dataset.
-    train_dataset = get_wikitext_dataset(
-        split="eval_train",
-    )
-    # eval_dataset = get_wikitext_dataset(
-    #     split="valid",
-    # )
-
-    # Prepare the trained model.
-    # model = construct_gpt2()
-
-    model_str = "EleutherAI/pythia-14m"
-    step = 143000
-    model = GPTNeoXForCausalLM.from_pretrained(
-        model_str,
-        revision=f"step{step}",
-        device_map="cuda:0",
-    )
-
-    # checkpoint_path = os.path.join(args.checkpoint_dir, "model.pth")
-    # if not os.path.isfile(checkpoint_path):
-    #     raise ValueError(f"No checkpoint found at {checkpoint_path}.")
-    # model.load_state_dict(torch.load(checkpoint_path))
 
     # Define task and prepare model.
-    task = LanguageModelingTask(module_keys=[m[0] for m in model.named_modules()])
     model = prepare_model(model, task)
 
-    if args.use_compile:
-        model = torch.compile(model)
+    if EK_FAC_args.use_compile:
+        model = torch.compile(model)  # type: ignore
 
     analyzer = Analyzer(
-        analysis_name="wikitext",
-        model=model,  # type: ignore (because)
+        analysis_name="CHANGE_THIS",
+        output_dir=output_dir,
+        model=model,
         task=task,
-        profile=args.profile,
+        profile=EK_FAC_args.profile,
     )
     # Configure parameters for DataLoader.
     dataloader_kwargs = DataLoaderKwargs(collate_fn=default_data_collator)
     analyzer.set_dataloader_kwargs(dataloader_kwargs)
 
     # Compute influence factors.
-    factors_name = args.factor_strategy
-    factor_args = FactorArguments(strategy=args.factor_strategy)
-    if args.use_half_precision:
+    factors_name = EK_FAC_args.factor_strategy
+    factor_args = FactorArguments(strategy=EK_FAC_args.factor_strategy)
+    if EK_FAC_args.use_half_precision:
         factor_args = all_low_precision_factor_arguments(
-            strategy=args.factor_strategy, dtype=torch.bfloat16
+            strategy=EK_FAC_args.factor_strategy, dtype=torch.bfloat16
         )
         factors_name += "_half"
-    if args.use_compile:
+    if EK_FAC_args.use_compile:
         factors_name += "_compile"
     analyzer.fit_all_factors(
         factors_name=factors_name,
         dataset=train_dataset,
-        per_device_batch_size=args.per_device_batch_size,
+        per_device_batch_size=EK_FAC_args.per_device_batch_size,
         factor_args=factor_args,
         initial_per_device_batch_size_attempt=64,
         overwrite_output_dir=False,
     )
 
-    # # Compute pairwise scores.
-    # score_args = ScoreArguments()
-    # scores_name = factor_args.strategy
-    # if args.use_half_precision:
-    #     score_args = all_low_precision_score_arguments(dtype=torch.bfloat16)
-    #     scores_name += "_half"
-    # if args.use_compile:
-    #     scores_name += "_compile"
-    # if args.compute_per_token_scores:
-    #     score_args.compute_per_token_scores = True
-    #     scores_name += "_per_token"
-    # rank = args.query_gradient_rank if args.query_gradient_rank != -1 else None
-    # if rank is not None:
-    #     score_args.query_gradient_low_rank = rank
-    #     score_args.query_gradient_accumulation_steps = 10
-    #     scores_name += f"_qlr{rank}"
-    # analyzer.compute_pairwise_scores(
-    #     scores_name=scores_name,
-    #     score_args=score_args,
-    #     factors_name=factors_name,
-    #     query_dataset=eval_dataset,
-    #     train_dataset=train_dataset,
-    #     per_device_query_batch_size=args.query_batch_size,
-    #     per_device_train_batch_size=args.train_batch_size,
-    #     overwrite_output_dir=False,
-    # )
 
-    # scores = analyzer.load_pairwise_scores(scores_name)["all_modules"]  # type: ignore
-    # logging.info(f"Scores shape: {scores.shape}")
+def compute_EK_FAC_checkpoints(
+    checkpoint_manager: ModelCheckpointManager,
+    task: LanguageModelingTask,
+    train_dataset: data.Dataset,
+    EK_FAC_args: argparse.Namespace,
+    device="cuda",
+):
+    """Loads the model from the checkpoint directory and computes the EK-FAC matrix."""
+    model_dir = checkpoint_manager.checkpoints_dir / checkpoint_manager.model_name
+
+    # Check if the model directory exists
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
+
+    for checkpoint in checkpoint_manager.checkpoint_list:
+        checkpoint_path = model_dir / f"checkpoint_{checkpoint}" / "model.pt"
+        # Check if the checkpoint file exists
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint file {checkpoint_path} does not exist."
+            )
+
+        # Load the model from the checkpoint
+
+        loaded_checkpoint = checkpoint_manager.load_checkpoint(
+            checkpoint, device=device
+        )
+
+        output_dir = model_dir / f"checkpoint_{checkpoint}" / "influence_results"
+
+        compute_EK_FAC(
+            model=loaded_checkpoint,
+            output_dir=str(output_dir),  # maybe keeping as Path is fine
+            task=task,
+            train_dataset=train_dataset,
+            EK_FAC_args=EK_FAC_args,
+        )
+
+        logger.info(
+            f"Computed EK-FAC for checkpoint {checkpoint} and saved to {output_dir} \n"
+            + "-" * 50
+        )
 
 
-if __name__ == "__main__":
-    main()
+def prepare_hessians(
+    checkpoint_manager: ModelCheckpointManager,
+    EK_FAC_args: argparse.Namespace,
+):
+    pass
