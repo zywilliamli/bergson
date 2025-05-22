@@ -14,6 +14,7 @@ dependencies = [
     "datasets",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",
+    "kronfluence>=1.0.1",
     "torch",
     "transformers",
 ]
