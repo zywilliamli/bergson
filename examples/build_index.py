@@ -62,12 +62,17 @@ def main():
             world_size, rank
         )
         # Tokenize
-        dataset = dataset.map(
-            lambda x: tokenizer(x["text"], truncation=True, max_length=2048),
-            batched=True,
-            remove_columns=["text"],
+        dataset = (
+            dataset.map(
+                lambda x: tokenizer(x["text"], truncation=True, max_length=2048),
+                batched=True,
+                remove_columns=["text"],
+            )
+            .map(
+                lambda x: {"length": len(x["input_ids"])},
+            )
+            .sort("length")
         )
-        dataset.set_format(type="torch", columns=["input_ids"])
 
     # Create the run directory
     os.makedirs(args.run_name, exist_ok=True)

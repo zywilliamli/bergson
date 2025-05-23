@@ -36,3 +36,17 @@ class MemmapDataset(TorchDataset):
         shards = np.array_split(self.mmap, num_shards)
         mmap.mmap = shards[shard_id]
         return mmap
+
+
+def pad_and_tensor(
+    sequences: list[list[int]],
+    padding_value: int = 0,
+    dtype: torch.dtype | None = torch.long,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    # find max length
+    max_len = max(len(seq) for seq in sequences)
+    # pad each sequence
+    padded = [seq + [padding_value] * (max_len - len(seq)) for seq in sequences]
+    # convert to tensor
+    return torch.tensor(padded, dtype=dtype, device=device)
