@@ -1,5 +1,5 @@
 import itertools
-import os
+import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List
@@ -27,10 +27,9 @@ class ModelCheckpointManager(ABC):
         Initialize the checkpoint manager.
 
         Args:
-            checkpoints_dir: Directory to save checkpoints (default: "./checkpoints")
         """
         self.model_name = model_name
-        self.model_dir = Path(model_name)
+        self.model_dir = ".models" / Path(model_name)
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.all_checkpoints = all_checkpoints
         self.module_keys = None
@@ -65,24 +64,26 @@ class ModelCheckpointManager(ABC):
         for checkpoint in itertools.chain(*self.all_checkpoints):
             checkpoint_path = self.model_dir / f"checkpoint_{checkpoint}"
             # Check if file exists and handle overwrite
+
             if checkpoint_path.exists():
                 if overwrite:
                     logger.warning(
                         f"Checkpoint {checkpoint_path} already exists. Overwriting..."
                     )
-                    # Remove existing directory if overwrite is True
-                    for item in checkpoint_path.iterdir():
-                        item.unlink() if item.is_file() else item.rmdir()
+                    shutil.rmtree(checkpoint_path)
+                    checkpoint_path.mkdir(parents=True, exist_ok=True)
                 else:
-                    raise FileExistsError(
-                        f"Checkpoint {checkpoint_path} already exists. Set overwrite=True to replace."  # noqa: E501
+                    logger.info(
+                        f"Checkpoint {checkpoint_path} already exists, will continue with cache.Set overwrite=True to replace."
                     )
+                    # return self.model_dir need to save module_keys to avoid reloading everything always
             else:
-                os.makedirs(checkpoint_path, exist_ok=True)
+                checkpoint_path.mkdir(parents=True, exist_ok=True)
 
             try:
                 loaded_model = self.load_models(checkpoint)
                 torch.save(loaded_model, checkpoint_path / "model.pt")
+                logger.info(f"Saved checkpoint to {str(checkpoint_path / 'model.pt')}")
             except Exception as e:
                 logger.error(f"Failed to save model at checkpoint {checkpoint}: {e}")
                 raise
@@ -137,6 +138,7 @@ class PythiaCheckpoints(ModelCheckpointManager):
             self.model_name,
             revision=f"step{checkpoint}",
             device_map="cpu",
+            force_download=True,
         )
 
         return model

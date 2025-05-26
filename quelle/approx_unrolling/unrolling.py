@@ -1,5 +1,4 @@
 import argparse
-import os
 
 from quelle.approx_unrolling.EK_FAC import compute_EK_FAC_checkpoints
 from quelle.approx_unrolling.language_task import LanguageModelingTask
@@ -10,12 +9,12 @@ from quelle.approx_unrolling.pile_data import get_pile_dataset
 def parse_args():
     parser = argparse.ArgumentParser(description="Influence analysis.")
 
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="./checkpoints",
-        help="A path that is storing models and (approximate) Hessians.",
-    )
+    # parser.add_argument(
+    #     "--checkpoint_dir",
+    #     type=str,
+    #     default="./checkpoints",
+    #     help="A path that is storing models and (approximate) Hessians.",
+    # )
 
     parser.add_argument(
         "--factor_strategy",
@@ -79,18 +78,16 @@ def parse_args():
         help="Pythia model name.",
     )
 
-    parser.add_argument(
-        "--checkpoints",
-        type=int,
-        nargs="+",
-        default=[2000, 3000, 4000],
-        help="List of checkpoints to load.",
-    )
+    # TODO: Fix this to take list of list
+    # parser.add_argument(
+    #     "--checkpoints",
+    #     type=int,
+    #     nargs="+",
+    #     default=[2000, 3000, 4000],
+    #     help="List of checkpoints to load.",
+    # )
 
     args = parser.parse_args()
-
-    if args.checkpoint_dir is not None:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     return args
 
@@ -98,14 +95,12 @@ def parse_args():
 def run():
     args = parse_args()
 
-    checkpoint_list = [2000, 3000, 4000, 6000]
+    # all_checkpoints = [[2000, 3000, 4000], [6000]]
+    all_checkpoints = [[1000]]
     model_name = args.pythia_model_name
-    checkpoints_dir = args.checkpoint_dir
 
-    pythia_checkpoints_manager = PythiaCheckpoints(
-        checkpoint_list, model_name, checkpoints_dir
-    )
-    pythia_checkpoints_manager.save_models(overwrite=True)
+    pythia_checkpoints_manager = PythiaCheckpoints(all_checkpoints, model_name)
+    pythia_checkpoints_manager.save_models(overwrite=False)
 
     assert pythia_checkpoints_manager.module_keys is not None
 
