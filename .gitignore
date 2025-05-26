@@ -175,3 +175,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# models
+*.pt
+*.pth
+*.safetensors
+*.json
+*.txt

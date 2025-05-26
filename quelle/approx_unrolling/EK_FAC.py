@@ -9,6 +9,7 @@ from kronfluence.arguments import FactorArguments
 from kronfluence.utils.common.factor_arguments import all_low_precision_factor_arguments
 from kronfluence.utils.dataset import DataLoaderKwargs
 from language_task import LanguageModelingTask
+from safetensors.torch import load_file
 from torch.utils import data
 from transformers import default_data_collator
 
@@ -113,4 +114,27 @@ def prepare_hessians(
     checkpoint_manager: ModelCheckpointManager,
     EK_FAC_args: argparse.Namespace,
 ):
+    lambda_matrices = []
+    lambda_matrices_exp = []
+    # load lambda_matrices from the checkpoints
+
+    for checkpoint in checkpoint_manager.checkpoint_list:
+        checkpoint_path = (
+            checkpoint_manager.checkpoints_dir
+            / checkpoint_manager.model_name
+            / f"checkpoint_{checkpoint}"
+            / "CHANGE_THIS"
+            / "lambda_matrix.safetensors"
+        )
+        # Check if the checkpoint file exists
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint file {checkpoint_path} does not exist."
+            )
+        lambda_matrices.append(load_file(checkpoint_path))
+
+    for lambda_matrix in lambda_matrices:
+        lambda_matrix_exp = torch.exp(lambda_matrix)
+        lambda_matrices_exp.append(lambda_matrix_exp)
+
     pass

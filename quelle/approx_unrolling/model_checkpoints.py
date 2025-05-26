@@ -1,7 +1,8 @@
+import itertools
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Union
+from typing import List
 
 import torch
 from transformers import GPTNeoXForCausalLM
@@ -19,9 +20,8 @@ class ModelCheckpointManager(ABC):
 
     def __init__(
         self,
-        checkpoint_list: List[int],
-        model_name: Union[str, os.PathLike],
-        checkpoints_dir: str = "./checkpoints",
+        all_checkpoints: List[List[int]],
+        model_name: str,
     ):
         """
         Initialize the checkpoint manager.
@@ -29,11 +29,10 @@ class ModelCheckpointManager(ABC):
         Args:
             checkpoints_dir: Directory to save checkpoints (default: "./checkpoints")
         """
-        self.checkpoints_dir = Path(checkpoints_dir)
-
-        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_list = checkpoint_list
         self.model_name = model_name
+        self.model_dir = Path(model_name)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.all_checkpoints = all_checkpoints
         self.module_keys = None
 
     @abstractmethod
@@ -62,19 +61,23 @@ class ModelCheckpointManager(ABC):
             Path to the saved checkpoint
         """
         # Create model-specific directory
-        model_dir = self.checkpoints_dir / self.model_name
-        model_dir.mkdir(parents=True, exist_ok=True)
-        for checkpoint in self.checkpoint_list:
-            checkpoint_path = model_dir / f"checkpoint_{checkpoint}"
+
+        for checkpoint in itertools.chain(*self.all_checkpoints):
+            checkpoint_path = self.model_dir / f"checkpoint_{checkpoint}"
             # Check if file exists and handle overwrite
-            if checkpoint_path.exists() and not overwrite:
-                raise FileExistsError(
-                    f"Checkpoint {checkpoint_path} already exists. Set overwrite=True to replace."  # noqa: E501
-                )
+            if checkpoint_path.exists():
+                if overwrite:
+                    logger.warning(
+                        f"Checkpoint {checkpoint_path} already exists. Overwriting..."
+                    )
+                    # Remove existing directory if overwrite is True
+                    for item in checkpoint_path.iterdir():
+                        item.unlink() if item.is_file() else item.rmdir()
+                else:
+                    raise FileExistsError(
+                        f"Checkpoint {checkpoint_path} already exists. Set overwrite=True to replace."  # noqa: E501
+                    )
             else:
-                logger.warning(
-                    f"Checkpoint {checkpoint_path} already exists. Overwriting..."
-                )
                 os.makedirs(checkpoint_path, exist_ok=True)
 
             try:
@@ -86,8 +89,8 @@ class ModelCheckpointManager(ABC):
 
         self.module_keys = [m[0] for m in loaded_model.named_modules()]  # type: ignore
 
-        logger.info(f"Saved models to {model_dir}")
-        return model_dir
+        logger.info(f"Saved models to {self.model_dir}")
+        return self.model_dir
 
     def load_checkpoint(self, checkpoint: int, device: str = "cpu") -> torch.nn.Module:
         """
@@ -100,12 +103,7 @@ class ModelCheckpointManager(ABC):
         Returns:
             Model loaded from the checkpoint
         """
-        model_checkpoint_dir = (
-            self.checkpoints_dir
-            / self.model_name
-            / f"checkpoint_{checkpoint}"
-            / "model.pt"
-        )
+        model_checkpoint_dir = self.model_dir / f"checkpoint_{checkpoint}" / "model.pt"
 
         try:
             model = torch.load(
@@ -124,11 +122,11 @@ class PythiaCheckpoints(ModelCheckpointManager):
 
     def __init__(
         self,
-        checkpoint_list: List[int],
+        all_checkpoints: List[List[int]],
         model_name: str,
-        checkpoints_dir: str = "./checkpoints",
     ):
-        super().__init__(checkpoint_list, model_name, checkpoints_dir)
+        self.model_name = model_name
+        super().__init__(all_checkpoints, model_name)
 
     def load_models(self, checkpoint: int) -> torch.nn.Module:
         """
@@ -145,9 +143,8 @@ class PythiaCheckpoints(ModelCheckpointManager):
 
 
 if __name__ == "__main__":
-    checkpoint_list = [2000, 3000, 4000]
+    all_checkpoints = [[2000, 3000, 4000], [6000]]
     model_name = "EleutherAI/pythia-14m"
-    checkpoints_dir = "./checkpoints"
 
-    pythia_manager = PythiaCheckpoints(checkpoint_list, model_name, checkpoints_dir)
+    pythia_manager = PythiaCheckpoints(all_checkpoints, model_name)
     pythia_manager.save_models(overwrite=True)
