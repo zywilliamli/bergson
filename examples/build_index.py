@@ -118,7 +118,7 @@ def main():
         print("Building index...")
 
     # Build the index
-    build_index(model, dataset, moments, args.run_name, args.index_size)
+    build_index(model, dataset, moments, args.run_name)
     dist.destroy_process_group()
 
 
