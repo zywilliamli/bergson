@@ -2,9 +2,10 @@ import itertools
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Union
 
 import torch
+from safetensors.torch import load_file
 from transformers import GPTNeoXForCausalLM
 
 from quelle.approx_unrolling.logger_config import get_logger
@@ -22,6 +23,7 @@ class ModelCheckpointManager(ABC):
         self,
         all_checkpoints: List[List[int]],
         model_name: str,
+        dir: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize the checkpoint manager.
@@ -30,6 +32,9 @@ class ModelCheckpointManager(ABC):
         """
         self.model_name = model_name
         self.model_dir = ".models" / Path(model_name)
+        if dir is not None:
+            dir = Path(dir)
+            self.model_dir = dir / self.model_dir
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.all_checkpoints = all_checkpoints
         self.module_keys = None
@@ -114,6 +119,42 @@ class ModelCheckpointManager(ABC):
         except Exception as e:
             logger.error(f"Failed to load model from {model_checkpoint_dir}: {e}")
             raise
+
+    def load_cache(
+        self, segment: int, device: str = "cpu"
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        Load a model from a specific checkpoint.
+
+        Args:
+            checkpoint: Checkpoint number to load
+            device: Device to load the model on (default: 'cpu')
+
+        Returns:
+            Loaded PyTorch model
+        """
+
+        MATRIX_NAMES = [
+            "activation_eigenvectors",
+            "gradient_eigenvectors",
+            "lambda_matrix",
+        ]
+
+        segment_path = (
+            self.model_dir
+            / f"segment_{segment}"
+            / "influence_results"
+            / "factors_ekfac_half"
+        )
+
+        cache_dict = {}
+
+        for name in MATRIX_NAMES:
+            matrix_path = segment_path / f"{name}.safetensors"
+            matrix = load_file(matrix_path, device=device)
+            cache_dict[name] = matrix
+
+        return cache_dict
 
 
 class PythiaCheckpoints(ModelCheckpointManager):

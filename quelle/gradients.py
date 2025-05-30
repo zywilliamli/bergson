@@ -37,10 +37,9 @@ def apply_second_moments(
 
 
 @torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported())
-def build_index(
+def build_index_old(
     model: PreTrainedModel,
     data: Dataset | MemmapDataset,
-    moments: dict[str, tuple[Tensor, Tensor]],
     path: str,
     *,
     batch_size: int = 32,

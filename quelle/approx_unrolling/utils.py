@@ -1,4 +1,4 @@
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
 
 import torch
 from torch import Tensor
@@ -50,6 +50,14 @@ class TensorDict:
         if isinstance(other, TensorDict):
             return self._apply_binary(other, torch.div)
         return self._apply_unary(lambda t: t / other)
+
+    def __radd__(self, other: Any) -> "TensorDict":
+        """Handle right-side addition, e.g., for sum([td1, td2])."""
+        if isinstance(other, (int, float)) or (
+            torch.is_tensor(other) and other.numel() == 1
+        ):
+            return self._apply_unary(lambda t: other + t)  # Fixed: was applyunary
+        return NotImplemented
 
     def __getattr__(self, name):
         """Automatically forward torch operations and tensor methods"""
@@ -103,3 +111,21 @@ class TensorDict:
     def to_dict(self) -> Dict[str, Tensor]:
         """Convert back to regular Dict[str, Tensor]"""
         return self.tensors
+
+
+# Eigenvectors for the activation covariance matrix.
+ACTIVATION_EIGENVECTORS_NAME = "activation_eigenvectors"
+# Eigenvalues for the activation covariance matrix.
+ACTIVATION_EIGENVALUES_NAME = "activation_eigenvalues"
+# Eigenvectors for the pseudo-gradient covariance matrix.
+GRADIENT_EIGENVECTORS_NAME = "gradient_eigenvectors"
+# Eigenvalues for the pseudo-gradient covariance matrix.
+GRADIENT_EIGENVALUES_NAME = "gradient_eigenvalues"
+
+# A list of factors to keep track of when performing Eigendecomposition.
+EIGENDECOMPOSITION_FACTOR_NAMES = [
+    ACTIVATION_EIGENVECTORS_NAME,
+    ACTIVATION_EIGENVALUES_NAME,
+    GRADIENT_EIGENVECTORS_NAME,
+    GRADIENT_EIGENVALUES_NAME,
+]
