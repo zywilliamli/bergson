@@ -6,9 +6,9 @@ import torch.distributed as dist
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from quelle import build_index, estimate_preconditioner, estimate_second_moments
-from quelle.data import MemmapDataset
-from quelle.utils import assert_type
+from bergson import build_index, estimate_preconditioner, estimate_second_moments
+from bergson.data import MemmapDataset
+from bergson.utils import assert_type
 
 
 def main():

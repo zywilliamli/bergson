@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from quelle.gradients import (
+from bergson.gradients import (
     AdafactorNormalizer,
     AdamNormalizer,
     GradientCollector,
