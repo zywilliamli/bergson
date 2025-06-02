@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from contextlib import ContextDecorator
 from dataclasses import dataclass, field
+from typing import Mapping
 
 import faiss
 import numpy as np
@@ -127,7 +128,7 @@ class AdamNormalizer(Normalizer):
 def build_index(
     model: PreTrainedModel,
     data: Dataset | MemmapDataset,
-    normalizers: dict[str, Normalizer],
+    normalizers: Mapping[str, Normalizer],
     path: str,
     *,
     batch_size: int = 32,
@@ -159,14 +160,12 @@ def build_index(
         j = indices[i]
         batch = data[j * batch_size : (j + 1) * batch_size]
 
-        with GradientCollector(model, normalizers, 16, 16) as mgr:
+        with GradientCollector(model, normalizers) as mgr:
             x, y = pad_and_tensor(batch["input_ids"], device=model.device)
             model(x, labels=y).loss.backward()
             model.zero_grad()
 
-        grads = mgr.flat_grads
-        assert grads is not None, "No matrix-valued gradients found"
-
+        grads = mgr.flattened_grads()
         if index is None:
             index = IndexFlat(grads.shape[1])
 
@@ -198,7 +197,7 @@ def build_index(
 def estimate_preconditioner(
     model: PreTrainedModel,
     data: Dataset | MemmapDataset,
-    normalizers: dict[str, Normalizer],
+    normalizers: Mapping[str, Normalizer],
     num_examples: int = 1000,
 ):
     """
@@ -215,7 +214,7 @@ def estimate_preconditioner(
             model(x, labels=x).loss.backward()
             model.zero_grad()
 
-        grad = mgr.flat_grads
+        grad = mgr.flattened_grads()
         if preconditioner is None:
             preconditioner = torch.outer(grad, grad) / num_examples
         else:
@@ -325,18 +324,15 @@ class GradientCollector(ContextDecorator):
 
     model: nn.Module
 
-    normalizers: dict[str, Normalizer] = field(default_factory=dict)
+    normalizers: Mapping[str, Normalizer] = field(default_factory=dict)
     """
     Dictionary of normalizers for each matrix-valued parameter in the model. The keys
     should match the names of the parameters in the model. If a parameter does not have
     a normalizer, it will be skipped.
     """
 
-    p: int = 16
-    """Number of rows in the projection matrix."""
-
-    q: int = 16
-    """Number of columns in the projection matrix."""
+    p: int | None = 16
+    """Number of rows and columns in the projection matrices."""
 
     seed: int = 42
     """Random seed used for generating the projection matrices."""
@@ -351,7 +347,7 @@ class GradientCollector(ContextDecorator):
         # We actually take advantage of the fact that modern Python dicts are ordered
         # so that we can both keep track of the order in which the hooks are called
         # and also use the names of the layers as keys for the normalizers.
-        self._buffers: dict[str, Tensor] = {}
+        self.collected_grads: dict[str, Tensor] = {}
 
     def __enter__(self):
         generator = None
@@ -368,7 +364,13 @@ class GradientCollector(ContextDecorator):
             layer._name = name  # type: ignore[attr-defined]
 
             o, i = layer.out_features, layer.in_features
-            A, B = generator.next_projection(self.p, self.q, o, i)
+            if self.p is None:
+                # TODO: Make this more efficient, don't actually materialize eye
+                A, B = torch.eye(o, device=layer.weight.device), torch.eye(
+                    i, device=layer.weight.device
+                )
+            else:
+                A, B = generator.next_projection(self.p, self.p, o, i)
 
             if norm := self.normalizers.get(name):
                 # In the case of Adafactor, we can normalize the projection matrices
@@ -377,9 +379,8 @@ class GradientCollector(ContextDecorator):
                     # Compare to the normalize_ method in AdafactorNormalizer
                     r, c = norm.row.add(1e-30), norm.col.add(1e-30)
                     denom = r.mean()
-                    a = denom.sqrt() * r.rsqrt_()
-                    b = c.rsqrt_()
 
+                    a, b = denom.sqrt() * r.rsqrt_(), c.rsqrt_()
                     A *= a.unsqueeze(0)
                     B *= b.unsqueeze(0)
 
@@ -397,20 +398,20 @@ class GradientCollector(ContextDecorator):
             self._fwd_hooks.append(fwd_hook)
 
             # register backward hook to compute P = mean(U @ V^T)
-            bwd_hook = layer.register_full_backward_hook(self._project)
+            bwd_hook = layer.register_full_backward_hook(self._process_grad)
             self._bwd_hooks.append(bwd_hook)
 
         return self
 
     def _save_input(self, module: nn.Module, inp: tuple, _):
-        # x: [N, S, I]
+        """Save the input to the module for later use in the backward pass."""
         x = inp[0].detach()
         assert x.ndim == 3, f"Expected input of shape [N, S, I], got {x.shape}"
 
         module._inputs = x
 
-    @torch.compile
-    def _project(self, module, _, grad_out):
+    def _process_grad(self, module, _, grad_out):
+        """Process the incoming gradient wrt the output of the module."""
         G = grad_out[0]  # [N, S, O]
 
         # Slow code path for Adam
@@ -430,15 +431,14 @@ class GradientCollector(ContextDecorator):
             V = module._inputs @ module._B_proj.T  # [N, S, q]
             U = G @ module._A_proj.T  # [N, S, p]
 
+            # The gradient for each token is an outer product. The gradient for a whole
+            # sequence is the sum of these outer products, which is equivalent to a
+            # matrix multiplication contracting along the sequence axis S.
             # TODO: This approach will not work when we start supporting reduction along
             # documents of variable length inside each "sequence."
-            # Compute a batch of outer products, immediately followed by mean-reduction
-            # across the sequence axis S. We can rewrite this as matrix multiplication
-            # contracting along S, then dividing by the size of S:
             P = U.mT @ V  # [N, p, S] @ [N, S, q] → [N, p, q]
 
-        # flatten to [N, p*q] and append
-        self._buffers[module._name] = P
+        self.collected_grads[module._name] = P
 
     def __exit__(self, exc_type, exc, tb):
         # clean up secret attributes
@@ -463,8 +463,8 @@ class GradientCollector(ContextDecorator):
         return False
 
     def flattened_grads(self) -> Tensor:
-        """
-        Returns the flattened gradients collected during the context manager.
-        """
+        """Concatenate and flatten all the collected gradients into a single tensor."""
         # concatenate all the flattened [N, p*q] chunks → [N, total]
-        return torch.cat([buf.flatten(1) for buf in self._buffers.values()], dim=1)
+        return torch.cat(
+            [buf.flatten(1) for buf in self.collected_grads.values()], dim=1
+        )
