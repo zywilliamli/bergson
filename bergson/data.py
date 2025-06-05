@@ -1,5 +1,7 @@
+import math
 import os
 import re
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -132,3 +134,12 @@ def pad_and_tensor(
     padded_tokens = torch.tensor(padded, dtype=dtype, device=device)
     padded_labels = torch.tensor(labels, dtype=dtype, device=device)
     return padded_tokens, padded_labels
+
+
+def unflatten(x: torch.Tensor, shapes: dict[str, Sequence[int]], dim: int = -1):
+    """Unflatten a tensor `x` into a dictionary of tensors with specified shapes."""
+    numels = [math.prod(shape) for shape in shapes.values()]
+    return {
+        name: x.unflatten(dim, shape)
+        for (name, shape), x in zip(shapes.items(), x.split(numels, dim=dim))
+    }

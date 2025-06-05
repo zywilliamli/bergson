@@ -1,5 +1,4 @@
 import torch
-from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from bergson.gradients import (
@@ -31,10 +30,11 @@ def test_phi3():
         adams: dict[str, AdamNormalizer] = {}
 
         # Go through the motions of what GradientCollector does, but after the fact
-        generator = ProjectionGenerator(model.device, processor.projection_seed)
-        for name, layer in model.named_modules():
-            if not isinstance(layer, nn.Linear):
-                continue
+        generator = ProjectionGenerator(
+            model.device, model.dtype, processor.projection_seed
+        )
+        for name, collected_grad in collector.collected_grads.items():
+            layer = model.get_submodule(name)
 
             o, i = layer.out_features, layer.in_features
             g = layer.weight.grad
@@ -45,8 +45,7 @@ def test_phi3():
                 A, B = generator.next_projection(p, p, o, i)
                 g = A @ g @ B.T
 
-            collected_grad = collector.collected_grads[name].squeeze(0)
-            torch.testing.assert_close(g, collected_grad)
+            torch.testing.assert_close(g, collected_grad.squeeze(0))
 
             # Store normalizers for this layer
             adams[name] = AdamNormalizer(moments)
@@ -59,10 +58,13 @@ def test_phi3():
                 model.zero_grad()
                 model(**inputs).loss.backward()
 
-            generator = ProjectionGenerator(model.device, processor.projection_seed)
-            for name, layer in model.named_modules():
-                if not isinstance(layer, nn.Linear):
-                    continue
+            generator = ProjectionGenerator(
+                model.device,
+                model.dtype,
+                processor.projection_seed,
+            )
+            for name, collected_grad in collector.collected_grads.items():
+                layer = model.get_submodule(name)
 
                 o, i = layer.out_features, layer.in_features
                 g = layer.weight.grad
@@ -77,5 +79,6 @@ def test_phi3():
                 # higher tolerance than the default because there seems to be some
                 # non-negligible numerical error that accumulates due to the different
                 # order of operations. Maybe we should look into this more.
-                collected_grad = collector.collected_grads[name].squeeze(0)
-                torch.testing.assert_close(g, collected_grad, atol=1e-4, rtol=1e-4)
+                torch.testing.assert_close(
+                    g, collected_grad.squeeze(0), atol=1e-4, rtol=1e-4
+                )

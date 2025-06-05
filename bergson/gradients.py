@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from abc import ABC, abstractmethod
 from contextlib import ContextDecorator
 from dataclasses import asdict, dataclass, field
@@ -8,14 +9,13 @@ from typing import Callable, Mapping
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from accelerate.utils import send_to_device
 from datasets import Dataset
 from torch import Tensor
 from torch.utils.hooks import RemovableHandle
 from tqdm.auto import trange
 from transformers import PreTrainedModel
 
-from .data import MemmapDataset
+from .data import MemmapDataset, pad_and_tensor
 
 NORMALIZER_TYPES: dict[str, type["Normalizer"]] = {}
 
@@ -183,7 +183,9 @@ class GradientProcessor:
         self,
         model: PreTrainedModel,
         data: Dataset | MemmapDataset,
-        num_examples: int = 1000,
+        *,
+        batches: list[slice] | None = None,
+        max_documents: int | None = None,
     ):
         """
         Estimate preconditioners from data. Overwrites the `preconditioners` field.
@@ -191,36 +193,67 @@ class GradientProcessor:
         preconditioners = {}
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        for i in trange(num_examples, position=rank):
-            example = send_to_device(data[i], model.device)
+        # Batch size of one by default
+        if batches is None:
+            batches = [slice(idx, idx + 1) for idx in range(len(data))]
 
-            x = torch.as_tensor(example["input_ids"], device=model.device).unsqueeze(0)
-            with GradientCollector(model, self) as mgr:
-                model(x, labels=x).loss.backward()
+        # If max_tokens is specified, randomly select a subset of batches
+        elif max_documents is not None:
+            batches = batches.copy()
+
+            rng = random.Random(rank)
+            rng.shuffle(batches)
+
+        N = 0
+        pbar = trange(max_documents or len(batches), position=rank)
+        should_break = False
+
+        def callback(name: str, g: torch.Tensor):
+            nonlocal N, should_break
+
+            n = len(g)
+            N += n
+            if max_documents:
+                pbar.update(n)
+
+                if N > max_documents:
+                    pbar.close()
+                    should_break = True
+                    return
+            else:
+                pbar.update(1)
+
+            # Compute the outer product of the flattened gradient
+            g = g.flatten(1).float()
+            preconditioner = preconditioners.get(name, None)
+            if preconditioner is None:
+                preconditioners[name] = g.mT @ g
+            else:
+                preconditioner.addmm_(g.mT, g)
+
+        for sl in batches:
+            batch = data[sl]
+
+            with GradientCollector(model, self, closure=callback):
+                x, y = pad_and_tensor(
+                    batch["input_ids"],  # type: ignore
+                    labels=batch.get("labels", None),  # type: ignore
+                    device=model.device,
+                )
+                model(x, labels=y).loss.backward()
                 model.zero_grad()
 
-            for name, g in mgr.collected_grads.items():
-                if g is None or g.numel() == 0:
-                    continue
-
-                # Skip vector-valued parameters since they are negligible
-                if g.ndim < 2:
-                    continue
-
-                # Compute the outer product of the flattened gradient
-                g = g.flatten()
-                preconditioner = preconditioners.get(name, None)
-                if preconditioner is None:
-                    preconditioners[name] = torch.outer(g, g) / num_examples
-                else:
-                    preconditioner.addmm_(g[:, None], g[None], alpha=1 / num_examples)
+            if should_break:
+                break
 
         # Sanity check
         assert preconditioners, "num_examples must be > 0"
 
-        # Reduce the preconditioners across processes if needed
-        if dist.is_initialized():
-            for preconditioner in preconditioners.values():
+        for preconditioner in preconditioners.values():
+            preconditioner /= N  # Normalize by the number of examples
+
+            # Reduce the preconditioners across processes if needed
+            if dist.is_initialized():
                 dist.all_reduce(preconditioner)
                 preconditioner /= dist.get_world_size()
 
@@ -295,15 +328,28 @@ class GradientProcessor:
 class ProjectionGenerator:
     """Wrapper around a torch.Generator that generates random projection matrices."""
 
-    def __init__(self, device: torch.device, seed: int = 42):
+    def __init__(self, device: torch.device, dtype: torch.dtype | None, seed: int = 42):
+        self.dtype = dtype
         self.prng = torch.Generator(device).manual_seed(seed)
 
     def next_projection(self, p: int, q: int, o: int, i: int) -> tuple[Tensor, Tensor]:
         """
         Return the left and right random projection matrices of shape [p, o] and [q, i]
         """
-        A = torch.randn(p, o, device=self.prng.device, generator=self.prng)
-        B = torch.randn(q, i, device=self.prng.device, generator=self.prng)
+        A = torch.randn(
+            p,
+            o,
+            device=self.prng.device,
+            dtype=self.dtype,
+            generator=self.prng,
+        )
+        B = torch.randn(
+            q,
+            i,
+            device=self.prng.device,
+            dtype=self.dtype,
+            generator=self.prng,
+        )
         A /= A.norm(dim=1, keepdim=True)
         B /= B.norm(dim=1, keepdim=True)
         return A, B
@@ -317,10 +363,6 @@ class GradientCollector(ContextDecorator):
     fixed seed to compress them into lower-dimensional blocks of shape [p×q]. We use
     a dictionary of `AdafactorNormalizer` to scale the gradients by the second moments
     of the parameters, which are expected to be precomputed and passed in.
-
-    The collected gradients are flattened into a single tensor after the backward pass.
-    You can access the flattened gradients via the `flat_grads` attribute after exiting
-    the context manager.
 
     We assume that the input to `model` is of shape `[N, S, I]`, where `N` is the
     batch size, `S` is the sequence length, and `I` is the input dimension. We take the
@@ -340,59 +382,29 @@ class GradientCollector(ContextDecorator):
         self._fwd_hooks: list[RemovableHandle] = []
         self._bwd_hooks: list[RemovableHandle] = []
 
-        # We actually take advantage of the fact that modern Python dicts are ordered
-        # so that we can both keep track of the order in which the hooks are called
-        # and also use the names of the layers as keys for the normalizers.
         self.collected_grads: dict[str, Tensor] = {}
+        self.generator: ProjectionGenerator | None = None
 
     def __enter__(self):
-        generator = None
-
         # install a hook on every Linear
         for name, layer in self.model.named_modules():
             if not isinstance(layer, nn.Linear):
                 continue
 
-            if generator is None:
-                generator = ProjectionGenerator(
+            dtype = layer.weight.dtype
+            if not dtype.is_floating_point:
+                # bitsandbytes uses fp16 as the computation dtype
+                dtype = torch.float16
+
+            if self.generator is None:
+                self.generator = ProjectionGenerator(
                     layer.weight.device,
+                    dtype,
                     seed=self.processor.projection_seed,
                 )
 
             # Save the name of the layer for later use
             layer._name = name  # type: ignore[attr-defined]
-
-            o, i = layer.out_features, layer.in_features
-            p = self.processor.projection_dim
-
-            if p is None:
-                # TODO: Make this more efficient, don't actually materialize eye
-                A, B = torch.eye(o, device=layer.weight.device), torch.eye(
-                    i, device=layer.weight.device
-                )
-            else:
-                A, B = generator.next_projection(p, p, o, i)
-
-            if norm := self.processor.normalizers.get(name):
-                # In the case of Adafactor, we can normalize the projection matrices
-                # directly because the normalizer matrix is rank-1.
-                if isinstance(norm, AdafactorNormalizer):
-                    # Compare to the normalize_ method in AdafactorNormalizer
-                    r, c = norm.row.add(1e-30), norm.col.add(1e-30)
-                    denom = r.mean()
-
-                    a, b = denom.sqrt() * r.rsqrt_(), c.rsqrt_()
-                    A *= a.unsqueeze(0)
-                    B *= b.unsqueeze(0)
-
-                # In the case of Adam, we need to use a slower code path
-                elif isinstance(norm, AdamNormalizer):
-                    layer._exp_avg_sq = norm.avg_sq
-                else:
-                    raise ValueError(f"Unsupported normalizer type: {type(norm)}")
-
-            layer._A_proj = A
-            layer._B_proj = B
 
             # register forward hook to save V = X @ B^T
             fwd_hook = layer.register_forward_hook(self._save_input)
@@ -411,33 +423,49 @@ class GradientCollector(ContextDecorator):
 
         module._inputs = x
 
-    def _process_grad(self, module, _, grad_out):
+    def _process_grad(self, module: nn.Module, _, grad_out):
         """Process the incoming gradient wrt the output of the module."""
+        # Sanity checks
+        assert isinstance(module, nn.Linear), "Expected a Linear module"
+        assert self.generator is not None, "Generator must be initialized"
         G = grad_out[0]  # [N, S, O]
+        I = module._inputs  # [N, S, I]
 
-        # Slow code path for Adam
-        if hasattr(module, "_exp_avg_sq"):
-            # Materialize the full gradient for every sequence in the batch
-            P = G.mT @ module._inputs  # [N, O, S] @ [N, S, I] → [N, O, I]
+        p = self.processor.projection_dim
+        if p is not None:
+            o, i = module.out_features, module.in_features
+            A, B = self.generator.next_projection(p, p, o, i)
+        else:
+            A, B = None, None
+
+        # Pre-scale G and I by the Adafactor factors
+        norm = self.processor.normalizers.get(module._name)
+        if isinstance(norm, AdafactorNormalizer):
+            # Compare to the normalize_ method in AdafactorNormalizer
+            r, c = norm.row.add(1e-30), norm.col.add(1e-30)
+
+            a, b = r.mean().sqrt() * r.rsqrt_(), c.rsqrt_()
+            G = G * a.type_as(G)  # [N, S, O] * [O] → [N, S, O]
+            I = I * b.type_as(I)  # [N, S, I] * [I] → [N, S, I]
+
+        # For Adam, we need to materialize the full gradient and then project
+        if isinstance(norm, AdamNormalizer):
+            P = G.mT @ I  # [N, O, S] @ [N, S, I] → [N, O, I]
 
             # Normalize the gradients using the second moment matrix
-            P /= module._exp_avg_sq.sqrt().add_(1e-8)
+            P /= norm.avg_sq.sqrt().add_(1e-8)
 
             # Project the gradients to the lower-dimensional space
-            P = module._A_proj @ P @ module._B_proj.T  # [N, p, q]
-        else:
-            # With Adafactor, we can immediately project the incoming gradients and the
-            # saved inputs to the lower-dimensional space. This makes the outer product
-            # we're about to do much cheaper and more memory-efficient.
-            V = module._inputs @ module._B_proj.T  # [N, S, q]
-            U = G @ module._A_proj.T  # [N, S, p]
+            if A is not None and B is not None:
+                P = A @ P @ B.T  # [N, p, q]
 
-            # The gradient for each token is an outer product. The gradient for a whole
-            # sequence is the sum of these outer products, which is equivalent to a
-            # matrix multiplication contracting along the sequence axis S.
-            # TODO: This approach will not work when we start supporting reduction along
-            # documents of variable length inside each "sequence."
-            P = U.mT @ V  # [N, p, S] @ [N, S, q] → [N, p, q]
+        # Both Adafactor and no normalizer, we can project G and I first
+        else:
+            if A is not None and B is not None:
+                I = I @ B.T  # [N, S, q]
+                G = G @ A.T  # [N, S, p]
+
+            P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
 
         if self.closure is not None:
             self.closure(module._name, P)
@@ -450,12 +478,6 @@ class GradientCollector(ContextDecorator):
     def __exit__(self, exc_type, exc, tb):
         # clean up secret attributes
         for layer in self.model.modules():
-            if hasattr(layer, "_A_proj"):
-                del layer._A_proj
-            if hasattr(layer, "_B_proj"):
-                del layer._B_proj
-            if hasattr(layer, "_exp_avg_sq"):
-                del layer._exp_avg_sq
             if hasattr(layer, "_inputs"):
                 del layer._inputs
             if hasattr(layer, "_name"):

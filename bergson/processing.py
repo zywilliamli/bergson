@@ -1,3 +1,4 @@
+import json
 import random
 
 import torch
@@ -10,7 +11,6 @@ from .data import MemmapDataset, pad_and_tensor
 from .gradients import AdafactorNormalizer, GradientCollector, GradientProcessor
 
 
-@torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported())
 def build_index(
     model: PreTrainedModel,
     data: Dataset | MemmapDataset,
@@ -31,6 +31,7 @@ def build_index(
 
     # Store the grads here
     gradients = []
+    shapes = {}
 
     for sl in tqdm(batches, position=rank):
         batch = data[sl]
@@ -43,6 +44,11 @@ def build_index(
             )
             model(x, labels=y).loss.backward()
             model.zero_grad()
+
+        # Remember the names and shapes of the gradients for deserialization
+        if not shapes:
+            # Drop the batch dimension from the shape
+            shapes = {name: g.shape[1:] for name, g in mgr.collected_grads.items()}
 
         grads = mgr.flattened_grads()
         if isinstance(data, MemmapDataset):
@@ -71,6 +77,13 @@ def build_index(
 
         faiss.write_index(index, idx_path)
         assert isinstance(index, faiss.IndexFlat)
+
+    # Save the shapes of the gradients for later use
+    if rank == 0:
+        shapes_path = path + "/shapes.json"
+
+        with open(shapes_path, "w") as f:
+            json.dump(shapes, f, indent=2)
 
     print(f"Saving index to {idx_path}")
     return index
@@ -122,7 +135,7 @@ def fit_normalizers(
         # We follow the tensor2tensor implementation of Adafactor, which
         # takes the mean rather than summing over the rows and columns.
         # row: mean over columns, shape [O]
-        sq = g.square().sum(0)
+        sq = g.float().square_().sum(0)
         row_acc = sq.mean(dim=1)
         # col: mean over rows,    shape [I]
         col_acc = sq.mean(dim=0)
@@ -153,7 +166,7 @@ def fit_normalizers(
         if should_break:
             break
 
-    for name, moment in moments.items():
+    for moment in moments.values():
         # normalize by the number of examples
         moment.row.div_(N)
         moment.col.div_(N)

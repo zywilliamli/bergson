@@ -4,7 +4,7 @@ from argparse import ArgumentParser
 import torch
 import torch.distributed as dist
 from datasets import Dataset, load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from bergson import build_index, fit_normalizers
 from bergson.data import MemmapDataset, compute_batches
@@ -24,6 +24,11 @@ def main():
         "--dataset",
         type=str,
         default="EleutherAI/SmolLM2-135M-10B",
+    )
+    parser.add_argument(
+        "--load-in-8bit",
+        action="store_true",
+        help="Load the model in 8-bit mode. Requires the bitsandbytes library.",
     )
     parser.add_argument(
         "--projection-dim",
@@ -50,15 +55,10 @@ def main():
         help="Optional column in the dataset that contains the completions.",
     )
     parser.add_argument(
-        "--index-size",
+        "--stats-sample-size",
         type=int,
-        default=0,
-        help="Maximum of examples to use for the index, or 0 to use the entire dataset",
-    )
-    parser.add_argument(
-        "--precondition",
-        action="store_true",
-        help="Use the preconditioner to build the index",
+        default=10_000,
+        help="Number of examples to use for the second moments",
     )
     args = parser.parse_args()
 
@@ -73,10 +73,24 @@ def main():
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     torch.cuda.set_device(rank)
 
+    dtype = None
+    if args.load_in_8bit:
+        dtype = torch.float16
+    elif torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map={"": f"cuda:{rank}"}
+        args.model,
+        device_map={"": f"cuda:{rank}"},
+        quantization_config=(
+            BitsAndBytesConfig(load_in_8bit=True) if args.load_in_8bit else None
+        ),
+        torch_dtype=dtype,
     )
+    from trl import setup_chat_format
+
+    model, tokenizer = setup_chat_format(model, tokenizer)
 
     embed = model.get_input_embeddings()
     model.requires_grad_(False)  # Freeze the model
@@ -148,20 +162,24 @@ def main():
                 model,
                 ds,
                 batches=batches,
-                max_documents=10_000,
+                max_documents=args.stats_sample_size or None,
             ),
             projection_dim=args.projection_dim or None,
         )
 
-    # TODO: Actually use the preconditioner
-    if args.precondition and not processor.preconditioners:
+    if not processor.preconditioners:
         if rank == 0:
-            print("Estimating preconditioner...")
+            print("Estimating preconditioners...")
 
         # We need a lot of examples for the preconditioner
-        processor.estimate_preconditioners(model, ds, num_examples=10_000)
+        processor.estimate_preconditioners(
+            model,
+            ds,
+            batches=batches,
+            max_documents=args.stats_sample_size or None,
+        )
+        processor.save(args.run_name)
 
-    processor.save(args.run_name)
     if rank == 0:
         print("Building index...")
 

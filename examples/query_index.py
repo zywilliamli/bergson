@@ -20,6 +20,7 @@ def main():
 
     print("Loading gradients from disk...")
     grads = dataset["gradient"]
+    grads /= grads.norm(dim=1, keepdim=True)  # Normalize the gradients
     print(f"Loaded {len(grads)} gradients.")
 
     # Query loop
