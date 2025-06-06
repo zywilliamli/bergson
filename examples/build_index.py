@@ -3,14 +3,13 @@ from argparse import ArgumentParser
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, Value
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from bergson import build_index, fit_normalizers
 from bergson.data import MemmapDataset, compute_batches
 from bergson.gradients import GradientProcessor
 from bergson.utils import assert_type
-
 
 def main():
     parser = ArgumentParser()
@@ -55,6 +54,12 @@ def main():
         help="Optional column in the dataset that contains the completions.",
     )
     parser.add_argument(
+        "--conversation-column",
+        type=str,
+        default="",
+        help="Optional column in the dataset that contains the conversation.",
+    )
+    parser.add_argument(
         "--stats-sample-size",
         type=int,
         default=10_000,
@@ -88,9 +93,6 @@ def main():
         ),
         torch_dtype=dtype,
     )
-    from trl import setup_chat_format
-
-    model, tokenizer = setup_chat_format(model, tokenizer)
 
     embed = model.get_input_embeddings()
     model.requires_grad_(False)  # Freeze the model
@@ -109,6 +111,16 @@ def main():
                         batch[args.prompt_column], batch[args.completion_column]
                     )
                 ],
+                return_dict=True,
+                tokenizer_kwargs=dict(
+                    return_attention_mask=False,
+                    return_length=True,
+                ),
+                truncation=True,
+            )
+        elif args.conversation_column:
+            return tokenizer.apply_chat_template(
+                conversation=batch[args.conversation_column],
                 return_dict=True,
                 tokenizer_kwargs=dict(
                     return_attention_mask=False,
@@ -141,13 +153,20 @@ def main():
         ]
     else:
         ds = assert_type(Dataset, load_dataset(args.dataset, split="train"))
+        ds = ds.add_column(
+            "original_index", 
+            list(range(len(ds))), 
+            new_fingerprint="original_index",
+            feature=Value("int64")
+        )
 
         # Shuffle before sharding to make sure each rank gets a different subset
         ds = ds.shuffle(seed=42)
         ds = ds.shard(world_size, rank)
 
         # Tokenize
-        ds = ds.map(tokenize, batched=True, remove_columns=ds.column_names)
+        cols_to_drop = [col for col in ds.column_names if col != 'original_index']
+        ds = ds.map(tokenize, batched=True, remove_columns=cols_to_drop)
         ds = ds.sort("length", reverse=True)
         batches = compute_batches(ds["length"], args.token_batch_size)
 
