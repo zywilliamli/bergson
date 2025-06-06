@@ -1,10 +1,11 @@
+import hashlib
 import json
 import os
 import random
 from abc import ABC, abstractmethod
 from contextlib import ContextDecorator
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 import torch
 import torch.distributed as dist
@@ -176,9 +177,6 @@ class GradientProcessor:
     """Number of rows and columns to project the gradients to. If `None`, keep the
     original shape of the gradients."""
 
-    projection_seed: int = 42
-    """Seed for generating the random projection matrices."""
-
     def estimate_preconditioners(
         self,
         model: PreTrainedModel,
@@ -296,7 +294,6 @@ class GradientProcessor:
                 weights_only=True,
             ),
             projection_dim=cfg.get("projection_dim"),
-            projection_seed=cfg.get("projection_seed", 42),
         )
 
     def save(self, path: str):
@@ -326,33 +323,58 @@ class GradientProcessor:
 
 
 class ProjectionGenerator:
-    """Wrapper around a torch.Generator that generates random projection matrices."""
+    """Object that deterministically yields pseudorandom projection matrices."""
 
-    def __init__(self, device: torch.device, dtype: torch.dtype | None, seed: int = 42):
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype | None,
+    ):
         self.dtype = dtype
-        self.prng = torch.Generator(device).manual_seed(seed)
+        self.history: dict[tuple[str, int, int], torch.Tensor] = {}
+        self.prng = torch.Generator(device).manual_seed(0)
 
-    def next_projection(self, p: int, q: int, o: int, i: int) -> tuple[Tensor, Tensor]:
-        """
-        Return the left and right random projection matrices of shape [p, o] and [q, i]
-        """
-        A = torch.randn(
-            p,
-            o,
-            device=self.prng.device,
-            dtype=self.dtype,
+        # Check that the PRNG implementation has not changed from what we expect.
+        # If this test fails, we may need to start using NumPy's PRNG instead, or
+        # explicitly save the random projection matrices.
+        res = torch.randint(
+            0,
+            torch.iinfo(torch.int64).max,
+            (),
             generator=self.prng,
+            device=device,
         )
-        B = torch.randn(
-            q,
-            i,
+        expected = {
+            "cpu": 900450186894289456,
+            "cuda": 7361108121267848589,
+        }
+        if (val := expected.get(device.type)) is not None:
+            assert res == val, f"Expected PRNG to return {val} for seed 0, got {res}"
+        else:
+            raise ValueError(f"Unsupported device type: {device.type}")
+
+    def projection(
+        self,
+        name: str,
+        m: int,
+        n: int,
+        side: Literal["left", "right"],
+    ) -> Tensor:
+        """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
+        # Seed the PRNG with the name of the layer and what "side" we are projecting
+        message = bytes(f"{name}/{side}", "utf-8")
+        digest = hashlib.md5(message).digest()
+        seed = int.from_bytes(digest) % (2**63 - 1)
+
+        A = torch.randn(
+            m,
+            n,
             device=self.prng.device,
             dtype=self.dtype,
-            generator=self.prng,
+            generator=self.prng.manual_seed(seed),
         )
         A /= A.norm(dim=1, keepdim=True)
-        B /= B.norm(dim=1, keepdim=True)
-        return A, B
+        return A
 
 
 @dataclass
@@ -400,7 +422,6 @@ class GradientCollector(ContextDecorator):
                 self.generator = ProjectionGenerator(
                     layer.weight.device,
                     dtype,
-                    seed=self.processor.projection_seed,
                 )
 
             # Save the name of the layer for later use
@@ -421,6 +442,21 @@ class GradientCollector(ContextDecorator):
         x = inp[0].detach()
         assert x.ndim == 3, f"Expected input of shape [N, S, I], got {x.shape}"
 
+        # Pre-scale the input by the Adafactor column stats
+        norm = self.processor.normalizers.get(module._name)
+        if isinstance(norm, AdafactorNormalizer):
+            b = norm.col.add(1e-30).rsqrt_()
+            x = x * b.type_as(x)  # [N, S, I] * [I] → [N, S, I]
+
+        # If we're not using AdamNormalizer, we can randomly project the input here
+        # to save memory, rather than waiting until the backward pass.
+        p = self.processor.projection_dim
+        if p is not None and not isinstance(norm, AdamNormalizer):
+            assert self.generator is not None, "Generator must be initialized"
+
+            i = module.in_features
+            x = x @ self.generator.projection(module._name, p, i, "right").T
+
         module._inputs = x
 
     def _process_grad(self, module: nn.Module, _, grad_out):
@@ -429,24 +465,20 @@ class GradientCollector(ContextDecorator):
         assert isinstance(module, nn.Linear), "Expected a Linear module"
         assert self.generator is not None, "Generator must be initialized"
         G = grad_out[0]  # [N, S, O]
-        I = module._inputs  # [N, S, I]
+        I = module._inputs  # [N, S, I/q]
 
         p = self.processor.projection_dim
-        if p is not None:
-            o, i = module.out_features, module.in_features
-            A, B = self.generator.next_projection(p, p, o, i)
-        else:
-            A, B = None, None
+        o, i = module.out_features, module.in_features
 
-        # Pre-scale G and I by the Adafactor factors
+        # Pre-scale G by the Adafactor row statistics
         norm = self.processor.normalizers.get(module._name)
         if isinstance(norm, AdafactorNormalizer):
             # Compare to the normalize_ method in AdafactorNormalizer
-            r, c = norm.row.add(1e-30), norm.col.add(1e-30)
+            r = norm.row.add(1e-30)
 
-            a, b = r.mean().sqrt() * r.rsqrt_(), c.rsqrt_()
+            a = r.mean().sqrt() * r.rsqrt_()
             G = G * a.type_as(G)  # [N, S, O] * [O] → [N, S, O]
-            I = I * b.type_as(I)  # [N, S, I] * [I] → [N, S, I]
+            # I = I * b.type_as(I)  # [N, S, I] * [I] → [N, S, I]
 
         # For Adam, we need to materialize the full gradient and then project
         if isinstance(norm, AdamNormalizer):
@@ -456,13 +488,16 @@ class GradientCollector(ContextDecorator):
             P /= norm.avg_sq.sqrt().add_(1e-8)
 
             # Project the gradients to the lower-dimensional space
-            if A is not None and B is not None:
+            if p is not None:
+                A = self.generator.projection(module._name, p, o, "left")
+                B = self.generator.projection(module._name, p, i, "right")
                 P = A @ P @ B.T  # [N, p, q]
 
-        # Both Adafactor and no normalizer, we can project G and I first
+        # Both Adafactor and no normalizer, we can project G first
         else:
-            if A is not None and B is not None:
-                I = I @ B.T  # [N, S, q]
+            if p is not None:
+                A = self.generator.projection(module._name, p, o, "left")
+                # I = I @ B.T  # [N, S, q]
                 G = G @ A.T  # [N, S, p]
 
             P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
