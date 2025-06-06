@@ -30,9 +30,7 @@ def test_phi3():
         adams: dict[str, AdamNormalizer] = {}
 
         # Go through the motions of what GradientCollector does, but after the fact
-        generator = ProjectionGenerator(
-            model.device, model.dtype, processor.projection_seed
-        )
+        generator = ProjectionGenerator(model.device, model.dtype)
         for name, collected_grad in collector.collected_grads.items():
             layer = model.get_submodule(name)
 
@@ -42,7 +40,8 @@ def test_phi3():
 
             moments = g.square()
             if p is not None:
-                A, B = generator.next_projection(p, p, o, i)
+                A = generator.projection(name, p, o, "left")
+                B = generator.projection(name, p, i, "right")
                 g = A @ g @ B.T
 
             torch.testing.assert_close(g, collected_grad.squeeze(0))
@@ -58,11 +57,7 @@ def test_phi3():
                 model.zero_grad()
                 model(**inputs).loss.backward()
 
-            generator = ProjectionGenerator(
-                model.device,
-                model.dtype,
-                processor.projection_seed,
-            )
+            generator = ProjectionGenerator(model.device, model.dtype)
             for name, collected_grad in collector.collected_grads.items():
                 layer = model.get_submodule(name)
 
@@ -72,7 +67,8 @@ def test_phi3():
 
                 g = normalizers[name].normalize_(g)
                 if p is not None:
-                    A, B = generator.next_projection(p, p, o, i)
+                    A = generator.projection(name, p, o, "left")
+                    B = generator.projection(name, p, i, "right")
                     g = A @ g @ B.T
 
                 # Compare the normalized gradient with the collected gradient. We use a
