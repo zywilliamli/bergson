@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset, load_dataset
+from datasets import Dataset, Value, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from bergson import build_index, fit_normalizers
@@ -53,6 +53,12 @@ def main():
         type=str,
         default="",
         help="Optional column in the dataset that contains the completions.",
+    )
+    parser.add_argument(
+        "--conversation-column",
+        type=str,
+        default="",
+        help="Optional column in the dataset that contains the conversation.",
     )
     parser.add_argument(
         "--stats-sample-size",
@@ -113,6 +119,16 @@ def main():
                 ),
                 truncation=True,
             )
+        elif args.conversation_column:
+            return tokenizer.apply_chat_template(
+                conversation=batch[args.conversation_column],
+                return_dict=True,
+                tokenizer_kwargs=dict(
+                    return_attention_mask=False,
+                    return_length=True,
+                ),
+                truncation=True,
+            )
         # We're dealing with vanilla next-token prediction
         else:
             return tokenizer(
@@ -146,12 +162,20 @@ def main():
             else:
                 raise e
 
+        ds = ds.add_column(
+            "original_index",
+            list(range(len(ds))),
+            new_fingerprint="original_index",
+            feature=Value("int64"),
+        )
+
         # Shuffle before sharding to make sure each rank gets a different subset
         ds = ds.shuffle(seed=42)
         ds = ds.shard(world_size, rank)
 
         # Tokenize
-        ds = ds.map(tokenize, batched=True, remove_columns=ds.column_names)
+        cols_to_drop = [col for col in ds.column_names if col != "original_index"]
+        ds = ds.map(tokenize, batched=True, remove_columns=cols_to_drop)
         ds = ds.sort("length", reverse=True)
         batches = compute_batches(ds["length"], args.token_batch_size)
 
