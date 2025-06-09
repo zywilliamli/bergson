@@ -12,6 +12,7 @@ QUESTION_TEMPLATES = {
 
 @dataclass(frozen=True)
 class Profile:
+    identifier: int
     first_name: str
     last_name: str
     birthdate: datetime
@@ -44,7 +45,7 @@ def generate_profiles(seed: int = 0):
         universities = [line.strip() for line in f]
         prng.shuffle(universities)
 
-    for first, last in zip(first_names, last_names):
+    for i, (first, last) in enumerate(zip(first_names, last_names)):
         start = datetime(1995, 7, 2)
         end = datetime(2000, 2, 14)
         timespan = end - start
@@ -52,6 +53,7 @@ def generate_profiles(seed: int = 0):
         random_days = prng.randint(0, timespan.days)
         birthdate = start + timedelta(days=random_days)
         yield Profile(
+            identifier=i,
             first_name=first,
             last_name=last,
             birthdate=birthdate,

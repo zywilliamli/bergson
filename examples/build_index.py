@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset, Value, load_dataset
+from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from bergson import build_index, fit_normalizers
@@ -61,10 +61,16 @@ def main():
         help="Optional column in the dataset that contains the conversation.",
     )
     parser.add_argument(
+        "--processor-path",
+        type=str,
+        default="",
+        help="Path to a precomputed processor.",
+    )
+    parser.add_argument(
         "--stats-sample-size",
         type=int,
         default=10_000,
-        help="Number of examples to use for the second moments",
+        help="Number of examples to use for estimating the processor statistics.",
     )
     parser.add_argument(
         "--drop-columns",
@@ -75,7 +81,8 @@ def main():
     args = parser.parse_args()
 
     # Initialize distributed training
-    dist.init_process_group("nccl")
+    if os.environ.get("LOCAL_RANK") is not None:
+        dist.init_process_group("nccl")
 
     # Set the random seed for reproducibility
     torch.manual_seed(42)
@@ -106,44 +113,64 @@ def main():
     embed.requires_grad_(True)  # Make sure backward hooks are called though
 
     def tokenize(batch):
-        # We're dealing with a prompt-completion dataset
+        kwargs = dict(
+            return_attention_mask=False,
+            return_length=True,
+        )
         if args.completion_column:
-            return tokenizer.apply_chat_template(
-                conversation=[
-                    [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": resp},
-                    ]
-                    for prompt, resp in zip(
-                        batch[args.prompt_column], batch[args.completion_column]
-                    )
-                ],
-                return_dict=True,
-                tokenizer_kwargs=dict(
-                    return_attention_mask=False,
-                    return_length=True,
-                ),
-                truncation=True,
-            )
+            # We're dealing with a prompt-completion dataset
+            convos = [
+                [
+                    {"role": "user", "content": assert_type(str, prompt)},
+                    {"role": "assistant", "content": assert_type(str, resp)},
+                ]
+                for prompt, resp in zip(
+                    batch[args.prompt_column], batch[args.completion_column]
+                )
+            ]
         elif args.conversation_column:
-            return tokenizer.apply_chat_template(
-                conversation=batch[args.conversation_column],
-                return_dict=True,
-                tokenizer_kwargs=dict(
-                    return_attention_mask=False,
-                    return_length=True,
-                ),
-                truncation=True,
+            # We're dealing with a conversation dataset
+            convos = assert_type(
+                list[list[dict[str, str]]],
+                batch[args.conversation_column],
             )
-        # We're dealing with vanilla next-token prediction
         else:
-            return tokenizer(
-                batch[args.prompt_column],
-                return_attention_mask=False,
-                return_length=True,
-                truncation=True,
-            )
-    
+            # We're dealing with vanilla next-token prediction
+            return tokenizer(batch[args.prompt_column], truncation=True, **kwargs)
+
+        # Make sure we only compute loss on the assistant's responses
+        strings = tokenizer.apply_chat_template(convos, tokenize=False)
+        encodings = tokenizer(strings, truncation=True, **kwargs)
+        labels_list: list[list[int]] = []
+
+        for i, convo in enumerate(convos):
+            # Find the spans of the assistant's responses in the tokenized output
+            pos = 0
+            spans: list[tuple[int, int]] = []
+
+            for msg in convo:
+                if msg["role"] != "assistant":
+                    continue
+
+                ans = msg["content"]
+                start = strings[i].find(ans, pos)
+                pos = start + len(ans)  # move past this match
+
+                start_token = encodings.char_to_token(i, start)
+                end_token = encodings.char_to_token(i, pos)
+                spans.append((start_token, end_token))
+
+            # Labels are -100 everywhere except where the assistant's response is
+            tokens = encodings["input_ids"][i]
+            labels = [-100] * len(tokens)
+            for start, end in spans:
+                if start is not None and end is not None:
+                    labels[start:end] = tokens[start:end]
+
+            labels_list.append(labels)
+
+        return dict(**encodings, labels=labels_list)
+
     if args.dataset.endswith(".bin"):
         # TODO: Make this configurable, right now this is just a hack to support
         # the Pythia preshuffled Pile dataset.
@@ -168,9 +195,9 @@ def main():
             else:
                 raise e
 
-        assert "_original_idx" not in ds.column_names, (
-            "The dataset already contains a column named '_original_idx'. "
-        )
+        assert (
+            "_original_idx" not in ds.column_names
+        ), "The dataset already contains a column named '_original_idx'. "
 
         ds = ds.map(lambda x, idx: {**x, "_original_idx": idx}, with_indices=True)
 
@@ -179,12 +206,16 @@ def main():
         ds = ds.shard(world_size, rank)
 
         # Tokenize
-        cols_to_drop = [col for col in ds.column_names if col != "_original_idx"]
-        ds = ds.map(tokenize, batched=True, remove_columns=cols_to_drop)
+        ds = ds.map(tokenize, batched=True)
         ds = ds.sort("length", reverse=True)
         batches = compute_batches(ds["length"], args.token_batch_size)
 
-    if os.path.exists(args.run_name):
+    if os.path.exists(args.processor_path):
+        if rank == 0:
+            print(f"Loading processor from '{args.processor_path}'")
+
+        processor = GradientProcessor.load(args.run_name, map_location=f"cuda:{rank}")
+    elif os.path.exists(args.run_name):
         processor = GradientProcessor.load(args.run_name, map_location=f"cuda:{rank}")
     else:
         if rank == 0:
@@ -217,7 +248,14 @@ def main():
         print("Building index...")
 
     # Build the index
-    build_index(model, ds, processor, args.run_name, batches=batches, drop_columns=args.drop_columns)
+    build_index(
+        model,
+        ds,
+        processor,
+        args.run_name,
+        batches=batches,
+        drop_columns=args.drop_columns,
+    )
     dist.destroy_process_group()
 
 
