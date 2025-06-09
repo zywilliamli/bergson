@@ -8,8 +8,8 @@ from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
 from .data import MemmapDataset, pad_and_tensor
-from .utils import assert_type
 from .gradients import AdafactorNormalizer, GradientCollector, GradientProcessor
+from .utils import assert_type
 
 
 def build_index(
@@ -37,8 +37,8 @@ def build_index(
 
     with GradientCollector(model.base_model, processor) as mgr:
         x, y = pad_and_tensor(
-            first_batch["input_ids"], # type: ignore
-            labels=first_batch.get("labels"), # type: ignore
+            first_batch["input_ids"],  # type: ignore
+            labels=first_batch.get("labels"),  # type: ignore
             device=model.device,
         )
         model(x, labels=y).loss.backward()
@@ -70,14 +70,14 @@ def build_index(
 
             with GradientCollector(model.base_model, processor) as mgr:
                 x, y = pad_and_tensor(
-                    batch["input_ids"], # type: ignore
-                    labels=batch.get("labels"), # type: ignore
+                    batch["input_ids"],  # type: ignore
+                    labels=batch.get("labels"),  # type: ignore
                     device=model.device,
                 )
                 model(x, labels=y).loss.backward()
                 model.zero_grad()
 
-            gradient = mgr.flattened_grads().cpu().float().numpy() 
+            gradient = mgr.flattened_grads().cpu().float().numpy()
 
             for i, g in enumerate(gradient):
                 row = {k: batch[k][i] for k in cols}
@@ -85,10 +85,7 @@ def build_index(
                 yield row
 
     index = assert_type(Dataset, Dataset.from_generator(generator))
-    index = (
-        index.sort("_original_idx")
-            .remove_columns("_original_idx")
-    )
+    index = index.sort("_original_idx").remove_columns("_original_idx")
 
     idx_path = path + f"/rank_{rank}.idx"
     print(f"Saving index to {idx_path}")
@@ -157,11 +154,11 @@ def fit_normalizers(
         batch = data[sl]
 
         # Update progress
-        n = len(range(*sl.indices(len(data))))
+        n = len(batch["input_ids"])
         pbar.update(n)
 
         N += n
-        if max_documents and N >= max_documents:
+        if total and N >= total:
             break
 
         with GradientCollector(model.base_model, closure=callback):

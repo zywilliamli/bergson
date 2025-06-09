@@ -225,7 +225,7 @@ class GradientProcessor:
             pbar.update(n)
 
             N += n
-            if max_documents and N >= max_documents:
+            if total and N >= total:
                 break
 
             with GradientCollector(model.base_model, self, closure=callback):
