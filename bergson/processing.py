@@ -36,7 +36,7 @@ def build_index(
     for sl in tqdm(batches, position=rank):
         batch = data[sl]
 
-        with GradientCollector(model, processor) as mgr:
+        with GradientCollector(model.base_model, processor) as mgr:
             x, y = pad_and_tensor(
                 batch["input_ids"],  # type: ignore
                 labels=batch.get("labels", None),  # type: ignore
@@ -101,6 +101,7 @@ def fit_normalizers(
     """
     moments: dict[str, AdafactorNormalizer] = {}
     rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
 
     # Batch size of one by default
     if batches is None:
@@ -113,25 +114,7 @@ def fit_normalizers(
         rng = random.Random(rank)
         rng.shuffle(batches)
 
-    N = 0
-    pbar = trange(max_documents or len(batches), position=rank)
-    should_break = False
-
     def callback(name: str, g: torch.Tensor):
-        nonlocal N, should_break
-
-        n = len(g)
-        N += n
-        if max_documents:
-            pbar.update(n)
-
-            if N > max_documents:
-                pbar.close()
-                should_break = True
-                return
-        else:
-            pbar.update(1)
-
         # We follow the tensor2tensor implementation of Adafactor, which
         # takes the mean rather than summing over the rows and columns.
         # row: mean over columns, shape [O]
@@ -151,10 +134,22 @@ def fit_normalizers(
         moments[name].row.add_(row_acc)
         moments[name].col.add_(col_acc)
 
+    N = 0
+    total = (max_documents or len(batches)) // world_size
+    pbar = trange(total, position=rank)
+
     for sl in batches:
         batch = data[sl]
 
-        with GradientCollector(model, closure=callback):
+        # Update progress
+        n = len(range(*sl.indices(len(data))))
+        pbar.update(n)
+
+        N += n
+        if max_documents and N >= max_documents:
+            break
+
+        with GradientCollector(model.base_model, closure=callback):
             x, y = pad_and_tensor(
                 batch["input_ids"],  # type: ignore
                 labels=batch.get("labels", None),  # type: ignore
@@ -162,9 +157,6 @@ def fit_normalizers(
             )
             model(x, labels=y).loss.backward()
             model.zero_grad()
-
-        if should_break:
-            break
 
     for moment in moments.values():
         # normalize by the number of examples

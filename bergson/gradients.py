@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from datasets import Dataset
+from natsort import natsorted
 from torch import Tensor
 from torch.utils.hooks import RemovableHandle
 from tqdm.auto import trange
@@ -190,6 +191,7 @@ class GradientProcessor:
         """
         preconditioners = {}
         rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Batch size of one by default
         if batches is None:
@@ -202,25 +204,7 @@ class GradientProcessor:
             rng = random.Random(rank)
             rng.shuffle(batches)
 
-        N = 0
-        pbar = trange(max_documents or len(batches), position=rank)
-        should_break = False
-
         def callback(name: str, g: torch.Tensor):
-            nonlocal N, should_break
-
-            n = len(g)
-            N += n
-            if max_documents:
-                pbar.update(n)
-
-                if N > max_documents:
-                    pbar.close()
-                    should_break = True
-                    return
-            else:
-                pbar.update(1)
-
             # Compute the outer product of the flattened gradient
             g = g.flatten(1).float()
             preconditioner = preconditioners.get(name, None)
@@ -229,10 +213,22 @@ class GradientProcessor:
             else:
                 preconditioner.addmm_(g.mT, g)
 
+        N = 0
+        total = (max_documents or len(batches)) // world_size
+        pbar = trange(total, position=rank)
+
         for sl in batches:
             batch = data[sl]
 
-            with GradientCollector(model, self, closure=callback):
+            # Update progress
+            n = len(range(*sl.indices(len(data))))
+            pbar.update(n)
+
+            N += n
+            if max_documents and N >= max_documents:
+                break
+
+            with GradientCollector(model.base_model, self, closure=callback):
                 x, y = pad_and_tensor(
                     batch["input_ids"],  # type: ignore
                     labels=batch.get("labels", None),  # type: ignore
@@ -241,13 +237,11 @@ class GradientProcessor:
                 model(x, labels=y).loss.backward()
                 model.zero_grad()
 
-            if should_break:
-                break
-
         # Sanity check
+        pbar.close()
         assert preconditioners, "num_examples must be > 0"
 
-        for preconditioner in preconditioners.values():
+        for name, preconditioner in preconditioners.items():
             preconditioner /= N  # Normalize by the number of examples
 
             # Reduce the preconditioners across processes if needed
@@ -524,6 +518,10 @@ class GradientCollector(ContextDecorator):
         for h in self._bwd_hooks:
             h.remove()
 
+        # Naturally sort the collected gradients by name
+        self.collected_grads = {
+            k: self.collected_grads[k] for k in natsorted(self.collected_grads)
+        }
         return False
 
     def flattened_grads(self) -> Tensor:

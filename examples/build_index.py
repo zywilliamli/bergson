@@ -88,9 +88,6 @@ def main():
         ),
         torch_dtype=dtype,
     )
-    from trl import setup_chat_format
-
-    model, tokenizer = setup_chat_format(model, tokenizer)
 
     embed = model.get_input_embeddings()
     model.requires_grad_(False)  # Freeze the model
@@ -140,7 +137,14 @@ def main():
             slice(start, start + batch_size) for start in range(0, len(ds), batch_size)
         ]
     else:
-        ds = assert_type(Dataset, load_dataset(args.dataset, split="train"))
+        try:
+            ds = assert_type(Dataset, load_dataset(args.dataset, split="train"))
+        except ValueError as e:
+            # Automatically use load_from_disk if appropriate
+            if "load_from_disk" in str(e):
+                ds = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
+            else:
+                raise e
 
         # Shuffle before sharding to make sure each rank gets a different subset
         ds = ds.shuffle(seed=42)
