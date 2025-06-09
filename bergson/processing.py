@@ -3,11 +3,12 @@ import random
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset, Sequence, Value, Features
+from datasets import Dataset
 from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
 from .data import MemmapDataset, pad_and_tensor
+from .utils import assert_type
 from .gradients import AdafactorNormalizer, GradientCollector, GradientProcessor
 
 
@@ -48,20 +49,16 @@ def build_index(
 
     first_grads = mgr.flattened_grads().cpu().float().numpy()
 
-    features = Features({
-        "input_ids": Sequence(Value("int32"), length=-1),
-        "gradient": Sequence(Value("float32"), length=int(first_grads.shape[-1])),
-    })
+    cols = ["input_ids"]
     if isinstance(data, Dataset):
-        features["_original_idx"] = Value("int64")
+        cols.append("_original_idx")
 
         if not drop_columns:
-            features.update(data.features)
+            cols.extend(list(data.features.keys()))
+            cols.remove("length")
 
     def generator():
-        nonlocal first_batch, first_grads
-
-        cols = [k for k in features.keys() if k != "gradient"]
+        nonlocal first_batch, first_grads, cols
 
         for i, g in enumerate(first_grads):
             row = {k: first_batch[k][i] for k in cols}
@@ -87,21 +84,15 @@ def build_index(
                 row["gradient"] = g
                 yield row
 
-    index = Dataset.from_generator(
-        generator,
-        features=features,
+    index = assert_type(Dataset, Dataset.from_generator(generator))
+    index = (
+        index.sort("_original_idx")
+            .remove_columns("_original_idx")
     )
 
     idx_path = path + f"/rank_{rank}.idx"
     print(f"Saving index to {idx_path}")
     index.save_to_disk(idx_path)  # type: ignore
-
-    if isinstance(data, Dataset):
-        print(f"Loading and sorting index at {idx_path}")
-        index = Dataset.load_from_disk(idx_path)
-        index = index.sort("_original_idx").remove_columns("_original_idx")
-        print(f"Saving sorted index to {idx_path}")
-        index.save_to_disk(idx_path)
 
     # Save the shapes of the gradients for later use
     if rank == 0:
