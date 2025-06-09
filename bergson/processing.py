@@ -7,17 +7,18 @@ from datasets import Dataset, Sequence, Value, Features
 from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
-from .data import pad_and_tensor
+from .data import MemmapDataset, pad_and_tensor
 from .gradients import AdafactorNormalizer, GradientCollector, GradientProcessor
 
 
 def build_index(
     model: PreTrainedModel,
-    data: Dataset,
+    data: Dataset | MemmapDataset,
     processor: GradientProcessor,
     path: str,
     *,
     batches: list[slice] | None = None,
+    drop_columns: bool = False,
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -35,8 +36,8 @@ def build_index(
 
     with GradientCollector(model.base_model, processor) as mgr:
         x, y = pad_and_tensor(
-            first_batch["input_ids"],
-            labels=first_batch.get("labels"),
+            first_batch["input_ids"], # type: ignore
+            labels=first_batch.get("labels"), # type: ignore
             device=model.device,
         )
         model(x, labels=y).loss.backward()
@@ -46,17 +47,21 @@ def build_index(
     shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
 
     first_grads = mgr.flattened_grads().cpu().float().numpy()
-    features = Features(
-        {
-            **data.features,
-            "gradient": Sequence(Value("float32"), length=int(first_grads.shape[-1])),
-        }
-    )
 
-    def gen():
+    features = Features({
+        "input_ids": Sequence(Value("int32"), length=-1),
+        "gradient": Sequence(Value("float32"), length=int(first_grads.shape[-1])),
+    })
+    if isinstance(data, Dataset):
+        features["_original_idx"] = Value("int64")
+
+        if not drop_columns:
+            features.update(data.features)
+
+    def generator():
         nonlocal first_batch, first_grads
 
-        cols = list(first_batch.keys())
+        cols = [k for k in features.keys() if k != "gradient"]
 
         for i, g in enumerate(first_grads):
             row = {k: first_batch[k][i] for k in cols}
@@ -68,8 +73,8 @@ def build_index(
 
             with GradientCollector(model.base_model, processor) as mgr:
                 x, y = pad_and_tensor(
-                    batch["input_ids"],
-                    labels=batch.get("labels"),
+                    batch["input_ids"], # type: ignore
+                    labels=batch.get("labels"), # type: ignore
                     device=model.device,
                 )
                 model(x, labels=y).loss.backward()
@@ -83,13 +88,20 @@ def build_index(
                 yield row
 
     index = Dataset.from_generator(
-        gen,
+        generator,
         features=features,
     )
 
     idx_path = path + f"/rank_{rank}.idx"
     print(f"Saving index to {idx_path}")
     index.save_to_disk(idx_path)  # type: ignore
+
+    if isinstance(data, Dataset):
+        print(f"Loading and sorting index at {idx_path}")
+        index = Dataset.load_from_disk(idx_path)
+        index = index.sort("_original_idx").remove_columns("_original_idx")
+        print(f"Saving sorted index to {idx_path}")
+        index.save_to_disk(idx_path)
 
     # Save the shapes of the gradients for later use
     if rank == 0:
@@ -103,7 +115,7 @@ def build_index(
 
 def fit_normalizers(
     model: PreTrainedModel,
-    data: Dataset,
+    data: Dataset | MemmapDataset,
     *,
     batches: list[slice] | None = None,
     max_documents: int | None = None,

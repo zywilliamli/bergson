@@ -17,7 +17,7 @@ from torch.utils.hooks import RemovableHandle
 from tqdm.auto import trange
 from transformers import PreTrainedModel
 
-from .data import pad_and_tensor
+from .data import MemmapDataset, pad_and_tensor
 
 NORMALIZER_TYPES: dict[str, type["Normalizer"]] = {}
 
@@ -181,7 +181,7 @@ class GradientProcessor:
     def estimate_preconditioners(
         self,
         model: PreTrainedModel,
-        data: Dataset,
+        data: Dataset | MemmapDataset,
         *,
         batches: list[slice] | None = None,
         max_documents: int | None = None,

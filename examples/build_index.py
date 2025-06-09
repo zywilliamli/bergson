@@ -7,7 +7,7 @@ from datasets import Dataset, Value, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from bergson import build_index, fit_normalizers
-from bergson.data import compute_batches
+from bergson.data import MemmapDataset, compute_batches
 from bergson.gradients import GradientProcessor
 from bergson.utils import assert_type
 
@@ -65,6 +65,12 @@ def main():
         type=int,
         default=10_000,
         help="Number of examples to use for the second moments",
+    )
+    parser.add_argument(
+        "--drop-columns",
+        type=int,
+        default=10_000,
+        help="Only return the new dataset columns",
     )
     args = parser.parse_args()
 
@@ -137,32 +143,46 @@ def main():
                 return_length=True,
                 truncation=True,
             )
-      
-    try:
-        ds = assert_type(Dataset, load_dataset(args.dataset, split="train"))
-    except ValueError as e:
-        # Automatically use load_from_disk if appropriate
-        if "load_from_disk" in str(e):
-            ds = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
-        else:
-            raise e
+    
+    if args.dataset.endswith(".bin"):
+        # TODO: Make this configurable, right now this is just a hack to support
+        # the Pythia preshuffled Pile dataset.
+        MEMMAP_CTX_LEN = 2049
 
-    ds = ds.add_column(
-        "original_index",
-        list(range(len(ds))),
-        new_fingerprint="original_index",
-        feature=Value("int64"),
-    )
+        # If the dataset is a memmap file, use MemmapDataset
+        ds = MemmapDataset(args.dataset, MEMMAP_CTX_LEN)
+        ds = ds.shard(world_size, rank)
 
-    # Shuffle before sharding to make sure each rank gets a different subset
-    ds = ds.shuffle(seed=42)
-    ds = ds.shard(world_size, rank)
+        # Uniform batches
+        batch_size = args.token_batch_size // MEMMAP_CTX_LEN
+        batches = [
+            slice(start, start + batch_size) for start in range(0, len(ds), batch_size)
+        ]
+    else:
+        try:
+            ds = assert_type(Dataset, load_dataset(args.dataset, split="train"))
+        except ValueError as e:
+            # Automatically use load_from_disk if appropriate
+            if "load_from_disk" in str(e):
+                ds = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
+            else:
+                raise e
 
-    # Tokenize
-    cols_to_drop = [col for col in ds.column_names if col != "original_index"]
-    ds = ds.map(tokenize, batched=True, remove_columns=cols_to_drop)
-    ds = ds.sort("length", reverse=True)
-    batches = compute_batches(ds["length"], args.token_batch_size)
+        assert "_original_idx" not in ds.column_names, (
+            "The dataset already contains a column named '_original_idx'. "
+        )
+
+        ds = ds.map(lambda x, idx: {**x, "_original_idx": idx}, with_indices=True)
+
+        # Shuffle before sharding to make sure each rank gets a different subset
+        ds = ds.shuffle(seed=42)
+        ds = ds.shard(world_size, rank)
+
+        # Tokenize
+        cols_to_drop = [col for col in ds.column_names if col != "_original_idx"]
+        ds = ds.map(tokenize, batched=True, remove_columns=cols_to_drop)
+        ds = ds.sort("length", reverse=True)
+        batches = compute_batches(ds["length"], args.token_batch_size)
 
     if os.path.exists(args.run_name):
         processor = GradientProcessor.load(args.run_name, map_location=f"cuda:{rank}")
@@ -197,7 +217,7 @@ def main():
         print("Building index...")
 
     # Build the index
-    build_index(model, ds, processor, args.run_name, batches=batches)
+    build_index(model, ds, processor, args.run_name, batches=batches, drop_columns=args.drop_columns)
     dist.destroy_process_group()
 
 
