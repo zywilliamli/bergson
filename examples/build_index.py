@@ -199,6 +199,10 @@ def main():
             "_original_idx" not in ds.column_names
         ), "The dataset already contains a column named '_original_idx'. "
 
+        metadata = {"length"}
+        if args.drop_columns:
+            metadata.update(set(ds.column_names))
+
         ds = ds.map(lambda x, idx: {**x, "_original_idx": idx}, with_indices=True)
 
         # Shuffle before sharding to make sure each rank gets a different subset

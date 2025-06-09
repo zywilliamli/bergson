@@ -19,7 +19,6 @@ def build_index(
     path: str,
     *,
     batches: list[slice] | None = None,
-    drop_columns: bool = False,
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -49,16 +48,10 @@ def build_index(
 
     first_grads = mgr.flattened_grads().cpu().float().numpy()
 
-    cols = ["input_ids"]
-    if isinstance(data, Dataset):
-        cols.append("_original_idx")
-
-        if not drop_columns:
-            cols.extend(list(data.features.keys()))
-            cols.remove("length")
-
     def generator():
-        nonlocal first_batch, first_grads, cols
+        nonlocal first_batch, first_grads
+
+        cols = list(first_batch.keys())
 
         for i, g in enumerate(first_grads):
             row = {k: first_batch[k][i] for k in cols}
@@ -85,7 +78,7 @@ def build_index(
                 yield row
 
     index = assert_type(Dataset, Dataset.from_generator(generator))
-    index = index.sort("_original_idx").remove_columns("_original_idx")
+    index.sort("_original_idx").remove_columns("_original_idx")
 
     idx_path = path + f"/rank_{rank}.idx"
     print(f"Saving index to {idx_path}")
