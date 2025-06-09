@@ -3,17 +3,17 @@ import random
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset, Sequence, Value
+from datasets import Dataset, Sequence, Value, Features
 from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
-from .data import MemmapDataset, pad_and_tensor
+from .data import pad_and_tensor
 from .gradients import AdafactorNormalizer, GradientCollector, GradientProcessor
 
 
 def build_index(
     model: PreTrainedModel,
-    data: Dataset | MemmapDataset,
+    data: Dataset,
     processor: GradientProcessor,
     path: str,
     *,
@@ -22,61 +22,74 @@ def build_index(
     """
     Compute projected gradients using a subset of the dataset.
     """
-    index = None
     rank = dist.get_rank() if dist.is_initialized() else 0
 
     # Batch size of one by default
     if batches is None:
         batches = [slice(idx, idx + 1) for idx in range(len(data))]
 
-    # Store the grads here
-    gradients = []
-    shapes = {}
+    # Pre-compute first example to define dataset features
+    # and names and shapes of the gradients for serialization
+    first_sl, *rest = batches
+    first_batch = data[first_sl]
 
-    for sl in tqdm(batches, position=rank):
-        batch = data[sl]
+    with GradientCollector(model.base_model, processor) as mgr:
+        x, y = pad_and_tensor(
+            first_batch["input_ids"],
+            labels=first_batch.get("labels"),
+            device=model.device,
+        )
+        model(x, labels=y).loss.backward()
+        model.zero_grad()
 
-        with GradientCollector(model.base_model, processor) as mgr:
-            x, y = pad_and_tensor(
-                batch["input_ids"],  # type: ignore
-                labels=batch.get("labels", None),  # type: ignore
-                device=model.device,
-            )
-            model(x, labels=y).loss.backward()
-            model.zero_grad()
+    # Drop the batch dimension from the shape
+    shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
 
-        # Remember the names and shapes of the gradients for deserialization
-        if not shapes:
-            # Drop the batch dimension from the shape
-            shapes = {name: g.shape[1:] for name, g in mgr.collected_grads.items()}
+    first_grads = mgr.flattened_grads().cpu().float().numpy()
+    features = Features(
+        {
+            **data.features,
+            "gradient": Sequence(Value("float32"), length=int(first_grads.shape[-1])),
+        }
+    )
 
-        grads = mgr.flattened_grads()
-        if isinstance(data, MemmapDataset):
-            if index is None:
-                from faiss import IndexFlat
+    def gen():
+        nonlocal first_batch, first_grads
 
-                index = IndexFlat(grads.shape[1])
-            else:
-                index.add(grads.cpu().float().numpy())  # type: ignore
-        else:
-            gradients.extend(grads.cpu().float().numpy())
+        cols = list(first_batch.keys())
+
+        for i, g in enumerate(first_grads):
+            row = {k: first_batch[k][i] for k in cols}
+            row["gradient"] = g
+            yield row
+
+        for sl in tqdm(rest, position=rank):
+            batch = data[sl]
+
+            with GradientCollector(model.base_model, processor) as mgr:
+                x, y = pad_and_tensor(
+                    batch["input_ids"],
+                    labels=batch.get("labels"),
+                    device=model.device,
+                )
+                model(x, labels=y).loss.backward()
+                model.zero_grad()
+
+            gradient = mgr.flattened_grads().cpu().float().numpy() 
+
+            for i, g in enumerate(gradient):
+                row = {k: batch[k][i] for k in cols}
+                row["gradient"] = g
+                yield row
+
+    index = Dataset.from_generator(
+        gen,
+        features=features,
+    )
 
     idx_path = path + f"/rank_{rank}.idx"
-    if isinstance(data, Dataset):
-        index = data.add_column(  # type: ignore
-            name="gradient",
-            column=gradients,
-            feature=Sequence(Value("float32"), length=gradients[0].shape[-1]),
-        )
-        index.save_to_disk(idx_path)  # type: ignore
-
-        assert isinstance(index, Dataset)
-    else:
-        # Save the index to disk
-        import faiss
-
-        faiss.write_index(index, idx_path)
-        assert isinstance(index, faiss.IndexFlat)
+    print(f"Saving index to {idx_path}")
+    index.save_to_disk(idx_path)  # type: ignore
 
     # Save the shapes of the gradients for later use
     if rank == 0:
@@ -85,13 +98,12 @@ def build_index(
         with open(shapes_path, "w") as f:
             json.dump(shapes, f, indent=2)
 
-    print(f"Saving index to {idx_path}")
     return index
 
 
 def fit_normalizers(
     model: PreTrainedModel,
-    data: Dataset | MemmapDataset,
+    data: Dataset,
     *,
     batches: list[slice] | None = None,
     max_documents: int | None = None,
