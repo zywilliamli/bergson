@@ -131,9 +131,11 @@ def main():
         elif args.conversation_column:
             # We're dealing with a conversation dataset
             convos = assert_type(
-                list[list[dict[str, str]]],
+                list,
                 batch[args.conversation_column],
             )
+            assert_type(list, convos[0])
+            assert_type(dict, convos[0][0])
         else:
             # We're dealing with vanilla next-token prediction
             return tokenizer(batch[args.prompt_column], truncation=True, **kwargs)
@@ -258,7 +260,6 @@ def main():
         processor,
         args.run_name,
         batches=batches,
-        drop_columns=args.drop_columns,
     )
     dist.destroy_process_group()
 
