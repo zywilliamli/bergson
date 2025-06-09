@@ -179,10 +179,16 @@ def main():
         ds = ds.shard(world_size, rank)
 
         # Tokenize
-        cols_to_drop = [col for col in ds.column_names if col != "_original_idx"]
-        ds = ds.map(tokenize, batched=True, remove_columns=cols_to_drop)
+        ds = ds.map(tokenize, batched=True)
         ds = ds.sort("length", reverse=True)
         batches = compute_batches(ds["length"], args.token_batch_size)
+
+        metadata = {"length"}
+        if args.drop_columns:
+            metadata.update(set(ds.column_names) - {"_original_idx", "input_ids"})
+
+        ds = ds.remove_columns(list(metadata))
+
 
     if os.path.exists(args.run_name):
         processor = GradientProcessor.load(args.run_name, map_location=f"cuda:{rank}")
@@ -217,7 +223,7 @@ def main():
         print("Building index...")
 
     # Build the index
-    build_index(model, ds, processor, args.run_name, batches=batches, drop_columns=args.drop_columns)
+    build_index(model, ds, processor, args.run_name, batches=batches)
     dist.destroy_process_group()
 
 
