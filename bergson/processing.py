@@ -78,7 +78,7 @@ def build_index(
                 yield row
 
     index = assert_type(Dataset, Dataset.from_generator(generator))
-    index.sort("_original_idx").remove_columns("_original_idx")
+    index = index.sort("_original_idx").remove_columns("_original_idx")
 
     idx_path = path + f"/rank_{rank}.idx"
     print(f"Saving index to {idx_path}")
