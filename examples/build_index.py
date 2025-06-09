@@ -167,10 +167,14 @@ def main():
                 ds = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
             else:
                 raise e
-
+        
         assert "_original_idx" not in ds.column_names, (
             "The dataset already contains a column named '_original_idx'. "
         )
+
+        metadata = {"length"}
+        if args.drop_columns:
+            metadata.update(set(ds.column_names))
 
         ds = ds.map(lambda x, idx: {**x, "_original_idx": idx}, with_indices=True)
 
@@ -182,10 +186,6 @@ def main():
         ds = ds.map(tokenize, batched=True)
         ds = ds.sort("length", reverse=True)
         batches = compute_batches(ds["length"], args.token_batch_size)
-
-        metadata = {"length"}
-        if args.drop_columns:
-            metadata.update(set(ds.column_names) - {"_original_idx", "input_ids"})
 
         ds = ds.remove_columns(list(metadata))
 
