@@ -71,10 +71,10 @@ def main():
                 raise e
 
         assert (
-            "_original_idx" not in ds.column_names
-        ), "The dataset already contains a column named '_original_idx'. "
+            "row_number" not in ds.column_names
+        ), "The dataset already contains a column named 'row_number'. "
 
-        ds = ds.map(lambda x, idx: {**x, "_original_idx": idx}, with_indices=True)
+        ds = ds.map(lambda x, idx: {**x, "row_number": idx}, with_indices=True)
         ds = ds.shuffle(seed=42).shard(world_size, rank)
 
         # Shuffle before sharding to make sure each rank gets a different subset
