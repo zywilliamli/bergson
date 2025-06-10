@@ -21,27 +21,27 @@ class Profile:
     university: str
 
 
-def generate_profiles(seed: int = 0):
-    name_path = "data/names/"
+def generate_profiles(seed: int = 0, path="data"):
     prng = random.Random(seed)
+    path = path + "/names/"
 
-    with open(name_path + "first_name.txt", "r") as f:
+    with open(path + "first_name.txt", "r") as f:
         first_names = [line.strip() for line in f]
         prng.shuffle(first_names)
 
-    with open(name_path + "last_name.txt", "r") as f:
+    with open(path + "last_name.txt", "r") as f:
         last_names = [line.strip() for line in f]
         prng.shuffle(last_names)
 
-    with open(name_path + "employer.txt", "r") as f:
+    with open(path + "employer.txt", "r") as f:
         employers = [line.strip() for line in f]
         prng.shuffle(employers)
 
-    with open(name_path + "town.txt", "r") as f:
+    with open(path + "town.txt", "r") as f:
         towns = [line.strip() for line in f]
         prng.shuffle(towns)
 
-    with open(name_path + "university.txt", "r") as f:
+    with open(path + "university.txt", "r") as f:
         universities = [line.strip() for line in f]
         prng.shuffle(universities)
 
@@ -64,32 +64,32 @@ def generate_profiles(seed: int = 0):
 
 
 def fact_generator(
+    num_facts: int,
+    path: str = "data",
     seed: int = 0,
-    *,
-    path: str = "data/templates/",
 ):
-    fields = []
-    prng = random.Random(seed)
-
+    fields = {"birthplace": [], "birthdate": [], "employer": [], "university": []}
     # Templates for facts
-    with open(path + "alma mater.txt", "r") as f:
-        fields.append([line.strip() for line in f])
+    for field in fields:
+        with open(path + "/templates/" + field + ".txt", "r") as f:
+            fields[field] = [line.strip() for line in f]
 
-    with open(path + "birthplace.txt", "r") as f:
-        fields.append([line.strip() for line in f])
-
-    with open(path + "birthdate.txt", "r") as f:
-        fields.append([line.strip() for line in f])
-
-    with open(path + "workplace.txt", "r") as f:
-        fields.append([line.strip() for line in f])
-
-    for profile in generate_profiles(seed):
-        prng.shuffle(fields)
-
+    for profile in generate_profiles(seed, path):
         kwargs = asdict(profile)
         kwargs["birthdate"] = profile.birthdate.strftime("%d %B %Y")
 
-        for field in fields:
-            template = prng.choice(field)
-            yield template.format(**kwargs)
+        for field, templates in fields.items():
+            for i, template in enumerate(templates):
+                yield {
+                    "answer": kwargs[field],
+                    "fact": template.format(**kwargs),
+                    "field": field,
+                    "identifier": profile.identifier,
+                    "question": QUESTION_TEMPLATES[field].format(**kwargs),
+                    "template": i,
+                }
+
+            # Limit the number of facts generated
+            num_facts -= 1
+            if num_facts <= 0:
+                return
