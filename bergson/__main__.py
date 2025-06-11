@@ -6,10 +6,10 @@ from datasets import Dataset, load_dataset
 from simple_parsing import parse
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from bergson import build_index, fit_normalizers
-from bergson.data import IndexConfig, MemmapDataset, compute_batches, tokenize
-from bergson.gradients import GradientProcessor
-from bergson.utils import assert_type
+from .data import IndexConfig, MemmapDataset, compute_batches, tokenize
+from .gradients import GradientProcessor
+from .processing import build_index, fit_normalizers
+from .utils import assert_type
 
 
 def main():
@@ -41,6 +41,32 @@ def main():
         ),
         torch_dtype=dtype,
     )
+
+    # Check for PEFT adapters
+    try:
+        adapters = model.active_adapters()
+    except ValueError:
+        target_modules = None
+    else:
+        if rank == 0:
+            print("PEFT model detected; disabling random projection.")
+
+        args.projection_dim = 0
+        target_modules = set()
+
+        for adapter_name in adapters:
+            state = model.get_adapter_state_dict(adapter_name)
+
+            for name in state:
+                prefix = name.removesuffix(".weight")
+                name = prefix + "." + adapter_name
+
+                try:
+                    model.get_submodule(name)
+                except AttributeError:
+                    print(f"Adapter parameter '{name}' not found in the model.")
+
+                target_modules.add(name.removeprefix("model."))
 
     embed = model.get_input_embeddings()
     model.requires_grad_(False)  # Freeze the model
@@ -91,46 +117,41 @@ def main():
         if rank == 0:
             print(f"Loading processor from '{args.processor_path}'")
 
-        processor = GradientProcessor.load(args.run_name, map_location=f"cuda:{rank}")
-    elif os.path.exists(args.run_name):
-        processor = GradientProcessor.load(args.run_name, map_location=f"cuda:{rank}")
+        processor = GradientProcessor.load(args.run_path, map_location=f"cuda:{rank}")
     else:
-        if rank == 0:
-            print("Estimating normalizers...")
-
-        processor = GradientProcessor(
-            normalizers=fit_normalizers(
+        if args.normalizer != "none":
+            normalizers = fit_normalizers(
                 model,
                 ds,
                 batches=batches,
+                kind=args.normalizer,
                 max_documents=args.stats_sample_size or None,
-            ),
+                target_modules=target_modules,
+            )
+        else:
+            normalizers = {}
+
+        processor = GradientProcessor(
+            normalizers,
             projection_dim=args.projection_dim or None,
         )
-
-    if not processor.preconditioners:
-        if rank == 0:
-            print("Estimating preconditioners...")
-
-        # We need a lot of examples for the preconditioner
-        processor.estimate_preconditioners(
-            model,
-            ds,
-            batches=batches,
-            max_documents=args.stats_sample_size or None,
-        )
-        processor.save(args.run_name)
-
-    if rank == 0:
-        print("Building index...")
+        # processor.estimate_preconditioners(
+        #     model,
+        #     ds,
+        #     batches=batches,
+        #     max_documents=args.stats_sample_size or None,
+        #     target_modules=target_modules,
+        # )
+        processor.save(args.run_path)
 
     # Build the index
     build_index(
         model,
         ds,
         processor,
-        args.run_name,
+        args.run_path,
         batches=batches,
+        target_modules=target_modules,
     )
     dist.destroy_process_group()
 
