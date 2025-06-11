@@ -96,6 +96,10 @@ def main():
             else:
                 raise e
 
+        metadata = {"length"}
+        if args.drop_columns:
+            metadata |= set(ds.column_names)
+
         assert (
             "row_number" not in ds.column_names
         ), "The dataset already contains a column named 'row_number'. "
@@ -112,6 +116,8 @@ def main():
         )
         ds = ds.sort("length", reverse=True)
         batches = compute_batches(ds["length"], args.token_batch_size)
+
+        ds = ds.remove_columns(list(metadata))
 
     if os.path.exists(args.processor_path):
         if rank == 0:

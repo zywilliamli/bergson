@@ -37,49 +37,13 @@ def build_index(
     if batches is None:
         batches = [slice(idx, idx + 1) for idx in range(len(data))]
 
-    # Pre-compute first example to define dataset features
-    # and names and shapes of the gradients for serialization
-    first_sl, *rest = batches
-    first_batch = data[first_sl]
-
-    with GradientCollector(
-        model.base_model,
-        processor,
-        target_modules=target_modules,
-    ) as mgr:
-        x, y = pad_and_tensor(
-            first_batch["input_ids"],  # type: ignore
-            labels=first_batch.get("labels"),  # type: ignore
-            device=model.device,
-        )
-        model(x, labels=y).loss.backward()
-        model.zero_grad()
-
-    # Drop the batch dimension from the shape
-    shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
-
-    first_grads = mgr.flattened_grads().cpu().float().numpy()
-
-    features = Features(
-        {
-            "input_ids": Sequence(Value("int32"), length=-1),
-            "gradient": Sequence(Value("float32"), length=first_grads.shape[-1]),
-        }
-    )
-    if isinstance(data, Dataset):
-        features.update(data.features)
+    shapes = None
+    grad_length = -1
 
     def generator():
-        nonlocal first_batch, first_grads
+        nonlocal shapes, grad_length
 
-        cols = list(first_batch.keys())
-
-        for i, g in enumerate(first_grads):
-            row = {k: first_batch[k][i] for k in cols}
-            row["gradient"] = g
-            yield row
-
-        for sl in tqdm(rest, disable=rank != 0, desc="Building index"):
+        for sl in tqdm(batches, disable=rank != 0, desc="Building index"):
             batch = data[sl]
 
             with GradientCollector(
@@ -97,12 +61,22 @@ def build_index(
 
             gradient = mgr.flattened_grads().cpu().float().numpy()
 
+            # Define names, shapes, and lengths of the gradients for serialization
+            if shapes is None:
+                # Drop the batch dimension from the shape
+                shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
+                grad_length = gradient.shape[-1]
+
             for i, g in enumerate(gradient):
-                row = {k: batch[k][i] for k in cols}
+                row = {k: batch[k][i] for k in batch.keys()}
                 row["gradient"] = g
                 yield row
 
-    index = assert_type(Dataset, Dataset.from_generator(generator, features=features))
+    index = assert_type(Dataset, Dataset.from_generator(generator))
+
+    features = index.features.copy()
+    features["gradient"] = Sequence(Value("float32"), length=grad_length)
+    index = index.cast(features=features)
 
     idx_path = path + f"/rank_{rank}.idx"
     index.save_to_disk(idx_path)  # type: ignore
