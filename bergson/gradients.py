@@ -364,7 +364,7 @@ class ProjectionGenerator:
         # Seed the PRNG with the name of the layer and what "side" we are projecting
         message = bytes(f"{name}/{side}", "utf-8")
         digest = hashlib.md5(message).digest()
-        seed = int.from_bytes(digest) % (2**63 - 1)
+        seed = int.from_bytes(digest, byteorder="big") % (2**63 - 1)
 
         A = torch.randn(
             m,

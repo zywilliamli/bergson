@@ -4,7 +4,7 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
+from datasets import Dataset, Features, Sequence, Value
 from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
@@ -60,6 +60,15 @@ def build_index(
 
     first_grads = mgr.flattened_grads().cpu().float().numpy()
 
+    features = Features(
+        {
+            "input_ids": Sequence(Value("int32"), length=-1),
+            "gradient": Sequence(Value("float32"), length=first_grads.shape[-1]),
+        }
+    )
+    if isinstance(data, Dataset):
+        features.update(data.features)
+
     def generator():
         nonlocal first_batch, first_grads
 
@@ -93,7 +102,7 @@ def build_index(
                 row["gradient"] = g
                 yield row
 
-    index = assert_type(Dataset, Dataset.from_generator(generator))
+    index = assert_type(Dataset, Dataset.from_generator(generator, features=features))
     index = index.sort("_original_idx").remove_columns("_original_idx")
 
     idx_path = path + f"/rank_{rank}.idx"
