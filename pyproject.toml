@@ -23,6 +23,9 @@ dev = [
     "pre-commit",
 ]
 
+[project.scripts]
+bergson = "bergson.__main__:run"
+
 [tool.pyright]
 include = ["bergson*"]
 reportPrivateImportUsage = false

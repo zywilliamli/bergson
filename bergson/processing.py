@@ -1,5 +1,6 @@
 import json
 import random
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -8,7 +9,13 @@ from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
 from .data import MemmapDataset, pad_and_tensor
-from .gradients import AdafactorNormalizer, GradientCollector, GradientProcessor
+from .gradients import (
+    AdafactorNormalizer,
+    AdamNormalizer,
+    GradientCollector,
+    GradientProcessor,
+    Normalizer,
+)
 from .utils import assert_type
 
 
@@ -19,6 +26,7 @@ def build_index(
     path: str,
     *,
     batches: list[slice] | None = None,
+    target_modules: set[str] | None = None,
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -34,7 +42,11 @@ def build_index(
     first_sl, *rest = batches
     first_batch = data[first_sl]
 
-    with GradientCollector(model.base_model, processor) as mgr:
+    with GradientCollector(
+        model.base_model,
+        processor,
+        target_modules=target_modules,
+    ) as mgr:
         x, y = pad_and_tensor(
             first_batch["input_ids"],  # type: ignore
             labels=first_batch.get("labels"),  # type: ignore
@@ -67,10 +79,14 @@ def build_index(
             row["gradient"] = g
             yield row
 
-        for sl in tqdm(rest, position=rank):
+        for sl in tqdm(rest, disable=rank != 0, desc="Building index"):
             batch = data[sl]
 
-            with GradientCollector(model.base_model, processor) as mgr:
+            with GradientCollector(
+                model.base_model,
+                processor,
+                target_modules=target_modules,
+            ) as mgr:
                 x, y = pad_and_tensor(
                     batch["input_ids"],  # type: ignore
                     labels=batch.get("labels"),  # type: ignore
@@ -89,7 +105,6 @@ def build_index(
     index = assert_type(Dataset, Dataset.from_generator(generator, features=features))
 
     idx_path = path + f"/rank_{rank}.idx"
-    print(f"Saving index to {idx_path}")
     index.save_to_disk(idx_path)  # type: ignore
 
     # Save the shapes of the gradients for later use
@@ -107,12 +122,14 @@ def fit_normalizers(
     data: Dataset | MemmapDataset,
     *,
     batches: list[slice] | None = None,
+    kind: Literal["adafactor", "adam"] = "adafactor",
     max_documents: int | None = None,
-) -> dict[str, AdafactorNormalizer]:
+    target_modules: set[str] | None = None,
+) -> dict[str, Normalizer]:
     """
     Estimate the second moments of the model's gradients using a subset of the dataset.
     """
-    moments: dict[str, AdafactorNormalizer] = {}
+    normalizers: dict[str, Normalizer] = {}
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -127,7 +144,7 @@ def fit_normalizers(
         rng = random.Random(rank)
         rng.shuffle(batches)
 
-    def callback(name: str, g: torch.Tensor):
+    def adafactor_update(name: str, g: torch.Tensor):
         # We follow the tensor2tensor implementation of Adafactor, which
         # takes the mean rather than summing over the rows and columns.
         # row: mean over columns, shape [O]
@@ -136,20 +153,35 @@ def fit_normalizers(
         # col: mean over rows,    shape [I]
         col_acc = sq.mean(dim=0)
 
-        if name not in moments:
+        if (normalizer := normalizers.get(name)) is None:
             # initialize accumulators at zero
-            moments[name] = AdafactorNormalizer(
+            normalizers[name] = normalizer = AdafactorNormalizer(
                 torch.zeros_like(row_acc),
                 torch.zeros_like(col_acc),
             )
+        else:
+            assert isinstance(normalizer, AdafactorNormalizer)
 
         # in‐place accumulate
-        moments[name].row.add_(row_acc)
-        moments[name].col.add_(col_acc)
+        normalizer.row.add_(row_acc)
+        normalizer.col.add_(col_acc)
+
+    def adam_update(name: str, g: torch.Tensor):
+        sq = g.square_().float().sum(0)
+
+        # initialize accumulators at zero
+        if (normalizer := normalizers.get(name)) is None:
+            normalizers[name] = normalizer = AdamNormalizer(torch.zeros_like(sq))
+        else:
+            assert isinstance(normalizer, AdamNormalizer)
+
+        # in‐place accumulate
+        normalizer.avg_sq.add_(sq)
 
     N = 0
+    callback = adafactor_update if kind == "adafactor" else adam_update
     total = (max_documents or len(batches)) // world_size
-    pbar = trange(total, position=rank)
+    pbar = trange(total, disable=rank != 0, desc="Estimating normalizers")
 
     for sl in batches:
         batch = data[sl]
@@ -162,7 +194,11 @@ def fit_normalizers(
         if total and N >= total:
             break
 
-        with GradientCollector(model.base_model, closure=callback):
+        with GradientCollector(
+            model.base_model,
+            closure=callback,
+            target_modules=target_modules,
+        ):
             x, y = pad_and_tensor(
                 batch["input_ids"],  # type: ignore
                 labels=batch.get("labels", None),  # type: ignore
@@ -171,13 +207,20 @@ def fit_normalizers(
             model(x, labels=y).loss.backward()
             model.zero_grad()
 
-    for moment in moments.values():
-        # normalize by the number of examples
-        moment.row.div_(N)
-        moment.col.div_(N)
+    # Divide by the number of documents processed and average across all ranks
+    for normalizer in normalizers.values():
+        if isinstance(normalizer, AdamNormalizer):
+            normalizer.avg_sq.div_(N)
 
-        if dist.is_initialized():
-            dist.all_reduce(moment.row, op=dist.ReduceOp.AVG)
-            dist.all_reduce(moment.col, op=dist.ReduceOp.AVG)
+            if dist.is_initialized():
+                dist.all_reduce(normalizer.avg_sq, op=dist.ReduceOp.AVG)
 
-    return moments
+        elif isinstance(normalizer, AdafactorNormalizer):
+            normalizer.row.div_(N)
+            normalizer.col.div_(N)
+
+            if dist.is_initialized():
+                dist.all_reduce(normalizer.row, op=dist.ReduceOp.AVG)
+                dist.all_reduce(normalizer.col, op=dist.ReduceOp.AVG)
+
+    return normalizers

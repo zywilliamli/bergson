@@ -185,6 +185,7 @@ class GradientProcessor:
         *,
         batches: list[slice] | None = None,
         max_documents: int | None = None,
+        target_modules: set[str] | None = None,
     ):
         """
         Estimate preconditioners from data. Overwrites the `preconditioners` field.
@@ -215,7 +216,7 @@ class GradientProcessor:
 
         N = 0
         total = (max_documents or len(batches)) // world_size
-        pbar = trange(total, position=rank)
+        pbar = trange(total, disable=rank != 0, desc="Estimating preconditioners")
 
         for sl in batches:
             batch = data[sl]
@@ -228,7 +229,12 @@ class GradientProcessor:
             if total and N >= total:
                 break
 
-            with GradientCollector(model.base_model, self, closure=callback):
+            with GradientCollector(
+                model.base_model,
+                self,
+                closure=callback,
+                target_modules=target_modules,
+            ):
                 x, y = pad_and_tensor(
                     batch["input_ids"],  # type: ignore
                     labels=batch.get("labels", None),  # type: ignore
@@ -394,6 +400,13 @@ class GradientCollector(ContextDecorator):
     """Closure to call on the gradient as it is collected. If provided, we will not
     store the gradient after the closure is called."""
 
+    target_modules: set[str] | None = None
+    """
+    List of parameter names to collect gradients for. Should consist only of weight
+    matrices in `nn.Linear` modules. If `None`, the gradients for all weight matrices
+    will be collected.
+    """
+
     def __post_init__(self):
         self._fwd_hooks: list[RemovableHandle] = []
         self._bwd_hooks: list[RemovableHandle] = []
@@ -407,6 +420,10 @@ class GradientCollector(ContextDecorator):
             if not isinstance(layer, nn.Linear):
                 continue
 
+            if self.target_modules is not None and name not in self.target_modules:
+                continue
+
+            # print(f"{name} → {layer.weight.shape}")
             dtype = layer.weight.dtype
             if not dtype.is_floating_point:
                 # bitsandbytes uses fp16 as the computation dtype

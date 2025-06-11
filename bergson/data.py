@@ -2,11 +2,12 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import torch
 from datasets import Dataset, concatenate_datasets, load_from_disk
+from simple_parsing import field
 from torch.utils.data import Dataset as TorchDataset
 
 from .utils import assert_type
@@ -16,7 +17,7 @@ from .utils import assert_type
 class IndexConfig:
     """Config for building the index and running the model/dataset pipeline."""
 
-    run_name: str
+    run_path: str = field(positional=True)
     """Name of the run. Used to create a directory for the index."""
 
     model: str = "HuggingFaceTB/SmolLM2-135M"
@@ -42,6 +43,9 @@ class IndexConfig:
 
     conversation_column: str = ""
     """Optional column in the dataset that contains the conversation."""
+
+    normalizer: Literal["adafactor", "adam", "none"] = "adafactor"
+    """Type of normalizer to use for the gradients."""
 
     processor_path: str = ""
     """Path to a precomputed processor."""
@@ -114,7 +118,7 @@ def compute_batches(lengths, max_tokens: int):
     return batches
 
 
-def load_and_concatenate_ranked_datasets(root_dir: str) -> Dataset:
+def load_index(root_dir: str) -> Dataset:
     """
     Walk `root_dir`, find all subdirectories matching 'rank_{integer}.idx',
     load the HF dataset from each, and concatenate them in ascending order
