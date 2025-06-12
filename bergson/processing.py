@@ -3,6 +3,7 @@ import random
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from datasets import Dataset, Features, Sequence, Value
 from tqdm.auto import tqdm, trange
@@ -56,9 +57,16 @@ def build_index(
                     labels=batch.get("labels"),  # type: ignore
                     device=model.device,
                 )
-                model(x, labels=y).loss.backward()
+                logits = model(x).logits
+                loss = F.cross_entropy(
+                    logits[:, :-1].reshape(-1, logits.size(-1)),
+                    y[:, 1:].flatten(),
+                    reduction="none",
+                )
+                loss.mean().backward()
                 model.zero_grad()
 
+            loss = loss.detach().cpu().float().numpy()
             gradient = mgr.flattened_grads().cpu().float().numpy()
 
             # Define names, shapes, and lengths of the gradients for serialization
@@ -67,9 +75,10 @@ def build_index(
                 shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
                 grad_length = gradient.shape[-1]
 
-            for i, g in enumerate(gradient):
+            for i, (g, l) in enumerate(zip(gradient, loss)):
                 row = {k: batch[k][i] for k in batch.keys()}
                 row["gradient"] = g
+                row["loss"] = l
                 yield row
 
     index = assert_type(Dataset, Dataset.from_generator(generator))
