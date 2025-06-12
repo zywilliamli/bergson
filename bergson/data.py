@@ -47,6 +47,9 @@ class IndexConfig:
     normalizer: Literal["adafactor", "adam", "none"] = "adafactor"
     """Type of normalizer to use for the gradients."""
 
+    fisher_fourth_root: bool = False
+    """Whether to use the fourth root of the Fisher information matrix."""
+
     processor_path: str = ""
     """Path to a precomputed processor."""
 

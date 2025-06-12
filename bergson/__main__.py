@@ -49,9 +49,8 @@ def main():
         target_modules = None
     else:
         if rank == 0:
-            print("PEFT model detected; disabling random projection.")
+            print("PEFT model detected.")
 
-        args.projection_dim = 0
         target_modules = set()
 
         for adapter_name in adapters:
@@ -139,6 +138,7 @@ def main():
 
         processor = GradientProcessor(
             normalizers,
+            fisher_fourth_root=args.fisher_fourth_root,
             projection_dim=args.projection_dim or None,
         )
         # processor.estimate_preconditioners(

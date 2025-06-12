@@ -3,9 +3,9 @@ import random
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-from datasets import Dataset, Features, Sequence, Value
+import torch.nn.functional as F
+from datasets import Dataset, Sequence, Value
 from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
@@ -44,7 +44,8 @@ def build_index(
     def generator():
         nonlocal shapes, grad_length
 
-        for sl in tqdm(batches, disable=rank != 0, desc="Building index"):
+        pbar = tqdm(batches, disable=rank != 0, desc="Building index")
+        for sl in pbar:
             batch = data[sl]
 
             with GradientCollector(
@@ -58,15 +59,19 @@ def build_index(
                     device=model.device,
                 )
                 logits = model(x).logits
-                loss = F.cross_entropy(
+                losses = F.cross_entropy(
                     logits[:, :-1].reshape(-1, logits.size(-1)),
                     y[:, 1:].flatten(),
                     reduction="none",
                 )
-                loss.mean().backward()
+                avg_loss = losses.mean()
+                avg_loss.backward()
+
+                pbar.set_postfix(
+                    loss=f"{avg_loss.item():.3f}",
+                )
                 model.zero_grad()
 
-            loss = loss.detach().cpu().float().numpy()
             gradient = mgr.flattened_grads().cpu().float().numpy()
 
             # Define names, shapes, and lengths of the gradients for serialization
@@ -75,10 +80,9 @@ def build_index(
                 shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
                 grad_length = gradient.shape[-1]
 
-            for i, (g, l) in enumerate(zip(gradient, loss)):
+            for i, (g, l) in enumerate(zip(gradient, losses.tolist())):
                 row = {k: batch[k][i] for k in batch.keys()}
-                row["gradient"] = g
-                row["loss"] = l
+                row.update(gradient=g, loss=l)
                 yield row
 
     index = assert_type(Dataset, Dataset.from_generator(generator))

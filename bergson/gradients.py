@@ -47,7 +47,12 @@ class Normalizer(ABC):
         return cls(**state_dict)
 
     @abstractmethod
-    def normalize_(self, grad: Tensor, eps: float = 1e-8) -> Tensor:
+    def normalize_(
+        self,
+        grad: Tensor,
+        fisher_fourth_root: bool = False,
+        eps: float = 1e-8,
+    ) -> Tensor:
         """
         Normalize gradients in-place, adding a small epsilon to avoid division by zero.
         """
@@ -78,7 +83,12 @@ class AdafactorNormalizer(Normalizer):
         assert self.col.ndim == 1, f"Expected 1D tensor for col, got {self.col.ndim}D"
 
     @torch.compile
-    def normalize_(self, grad: Tensor, eps: float = 1e-30) -> Tensor:
+    def normalize_(
+        self,
+        grad: Tensor,
+        fisher_fourth_root: bool = False,
+        eps: float = 1e-30,
+    ) -> Tensor:
         """
         Normalize the row and column sums by adding a small epsilon.
 
@@ -104,8 +114,12 @@ class AdafactorNormalizer(Normalizer):
         # by diag(a) and right-multiplying by diag(b). In this case we can represent
         # the elementwise reciprocal square root of V as ab^T where:
         # a = denom.sqrt() * r.rsqrt() and b = c.rsqrt()
-        a = denom.sqrt() * r.rsqrt_()  # shape [O]
-        b = c.rsqrt_()
+        if fisher_fourth_root:
+            a = denom.pow(0.25) * r.pow(-0.25)
+            b = c.pow(-0.25)
+        else:
+            a = denom.sqrt() * r.rsqrt_()  # shape [O]
+            b = c.rsqrt_()
 
         # Implicitly do the Hadamard product
         grad *= a[:, None]  # [N, O] * [O] → [N, O]
@@ -134,10 +148,16 @@ class AdamNormalizer(Normalizer):
     avg_sq: Tensor
 
     @torch.compile
-    def normalize_(self, grad: Tensor, eps: float = 1e-8) -> Tensor:
+    def normalize_(
+        self,
+        grad: Tensor,
+        fisher_fourth_root: bool = False,
+        eps: float = 1e-8,
+    ) -> Tensor:
         """Normalize the gradients by the square root of the second moments."""
         # Adam-style epsilon is added outside the square root
-        return grad.div_(self.avg_sq.sqrt().add_(eps))
+        denom = self.avg_sq.pow(0.25) if fisher_fourth_root else self.avg_sq.sqrt()
+        return grad.div_(denom.add_(eps))
 
     def to_adafactor(self) -> AdafactorNormalizer:
         """
@@ -172,6 +192,14 @@ class GradientProcessor:
     """
     Dictionary of preconditioners for each matrix-valued parameter in the model.
     These are applied after the normalization and random projection steps.
+    """
+
+    fisher_fourth_root: bool = False
+    """
+    Whether to use the fourth root of the inverse Fisher information matrix when
+    normalizing gradients. This means any inner product between normalized gradients
+    will implicitly use the square root of the inverse Fisher, rather than the inverse
+    Fisher itself.
     """
 
     projection_dim: int | None = None
@@ -423,7 +451,6 @@ class GradientCollector(ContextDecorator):
             if self.target_modules is not None and name not in self.target_modules:
                 continue
 
-            # print(f"{name} → {layer.weight.shape}")
             dtype = layer.weight.dtype
             if not dtype.is_floating_point:
                 # bitsandbytes uses fp16 as the computation dtype
@@ -456,7 +483,12 @@ class GradientCollector(ContextDecorator):
         # Pre-scale the input by the Adafactor column stats
         norm = self.processor.normalizers.get(module._name)
         if isinstance(norm, AdafactorNormalizer):
-            b = norm.col.add(1e-30).rsqrt_()
+            b = norm.col.add(1e-30)
+            if self.processor.fisher_fourth_root:
+                b.pow_(-0.25)
+            else:
+                b.rsqrt_()
+
             x = x * b.type_as(x)  # [N, S, I] * [I] → [N, S, I]
 
         # If we're not using AdamNormalizer, we can randomly project the input here
@@ -487,9 +519,12 @@ class GradientCollector(ContextDecorator):
             # Compare to the normalize_ method in AdafactorNormalizer
             r = norm.row.add(1e-30)
 
-            a = r.mean().sqrt() * r.rsqrt_()
+            if self.processor.fisher_fourth_root:
+                a = r.mean().pow(0.25) * r.pow(-0.25)
+            else:
+                a = r.mean().sqrt() * r.rsqrt_()
+
             G = G * a.type_as(G)  # [N, S, O] * [O] → [N, S, O]
-            # I = I * b.type_as(I)  # [N, S, I] * [I] → [N, S, I]
 
         # For Adam, we need to materialize the full gradient and then project
         if isinstance(norm, AdamNormalizer):
@@ -508,7 +543,6 @@ class GradientCollector(ContextDecorator):
         else:
             if p is not None:
                 A = self.generator.projection(module._name, p, o, "left")
-                # I = I @ B.T  # [N, S, q]
                 G = G @ A.T  # [N, S, p]
 
             P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
