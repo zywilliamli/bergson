@@ -5,7 +5,7 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from datasets import Dataset, Sequence, Value
+from datasets import Dataset, Features, Sequence, Value
 from tqdm.auto import tqdm, trange
 from transformers import PreTrainedModel
 
@@ -17,7 +17,6 @@ from .gradients import (
     GradientProcessor,
     Normalizer,
 )
-from .utils import assert_type
 
 
 def build_index(
@@ -38,26 +37,33 @@ def build_index(
     if batches is None:
         batches = [slice(idx, idx + 1) for idx in range(len(data))]
 
-    shapes = None
-    grad_length = -1
+    collector = GradientCollector(
+        model.base_model,
+        processor,
+        target_modules=target_modules,
+    )
+    features = (
+        data.features.copy()
+        if isinstance(data, Dataset)
+        else Features(input_ids=Value("string"))
+    )
+    # Make sure gradients are stored in fp16 for efficiency
+    features.update(
+        gradient=Sequence(Value("float16"), length=collector.gradient_size()),
+        loss=Sequence(Value("float16")),
+    )
 
     def generator():
-        nonlocal shapes, grad_length
-
         pbar = tqdm(batches, disable=rank != 0, desc="Building index")
         for sl in pbar:
             batch = data[sl]
+            x, y = pad_and_tensor(
+                batch["input_ids"],  # type: ignore
+                labels=batch.get("labels"),  # type: ignore
+                device=model.device,
+            )
 
-            with GradientCollector(
-                model.base_model,
-                processor,
-                target_modules=target_modules,
-            ) as mgr:
-                x, y = pad_and_tensor(
-                    batch["input_ids"],  # type: ignore
-                    labels=batch.get("labels"),  # type: ignore
-                    device=model.device,
-                )
+            with collector:
                 logits = model(x).logits
                 losses = F.cross_entropy(
                     logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -75,35 +81,20 @@ def build_index(
                 )
                 model.zero_grad()
 
-            gradient = mgr.flattened_grads().cpu().float().numpy()
-            losses = losses.detach().cpu().float().numpy()
-
-            # Define names, shapes, and lengths of the gradients for serialization
-            if shapes is None:
-                # Drop the batch dimension from the shape
-                shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
-                grad_length = gradient.shape[-1]
+            gradient = collector.flattened_grads().half().cpu().numpy()
+            losses = losses.detach().half().cpu().numpy()
 
             for i, (g, l, m) in enumerate(zip(gradient, losses, mask.cpu())):
                 row = {k: batch[k][i] for k in batch.keys()}
                 row.update(gradient=g, loss=l[m])
                 yield row
 
-    index = assert_type(Dataset, Dataset.from_generator(generator))
+    index = Dataset.from_generator(generator, features)
+    index.save_to_disk(path + f"/rank_{rank}.idx")  # type: ignore
 
-    features = index.features.copy()
-    features["gradient"] = Sequence(Value("float32"), length=grad_length)
-    index = index.cast(features=features)
-
-    idx_path = path + f"/rank_{rank}.idx"
-    index.save_to_disk(idx_path)  # type: ignore
-
-    # Save the shapes of the gradients for later use
     if rank == 0:
-        shapes_path = path + "/shapes.json"
-
-        with open(shapes_path, "w") as f:
-            json.dump(shapes, f, indent=2)
+        with open(path + "/shapes.json", "w") as f:
+            json.dump(collector.shapes(), f, indent=2)
 
     return index
 

@@ -6,7 +6,6 @@ from bergson.gradients import (
     AdamNormalizer,
     GradientCollector,
     GradientProcessor,
-    ProjectionGenerator,
 )
 
 
@@ -22,7 +21,8 @@ def test_phi3():
     # Test with 16 x 16 random projection as well as with no projection
     for p in (16, None):
         processor = GradientProcessor(projection_dim=p)
-        with GradientCollector(model, processor) as collector:
+        collector = GradientCollector(model, processor)
+        with collector:
             model.zero_grad()
             model(**inputs).loss.backward()
 
@@ -30,7 +30,6 @@ def test_phi3():
         adams: dict[str, AdamNormalizer] = {}
 
         # Go through the motions of what GradientCollector does, but after the fact
-        generator = ProjectionGenerator(model.device, model.dtype)
         for name, collected_grad in collector.collected_grads.items():
             layer = model.get_submodule(name)
 
@@ -40,8 +39,8 @@ def test_phi3():
 
             moments = g.square()
             if p is not None:
-                A = generator.projection(name, p, o, "left")
-                B = generator.projection(name, p, i, "right")
+                A = collector.projection(name, p, o, "left")
+                B = collector.projection(name, p, i, "right")
                 g = A @ g @ B.T
 
             torch.testing.assert_close(g, collected_grad.squeeze(0))
@@ -53,11 +52,11 @@ def test_phi3():
         # Now do it again but this time use the normalizers
         for normalizers in (adafactors, adams):
             processor = GradientProcessor(normalizers=normalizers, projection_dim=p)
-            with GradientCollector(model, processor) as collector:
+            collector = GradientCollector(model, processor)
+            with collector:
                 model.zero_grad()
                 model(**inputs).loss.backward()
 
-            generator = ProjectionGenerator(model.device, model.dtype)
             for name, collected_grad in collector.collected_grads.items():
                 layer = model.get_submodule(name)
 
@@ -67,8 +66,8 @@ def test_phi3():
 
                 g = normalizers[name].normalize_(g)
                 if p is not None:
-                    A = generator.projection(name, p, o, "left")
-                    B = generator.projection(name, p, i, "right")
+                    A = collector.projection(name, p, o, "left")
+                    B = collector.projection(name, p, i, "right")
                     g = A @ g @ B.T
 
                 # Compare the normalized gradient with the collected gradient. We use a

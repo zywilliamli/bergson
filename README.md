@@ -17,7 +17,7 @@ pip install .
 The first step is to build an index of gradients for each training sample. You can do this from the command line, using `bergson` as a CLI tool:
 
 ```bash
-bergson <output_path> --model <model_name> --dataset <dataset_name> --output <output_path>
+bergson <output_path> --model <model_name> --dataset <dataset_name>
 ```
 
 This will create a directory at `<output_path>` containing the gradients for each training sample in the specified dataset. The `--model` and `--dataset` arguments should be compatible with the Hugging Face `transformers` library. By default it assumes that the dataset has a `text` column, but you can specify other columns using `--prompt_column` and optionally `--completion_column`. The `--help` flag will show you all available options.

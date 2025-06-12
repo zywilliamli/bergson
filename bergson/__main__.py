@@ -12,7 +12,7 @@ from .processing import build_index, fit_normalizers
 from .utils import assert_type
 
 
-def main():
+def run():
     args = parse(IndexConfig)
 
     # Initialize distributed training
@@ -166,4 +166,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()

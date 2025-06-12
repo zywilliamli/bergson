@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import random
 from abc import ABC, abstractmethod
@@ -350,61 +351,6 @@ class GradientProcessor:
         torch.save(self.preconditioners, precond_path)
 
 
-class ProjectionGenerator:
-    """Object that deterministically yields pseudorandom projection matrices."""
-
-    def __init__(
-        self,
-        device: torch.device,
-        dtype: torch.dtype | None,
-    ):
-        self.dtype = dtype
-        self.history: dict[tuple[str, int, int], torch.Tensor] = {}
-        self.prng = torch.Generator(device).manual_seed(0)
-
-        # Check that the PRNG implementation has not changed from what we expect.
-        # If this test fails, we may need to start using NumPy's PRNG instead, or
-        # explicitly save the random projection matrices.
-        res = torch.randint(
-            0,
-            torch.iinfo(torch.int64).max,
-            (),
-            generator=self.prng,
-            device=device,
-        )
-        expected = {
-            "cpu": 900450186894289456,
-            "cuda": 7361108121267848589,
-        }
-        if (val := expected.get(device.type)) is not None:
-            assert res == val, f"Expected PRNG to return {val} for seed 0, got {res}"
-        else:
-            raise ValueError(f"Unsupported device type: {device.type}")
-
-    def projection(
-        self,
-        name: str,
-        m: int,
-        n: int,
-        side: Literal["left", "right"],
-    ) -> Tensor:
-        """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
-        # Seed the PRNG with the name of the layer and what "side" we are projecting
-        message = bytes(f"{name}/{side}", "utf-8")
-        digest = hashlib.md5(message).digest()
-        seed = int.from_bytes(digest, byteorder="big") % (2**63 - 1)
-
-        A = torch.randn(
-            m,
-            n,
-            device=self.prng.device,
-            dtype=self.dtype,
-            generator=self.prng.manual_seed(seed),
-        )
-        A /= A.norm(dim=1, keepdim=True)
-        return A
-
-
 @dataclass
 class GradientCollector(ContextDecorator):
     """
@@ -436,14 +382,13 @@ class GradientCollector(ContextDecorator):
     """
 
     def __post_init__(self):
+        self.collected_grads: dict[str, Tensor] = {}
         self._fwd_hooks: list[RemovableHandle] = []
         self._bwd_hooks: list[RemovableHandle] = []
 
-        self.collected_grads: dict[str, Tensor] = {}
-        self.generator: ProjectionGenerator | None = None
+        self.target_info: dict[str, tuple[torch.device, torch.dtype, torch.Size]] = {}
 
-    def __enter__(self):
-        # install a hook on every Linear
+        # Before we add any hooks, we need to peek at what modules we need to track.
         for name, layer in self.model.named_modules():
             if not isinstance(layer, nn.Linear):
                 continue
@@ -456,11 +401,45 @@ class GradientCollector(ContextDecorator):
                 # bitsandbytes uses fp16 as the computation dtype
                 dtype = torch.float16
 
-            if self.generator is None:
-                self.generator = ProjectionGenerator(
-                    layer.weight.device,
-                    dtype,
-                )
+            # Users of this class really like to know ahead of time what the shapes are
+            self.target_info[name] = layer.weight.device, dtype, layer.weight.shape
+
+    def gradient_size(self) -> int:
+        """Expected flattened size of the gradients collected by this collector."""
+        return sum(math.prod(s) for s in self.shapes().values())
+
+    def shapes(self) -> Mapping[str, torch.Size]:
+        """Return the shapes of the gradients collected by this collector."""
+        if (p_dim := self.processor.projection_dim) is not None:
+            return {name: torch.Size((p_dim, p_dim)) for name in self.target_info}
+
+        # If we don't have a projection dimension, we can just use the original shapes.
+        return {name: shape for name, (_, _, shape) in self.target_info.items()}
+
+    def projection(
+        self,
+        name: str,
+        m: int,
+        n: int,
+        side: Literal["left", "right"],
+    ) -> Tensor:
+        """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
+        # Seed the PRNG with the name of the layer and what "side" we are projecting
+        message = bytes(f"{name}/{side}", "utf-8")
+        digest = hashlib.md5(message).digest()
+        seed = int.from_bytes(digest, byteorder="big") % (2**63 - 1)
+
+        device, dtype, _ = self.target_info[name]
+        prng = torch.Generator(device).manual_seed(seed)
+
+        A = torch.randn(m, n, device=device, dtype=dtype, generator=prng)
+        A /= A.norm(dim=1, keepdim=True)
+        return A
+
+    def __enter__(self):
+        # Install a hook on every Linear
+        for name in self.target_info:
+            layer = self.model.get_submodule(name)
 
             # Save the name of the layer for later use
             layer._name = name  # type: ignore[attr-defined]
@@ -472,6 +451,9 @@ class GradientCollector(ContextDecorator):
             # register backward hook to compute P = sum(U @ V^T)
             bwd_hook = layer.register_full_backward_hook(self._process_grad)
             self._bwd_hooks.append(bwd_hook)
+
+        # Clean up any collected gradients from previous runs
+        self.collected_grads.clear()
 
         return self
 
@@ -495,10 +477,8 @@ class GradientCollector(ContextDecorator):
         # to save memory, rather than waiting until the backward pass.
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
-            assert self.generator is not None, "Generator must be initialized"
-
             i = module.in_features
-            x = x @ self.generator.projection(module._name, p, i, "right").T
+            x = x @ self.projection(module._name, p, i, "right").T
 
         module._inputs = x
 
@@ -506,7 +486,6 @@ class GradientCollector(ContextDecorator):
         """Process the incoming gradient wrt the output of the module."""
         # Sanity checks
         assert isinstance(module, nn.Linear), "Expected a Linear module"
-        assert self.generator is not None, "Generator must be initialized"
         G = grad_out[0]  # [N, S, O]
         I = module._inputs  # [N, S, I/q]
 
@@ -535,14 +514,14 @@ class GradientCollector(ContextDecorator):
 
             # Project the gradients to the lower-dimensional space
             if p is not None:
-                A = self.generator.projection(module._name, p, o, "left")
-                B = self.generator.projection(module._name, p, i, "right")
+                A = self.projection(module._name, p, o, "left")
+                B = self.projection(module._name, p, i, "right")
                 P = A @ P @ B.T  # [N, p, q]
 
         # Both Adafactor and no normalizer, we can project G first
         else:
             if p is not None:
-                A = self.generator.projection(module._name, p, o, "left")
+                A = self.projection(module._name, p, o, "left")
                 G = G @ A.T  # [N, S, p]
 
             P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]

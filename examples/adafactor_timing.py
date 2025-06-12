@@ -10,7 +10,6 @@ from bergson.gradients import (
     AdamNormalizer,
     GradientCollector,
     GradientProcessor,
-    ProjectionGenerator,
 )
 
 torch._dynamo.cache_size = 0  # Disable cache size limit for this example
@@ -86,14 +85,13 @@ if __name__ == "__main__":
     assert p is not None, "Projection dimension must be set"
 
     # Go through the motions of what GradientCollector does, but after the fact
-    generator = ProjectionGenerator(model.device, model.dtype)
     for name, layer in model.named_modules():
         if not isinstance(layer, nn.Linear):
             continue
 
         o, i = layer.out_features, layer.in_features
-        A = generator.projection(name, p, o, "left")
-        B = generator.projection(name, p, i, "right")
+        A = collector.projection(name, p, o, "left")
+        B = collector.projection(name, p, i, "right")
 
         g = layer.weight.grad
         assert g is not None
