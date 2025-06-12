@@ -63,8 +63,11 @@ def build_index(
                     logits[:, :-1].reshape(-1, logits.size(-1)),
                     y[:, 1:].flatten(),
                     reduction="none",
-                )
-                avg_loss = losses.mean()
+                ).reshape_as(y[:, 1:])
+
+                mask = y[:, 1:] != -100
+                denoms = mask.sum(dim=1, dtype=logits.dtype)
+                avg_loss = losses.sum(1).div(denoms).mean()
                 avg_loss.backward()
 
                 pbar.set_postfix(
@@ -73,6 +76,7 @@ def build_index(
                 model.zero_grad()
 
             gradient = mgr.flattened_grads().cpu().float().numpy()
+            losses = losses.detach().cpu().float().numpy()
 
             # Define names, shapes, and lengths of the gradients for serialization
             if shapes is None:
@@ -80,9 +84,9 @@ def build_index(
                 shapes = {n: g.shape[1:] for n, g in mgr.collected_grads.items()}
                 grad_length = gradient.shape[-1]
 
-            for i, (g, l) in enumerate(zip(gradient, losses.tolist())):
+            for i, (g, l, m) in enumerate(zip(gradient, losses, mask.cpu())):
                 row = {k: batch[k][i] for k in batch.keys()}
-                row.update(gradient=g, loss=l)
+                row.update(gradient=g, loss=l[m])
                 yield row
 
     index = assert_type(Dataset, Dataset.from_generator(generator))

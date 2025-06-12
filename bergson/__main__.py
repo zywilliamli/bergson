@@ -103,7 +103,7 @@ def main():
             "row_number" not in ds.column_names
         ), "The dataset already contains a column named 'row_number'. "
 
-        ds = ds.map(lambda x, idx: {**x, "row_number": idx}, with_indices=True)
+        ds = ds.map(lambda _, idx: dict(row_number=idx), with_indices=True)
         ds = ds.shuffle(seed=42).shard(world_size, rank)
 
         # Shuffle before sharding to make sure each rank gets a different subset
@@ -122,7 +122,10 @@ def main():
         if rank == 0:
             print(f"Loading processor from '{args.processor_path}'")
 
-        processor = GradientProcessor.load(args.run_path, map_location=f"cuda:{rank}")
+        processor = GradientProcessor.load(
+            args.processor_path,
+            map_location=f"cuda:{rank}",
+        )
     else:
         if args.normalizer != "none":
             normalizers = fit_normalizers(
