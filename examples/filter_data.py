@@ -84,19 +84,23 @@ def main(
     model_name: str,
     dataset_name: str,
     index: str | None = None,
+    name: str | None = None,
     reverse: bool = False,
 ):
     rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(rank)
 
-    run_name = (
-        f"{model_name.split('/')[-1]}-{dataset_name.split('/')[-1]}-{filter}"
-        f"{'-reverse' if reverse else ''}"
-    )
+    if name is None:
+        run_name = (
+            f"{model_name.split('/')[-1]}-{dataset_name.split('/')[-1]}-{filter}"
+            f"{'-reverse' if reverse else ''}"
+        )
+    else:
+        run_name = name
 
     with nullcontext() if rank == 0 else redirect_stdout(None):
         dataset = assert_type(Dataset, load_dataset(dataset_name, split="train"))
-        
+
         if filter == "attribution":
             dataset = add_index(dataset, index)
 
@@ -107,11 +111,11 @@ def main(
             seed=42,
             load_from_cache_file=True,
             train_indices_cache_file_name=f"cache/{run_name}/train.arrow",
-            test_indices_cache_file_name=f"cache/{run_name}/test.arrow"
+            test_indices_cache_file_name=f"cache/{run_name}/test.arrow",
         ).values()
 
-        train.set_format("torch") 
-        eval.set_format("torch") 
+        train.set_format("torch")
+        eval.set_format("torch")
 
         print("Filtering...")
         if filter == "attribution":
@@ -125,7 +129,9 @@ def main(
                         "importance_score": (row["gradient"].cuda() @ eval_grad).item(),
                     }
 
-            train = assert_type(Dataset, Dataset.from_generator(importance_score_generator))
+            train = assert_type(
+                Dataset, Dataset.from_generator(importance_score_generator)
+            )
             train = select_topk(train, n, "importance_score", reverse=reverse)
         elif filter == "classification":
             ranks = {"excellent": 4, "good": 3, "average": 2, "poor": 1, "very poor": 0}
@@ -146,7 +152,7 @@ def main(
         else:
             raise ValueError(f"Invalid filter: {filter}")
 
-        # TODO switch to data.tokenize util 
+        # TODO switch to data.tokenize util
         # https://huggingface.co/blog/dvgodoy/fine-tuning-llm-hugging-face
         if "conversation" in train.column_names:
             train = train.rename_column("conversation", "messages")
@@ -155,11 +161,12 @@ def main(
             train = train.remove_columns(list(metadata))
             eval = eval.remove_columns(list(set(eval.column_names) - {"messages"}))
         elif "response" in train.column_names:
+
             def to_pc(x):
                 return {"prompt": x["instruction"], "completion": x["response"]}
-            
+
             train = train.map(to_pc, remove_columns=train.column_names)
-            eval = eval.map(to_pc, remove_columns=eval.column_names)    
+            eval = eval.map(to_pc, remove_columns=eval.column_names)
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -195,7 +202,6 @@ def main(
                 group_by_length=True,
                 completion_only_loss=True,
                 ddp_find_unused_parameters=False,
-                gradient_checkpointing=True,
                 seed=42,
             ),
             processing_class=tokenizer,
@@ -204,10 +210,8 @@ def main(
         trainer.train()
 
         if rank == 0:
-            trainer.save_model(f"runs/{run_name}")
-            trainer.push_to_hub(f"EleutherAI/{run_name}")
-            tokenizer.save_pretrained(f"runs/{run_name}")
-            tokenizer.push_to_hub(f"EleutherAI/{run_name}")
+            trainer.save_model(f"examples/runs/{run_name}")
+            tokenizer.save_pretrained(f"examples/runs/{run_name}")
 
 
 @dataclass
@@ -226,15 +230,25 @@ class FilterConfig(SFTConfig):
     index: str = ""
     """Bergson index to use for attribution filtering."""
 
+    name: str | None = None
+    """Name of the run, used to save the model and tokenizer."""
+
     n: int = 30_000
     """Number of items to select from the training set."""
 
     reverse: bool = False
     """Reverse the scores."""
 
+
 if __name__ == "__main__":
     args = parse(FilterConfig)
 
     main(
-        args.filter, args.n, args.model, args.dataset, args.index, args.reverse
+        args.filter,
+        args.n,
+        args.model,
+        args.dataset,
+        args.index,
+        args.name,
+        args.reverse,
     )
