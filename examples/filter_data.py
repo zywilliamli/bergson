@@ -224,7 +224,7 @@ class FilterConfig(SFTConfig):
     dataset: str = "argilla/magpie-ultra-v0.1"
     """Dataset identifier to finetune on."""
 
-    filter: Literal["classification", "attribution", "random"] = "classification"
+    filter: Literal["classification", "attribution", "random"] = "attribution"
     """Filter to apply to the training set before finetuning."""
 
     index: str = ""
