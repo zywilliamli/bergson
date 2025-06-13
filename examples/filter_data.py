@@ -13,8 +13,44 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import SFTConfig, SFTTrainer, setup_chat_format
 
-from bergson.data import load_index
+from bergson.data import load_index, tokenize
 from bergson.utils import assert_type
+
+
+@dataclass
+class FilterConfig():
+    """Config for building the index and running the model/dataset pipeline."""
+
+    model: str = "HuggingFaceTB/SmolLM2-1.7B"
+    """Name of the model to load."""
+
+    dataset: str = "argilla/magpie-ultra-v0.1"
+    """Dataset identifier to finetune on."""
+
+    filter: Literal["classification", "attribution", "loss", "random"] = "attribution"
+    """Filter to apply to the training set before finetuning."""
+
+    index: str = ""
+    """Bergson index to use for attribution and loss filtering."""
+
+    name: str | None = None
+    """Name of the run, used to save the model and tokenizer."""
+
+    n: int = 30_000
+    """Number of items to select from the training set."""
+
+    lowest: bool = False
+    """Select the lowest scores."""
+
+    prompt_column: str = "text"
+    """Column in the dataset that contains the prompts."""
+
+    completion_column: str = ""
+    """Optional column in the dataset that contains the completions."""
+
+    conversation_column: str = ""
+    """Optional column in the dataset that contains the conversation."""
+
 
 
 def select_topk(ds: Dataset, n: int, key: str, lowest: bool = False):
@@ -40,7 +76,7 @@ def add_index(
     dataset: Dataset,
     index: str | None = None,
 ) -> Dataset:
-    assert index is not None, "Index must be provided for attribution filtering"
+    assert index is not None, "Index must be provided for attribution or loss filtering"
 
     gradient_ds = (
         load_index(index)
@@ -79,30 +115,24 @@ def get_importance_scores(train: Dataset, test: Dataset, batch_size: int):
 
 
 def main(
-    filter: Literal["classification", "attribution", "random"],
-    n: int,
-    model_name: str,
-    dataset_name: str,
-    index: str | None = None,
-    name: str | None = None,
-    lowest: bool = False,
+    args: FilterConfig,
 ):
     rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(rank)
 
-    if name is None:
+    if args.name is None:
         run_name = (
-            f"{model_name.split('/')[-1]}-{dataset_name.split('/')[-1]}-{filter}"
-            f"{'-lowest' if lowest else ''}"
+            f"{args.model.split('/')[-1]}-{args.dataset.split('/')[-1]}-{args.filter}"
+            f"{'-lowest' if args.lowest else ''}"
         )
     else:
-        run_name = name
+        run_name = args.name
 
     with nullcontext() if rank == 0 else redirect_stdout(None):
-        dataset = assert_type(Dataset, load_dataset(dataset_name, split="train"))
+        dataset = assert_type(Dataset, load_dataset(args.dataset, split="train"))
 
-        if filter == "attribution":
-            dataset = add_index(dataset, index)
+        if args.filter == "attribution" or args.filter == "loss":
+            dataset = add_index(dataset, args.index)
 
         dataset.shuffle(42).with_format("torch")
 
@@ -118,7 +148,7 @@ def main(
         eval.set_format("torch")
 
         print("Filtering...")
-        if filter == "attribution":
+        if args.filter == "attribution":
             eval_grad = assert_type(Tensor, eval["gradient"]).mean(0).cuda()
 
             def importance_score_generator():
@@ -132,8 +162,8 @@ def main(
             train = assert_type(
                 Dataset, Dataset.from_generator(importance_score_generator)
             )
-            train = select_topk(train, n, "importance_score", lowest=lowest)
-        elif filter == "classification":
+            train = select_topk(train, args.n, "importance_score", lowest=args.lowest)
+        elif args.filter == "classification":
             ranks = {"excellent": 4, "good": 3, "average": 2, "poor": 1, "very poor": 0}
 
             def add_rank(ex):
@@ -143,40 +173,34 @@ def main(
             train = (
                 train.map(add_rank)
                 .filter(lambda x: x["_q"] >= 0)
-                .sort("_q", reverse=not lowest)
-                .select(range(min(n, len(train))))
+                .sort("_q", reverse=not args.lowest)
+                .select(range(min(args.n, len(train))))
                 .remove_columns("_q")
             )
-        elif filter == "random":
-            train = train.select(range(min(n, len(train))))
+        elif args.filter == "loss":
+            train = select_topk(train, args.n, "loss", lowest=args.lowest)
+        elif args.filter == "random":
+            train = train.select(range(min(args.n, len(train))))
         else:
-            raise ValueError(f"Invalid filter: {filter}")
-
-        # TODO switch to data.tokenize util
-        # https://huggingface.co/blog/dvgodoy/fine-tuning-llm-hugging-face
-        if "conversation" in train.column_names:
-            train = train.rename_column("conversation", "messages")
-            eval = eval.rename_column("conversation", "messages")
-            metadata = set(train.column_names) - {"messages"}
-            train = train.remove_columns(list(metadata))
-            eval = eval.remove_columns(list(set(eval.column_names) - {"messages"}))
-        elif "response" in train.column_names:
-
-            def to_pc(x):
-                return {"prompt": x["instruction"], "completion": x["response"]}
-
-            train = train.map(to_pc, remove_columns=train.column_names)
-            eval = eval.map(to_pc, remove_columns=eval.column_names)
+            raise ValueError(f"Invalid filter: {args.filter}")
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_name,
+            args.model,
             torch_dtype="bfloat16",
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name, max_length=8192)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, max_length=8192)
         model, tokenizer = setup_chat_format(model, tokenizer)
 
-        print("Current chat format:")
-        print(tokenizer.chat_template)
+        train = train.map(
+            tokenize,
+            batched=True,
+            fn_kwargs=dict(args=args, tokenizer=tokenizer),
+        )
+        eval = eval.map(
+            tokenize,
+            batched=True,
+            fn_kwargs=dict(args=args, tokenizer=tokenizer),
+        )
 
         # https://github.com/huggingface/alignment-handbook/blob/main/recipes/smollm2/sft/config.yaml
         trainer = SFTTrainer(
@@ -204,7 +228,6 @@ def main(
                 ddp_find_unused_parameters=False,
                 seed=42,
             ),
-            processing_class=tokenizer,
         )
 
         trainer.train()
@@ -214,41 +237,9 @@ def main(
             tokenizer.save_pretrained(f"examples/runs/{run_name}")
 
 
-@dataclass
-class FilterConfig():
-    """Config for building the index and running the model/dataset pipeline."""
-
-    model: str = "HuggingFaceTB/SmolLM2-1.7B"
-    """Name of the model to load."""
-
-    dataset: str = "argilla/magpie-ultra-v0.1"
-    """Dataset identifier to finetune on."""
-
-    filter: Literal["classification", "attribution", "random"] = "attribution"
-    """Filter to apply to the training set before finetuning."""
-
-    index: str = ""
-    """Bergson index to use for attribution filtering."""
-
-    name: str | None = None
-    """Name of the run, used to save the model and tokenizer."""
-
-    n: int = 30_000
-    """Number of items to select from the training set."""
-
-    lowest: bool = False
-    """Select the lowest scores."""
-
-
 if __name__ == "__main__":
     args = parse(FilterConfig)
 
     main(
-        args.filter,
-        args.n,
-        args.model,
-        args.dataset,
-        args.index,
-        args.name,
-        args.lowest,
+        args
     )
