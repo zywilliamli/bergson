@@ -215,7 +215,7 @@ def main(
 
 
 @dataclass
-class FilterConfig(SFTConfig):
+class FilterConfig():
     """Config for building the index and running the model/dataset pipeline."""
 
     model: str = "HuggingFaceTB/SmolLM2-1.7B"
