@@ -17,11 +17,11 @@ from bergson.data import load_index
 from bergson.utils import assert_type
 
 
-def select_topk(ds: Dataset, n: int, key: str, reverse: bool = False):
+def select_topk(ds: Dataset, n: int, key: str, lowest: bool = False):
     heap = []
 
     for idx, s in enumerate(ds[key]):
-        key = -s if reverse else s
+        key = -s if lowest else s
 
         if len(heap) < n:
             heapq.heappush(heap, (key, idx))
@@ -85,7 +85,7 @@ def main(
     dataset_name: str,
     index: str | None = None,
     name: str | None = None,
-    reverse: bool = False,
+    lowest: bool = False,
 ):
     rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(rank)
@@ -93,7 +93,7 @@ def main(
     if name is None:
         run_name = (
             f"{model_name.split('/')[-1]}-{dataset_name.split('/')[-1]}-{filter}"
-            f"{'-reverse' if reverse else ''}"
+            f"{'-lowest' if lowest else ''}"
         )
     else:
         run_name = name
@@ -132,7 +132,7 @@ def main(
             train = assert_type(
                 Dataset, Dataset.from_generator(importance_score_generator)
             )
-            train = select_topk(train, n, "importance_score", reverse=reverse)
+            train = select_topk(train, n, "importance_score", lowest=lowest)
         elif filter == "classification":
             ranks = {"excellent": 4, "good": 3, "average": 2, "poor": 1, "very poor": 0}
 
@@ -143,7 +143,7 @@ def main(
             train = (
                 train.map(add_rank)
                 .filter(lambda x: x["_q"] >= 0)
-                .sort("_q", reverse=True)
+                .sort("_q", reverse=not lowest)
                 .select(range(min(n, len(train))))
                 .remove_columns("_q")
             )
@@ -236,8 +236,8 @@ class FilterConfig():
     n: int = 30_000
     """Number of items to select from the training set."""
 
-    reverse: bool = False
-    """Reverse the scores."""
+    lowest: bool = False
+    """Select the lowest scores."""
 
 
 if __name__ == "__main__":
@@ -250,5 +250,5 @@ if __name__ == "__main__":
         args.dataset,
         args.index,
         args.name,
-        args.reverse,
+        args.lowest,
     )
