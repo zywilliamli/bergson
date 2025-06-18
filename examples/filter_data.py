@@ -36,7 +36,7 @@ class FilterConfig():
     name: str | None = None
     """Name of the run, used to save the model and tokenizer."""
 
-    n: int = 30_000
+    num_examples: int = 30_000
     """Number of items to select from the training set."""
 
     lowest: bool = False
@@ -51,6 +51,14 @@ class FilterConfig():
     conversation_column: str = ""
     """Optional column in the dataset that contains the conversation."""
 
+    seed: int = 42
+    """Seed for reproducibility."""
+
+
+def set_seeds(seed: int):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
 
 def select_topk(ds: Dataset, n: int, key: str, lowest: bool = False):
@@ -83,7 +91,7 @@ def add_index(
         .with_format("torch")
         .map(normalize_batch, batched=True, batch_size=512)
         .sort("row_number")
-        .select_columns(["gradient", "row_number"])
+        .select_columns(["gradient", "loss", "row_number"])
     )
 
     def generator():
@@ -117,6 +125,8 @@ def get_importance_scores(train: Dataset, test: Dataset, batch_size: int):
 def main(
     args: FilterConfig,
 ):
+    set_seeds(args.seed)
+
     rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(rank)
 
@@ -124,6 +134,7 @@ def main(
         run_name = (
             f"{args.model.split('/')[-1]}-{args.dataset.split('/')[-1]}-{args.filter}"
             f"{'-lowest' if args.lowest else ''}"
+            f"-s={args.seed}"
         )
     else:
         run_name = args.name
@@ -134,11 +145,11 @@ def main(
         if args.filter == "attribution" or args.filter == "loss":
             dataset = add_index(dataset, args.index)
 
-        dataset.shuffle(42).with_format("torch")
+        dataset.shuffle(args.seed).with_format("torch")
 
         train, eval = dataset.train_test_split(
             test_size=0.05,
-            seed=42,
+            seed=args.seed,
             load_from_cache_file=True,
             train_indices_cache_file_name=f"cache/{run_name}/train.arrow",
             test_indices_cache_file_name=f"cache/{run_name}/test.arrow",
@@ -148,21 +159,23 @@ def main(
         eval.set_format("torch")
 
         print("Filtering...")
-        if args.filter == "attribution":
-            eval_grad = assert_type(Tensor, eval["gradient"]).mean(0).cuda()
+        if args.num_examples == 0:
+            pass
+        elif args.filter == "attribution":
+            mean_train_grad = assert_type(Tensor, train["gradient"]).mean(0).cuda()
 
             def importance_score_generator():
                 for row in train:
                     row = dict(row)
                     yield {
                         **row,
-                        "importance_score": (row["gradient"].cuda() @ eval_grad).item(),
+                        "importance_score": (row["gradient"].cuda() @ mean_train_grad).item(),
                     }
 
             train = assert_type(
                 Dataset, Dataset.from_generator(importance_score_generator)
             )
-            train = select_topk(train, args.n, "importance_score", lowest=args.lowest)
+            train = select_topk(train, args.num_examples, "importance_score", lowest=args.lowest)
         elif args.filter == "classification":
             ranks = {"excellent": 4, "good": 3, "average": 2, "poor": 1, "very poor": 0}
 
@@ -174,13 +187,17 @@ def main(
                 train.map(add_rank)
                 .filter(lambda x: x["_q"] >= 0)
                 .sort("_q", reverse=not args.lowest)
-                .select(range(min(args.n, len(train))))
+                .select(range(min(args.num_examples, len(train))))
                 .remove_columns("_q")
             )
         elif args.filter == "loss":
-            train = select_topk(train, args.n, "loss", lowest=args.lowest)
+            train = train.map(
+                lambda x: {"loss": x["loss"].mean().item()},
+                remove_columns=["gradient"],
+            )
+            train = select_topk(train, args.num_examples, "loss", lowest=args.lowest)
         elif args.filter == "random":
-            train = train.select(range(min(args.n, len(train))))
+            train = train.select(range(min(args.num_examples, len(train))))
         else:
             raise ValueError(f"Invalid filter: {args.filter}")
 
@@ -210,12 +227,13 @@ def main(
             args=SFTConfig(
                 max_length=8192,
                 max_seq_length=8192,
-                output_dir=f"runs/{run_name}",
+                output_dir=f"examples/runs/{run_name}",
                 per_device_train_batch_size=1,
                 per_device_eval_batch_size=1,
                 gradient_accumulation_steps=32,
+                gradient_checkpointing=True,
                 learning_rate=3e-4,
-                num_train_epochs=2,
+                num_train_epochs=1,
                 warmup_ratio=0.1,
                 lr_scheduler_type="cosine",
                 bf16=True,
@@ -226,11 +244,11 @@ def main(
                 group_by_length=True,
                 completion_only_loss=True,
                 ddp_find_unused_parameters=False,
-                seed=42,
+                seed=args.seed,
             ),
         )
 
-        trainer.train()
+        trainer.train() # resume_from_checkpoint=True
 
         if rank == 0:
             trainer.save_model(f"examples/runs/{run_name}")
