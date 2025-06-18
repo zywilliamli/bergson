@@ -20,6 +20,8 @@ from bergson.utils import assert_type
 @dataclass
 class FilterConfig():
     """Config for building the index and running the model/dataset pipeline."""
+    filter: Literal["classification", "attribution", "loss", "random"] = "attribution"
+    """Filter to apply to the training set before finetuning."""
 
     model: str = "HuggingFaceTB/SmolLM2-1.7B"
     """Name of the model to load."""
@@ -27,11 +29,14 @@ class FilterConfig():
     dataset: str = "argilla/magpie-ultra-v0.1"
     """Dataset identifier to finetune on."""
 
-    filter: Literal["classification", "attribution", "loss", "random"] = "attribution"
-    """Filter to apply to the training set before finetuning."""
-
-    index: str = ""
+    dataset_index: str = ""
     """Bergson index to use for attribution and loss filtering."""
+
+    query_index: str = ""
+    """
+    The mean of this index's gradients will be used to query the dataset index for 
+    attribution filtering. When unspecified the query is the mean of the value gradients.
+    """
 
     name: str | None = None
     """Name of the run, used to save the model and tokenizer."""
@@ -119,10 +124,21 @@ def main(
         run_name = args.name
 
     with nullcontext() if rank == 0 else redirect_stdout(None):
+        if args.query_index and args.filter == "attribution":
+            query_index = (
+                load_index(args.query_index)
+                    .with_format("torch")
+                    .map(normalize_batch, batched=True, batch_size=512)      
+            )
+            query = assert_type(Tensor, query_index["gradient"]).mean(0).cuda()
+            del query_index
+        else:
+            query = None
+        
         dataset = assert_type(Dataset, load_dataset(args.dataset, split="train"))
 
         if args.filter == "attribution" or args.filter == "loss":
-            dataset = add_index(dataset, args.index)
+            dataset = add_index(dataset, args.dataset_index)
 
         dataset.shuffle(args.seed).with_format("torch")
 
@@ -141,14 +157,15 @@ def main(
         if args.num_examples == 0:
             pass
         elif args.filter == "attribution":
-            mean_train_grad = assert_type(Tensor, train["gradient"]).mean(0).cuda()
-
+            if query == None:
+                query = train["gradient"].mean(0).cuda()
+            
             def importance_score_generator():
                 for row in train:
                     row = dict(row)
                     yield {
                         **row,
-                        "importance_score": (row["gradient"].cuda() @ mean_train_grad).item(),
+                        "importance_score": (row["gradient"].cuda() @ query).item(),
                     }
 
             train = assert_type(
@@ -227,7 +244,7 @@ def main(
             ),
         )
 
-        trainer.train() # resume_from_checkpoint=True
+        trainer.train()
 
         if rank == 0:
             trainer.save_model(f"examples/runs/{run_name}")
