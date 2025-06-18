@@ -101,27 +101,6 @@ def add_index(
     return assert_type(Dataset, Dataset.from_generator(generator))
 
 
-def get_importance_scores(train: Dataset, test: Dataset, batch_size: int):
-    """
-    Assign training items influence scores for the test set.
-    Does not normalize gradients with second moment estimates.
-    """
-
-    mean_test_grads = assert_type(Tensor, test["gradient"]).mean(0).cuda()
-
-    scores = torch.empty(len(train))
-    for i in tqdm(range(0, len(train), batch_size)):
-        batch = assert_type(Tensor, train["gradient"])[i : i + batch_size].cuda()
-        if len(batch) == 0:
-            continue
-
-        # Compute the influence scores for this batch
-        batch_scores = batch @ mean_test_grads
-        scores[i : i + batch_size] = batch_scores.cpu()
-
-    return scores
-
-
 def main(
     args: FilterConfig,
 ):
