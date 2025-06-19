@@ -109,7 +109,7 @@ def collect_gradients(
         # longer before syncing.
         indices = batch.get("_row") or sl
         grad_buffer[indices, :] = torch.cat(mod_grads, dim=1).numpy()
-        per_doc_losses[indices] = losses.detach()
+        per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
         mod_grads.clear()
 
     if dist.is_initialized():
@@ -126,7 +126,7 @@ def collect_gradients(
         data = data.sort("_row").remove_columns("_row")
         data = data.add_column(
             "loss",
-            per_doc_losses,
+            per_doc_losses.cpu().numpy(),
             feature=Value("float16"),
             new_fingerprint="loss",
         )
