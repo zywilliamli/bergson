@@ -123,13 +123,13 @@ def collect_gradients(
         name: prec / len(data) for name, prec in preconditioners.items()
     }
     if rank == 0:
+        data = data.sort("_row").remove_columns("_row")
         data = data.add_column(
             "loss",
             per_doc_losses,
             feature=Value("float16"),
             new_fingerprint="loss",
         )
-        data = data.sort("_row").remove_columns("_row")
         data.save_to_disk(path + "/data.hf")
 
         processor.save(path)
