@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from typing import Literal, Sequence
 
 import numpy as np
+import pyarrow as pa
 import torch
 import torch.distributed as dist
+from datasets import Dataset
 from numpy.typing import DTypeLike
 from simple_parsing import field
 
@@ -140,7 +142,7 @@ def create_index(root: str, dtype: DTypeLike, shape: tuple[int, ...]) -> np.memm
 
 
 def load_gradients(root_dir: str) -> np.memmap:
-    """ """
+    """Map the gradients stored in `root_dir` into memory."""
     with open(os.path.join(root_dir, "info.json")) as f:
         info = json.load(f)
         grad_size = info["grad_size"]
@@ -153,6 +155,17 @@ def load_gradients(root_dir: str) -> np.memmap:
         shape=(num_grads, grad_size),
     )
     return mmap
+
+
+def load_gradient_dataset(root_dir: str) -> Dataset:
+    """Load a dataset of gradients from `root_dir`."""
+    mmap = load_gradients(root_dir)
+    flat = pa.array(mmap.reshape(-1))
+    col = pa.FixedSizeListArray.from_arrays(flat, mmap.shape[1])
+
+    # Create a Dataset with the gradients as a single column
+    ds = Dataset.load_from_disk(root_dir + "/data.hf")
+    return ds.add_column("gradients", col, new_fingerprint="grads")
 
 
 def pad_and_tensor(
