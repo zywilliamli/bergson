@@ -74,6 +74,11 @@ class IndexConfig:
     """Only return the new dataset columns."""
 
 
+def ceildiv(a: int, b: int) -> int:
+    """Ceiling division of two integers."""
+    return -(-a // b)  # Equivalent to math.ceil(a / b) but faster for integers
+
+
 def compute_batches(lengths, max_tokens: int):
     """Split a list of lengths into batches that do not exceed `max_tokens`.
 
@@ -92,7 +97,7 @@ def compute_batches(lengths, max_tokens: int):
     for idx, length in enumerate(lengths):
         # Would adding this `length` exceed the capacity?
         if tokens_in_batch + length > max_tokens:
-            batch = slice(start + rank, idx, world_size)
+            batch = slice(start, idx)
             if lengths[batch]:
                 batches.append(batch)
 
@@ -105,11 +110,28 @@ def compute_batches(lengths, max_tokens: int):
 
     # Add the last batch if it has any items
     if start < len(lengths):
-        batch = slice(start + rank, len(lengths), world_size)
+        batch = slice(start, len(lengths))
         if lengths[batch]:
             batches.append(batch)
 
-    return batches
+    min_batches = ceildiv(len(batches), world_size)
+    local_batches = batches[rank::world_size]
+    if len(local_batches) < min_batches:
+        # Split the last batch in two
+        last_batch = local_batches[-1]
+        batch_len = last_batch.stop - last_batch.start
+
+        if batch_len <= 2:
+            raise RuntimeError(
+                "Unable to evenly split data into batches. Please pad the dataset to a"
+                " multiple of the world size."
+            )
+
+        local_batches[-1] = slice(last_batch.start, last_batch.start + batch_len // 2)
+        local_batches.append(slice(last_batch.start + batch_len // 2, last_batch.stop))
+
+    assert len(local_batches) == min_batches
+    return local_batches
 
 
 def create_index(root: str, dtype: DTypeLike, shape: tuple[int, ...]) -> np.memmap:

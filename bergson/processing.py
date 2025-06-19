@@ -43,9 +43,13 @@ def collect_gradients(
     mod_grads = []
     preconditioners = {}
 
+    # TODO: Handle this more elegantly
+    lo = torch.finfo(torch.float16).min
+    hi = torch.finfo(torch.float16).max
+
     def callback(name: str, g: torch.Tensor):
-        # We aren't interested in the matrix-shape of the gradient
-        g = g.flatten(1)
+        # Prevent infs when casting to fp16 from bf16 or fp32
+        g = g.flatten(1).clamp_(lo, hi)
 
         # Asynchronously move the gradient to CPU and convert to fp16
         mod_grads.append(g.to(device="cpu", dtype=torch.float16, non_blocking=True))
@@ -112,16 +116,17 @@ def collect_gradients(
         per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
         mod_grads.clear()
 
+    chols = {}
+    for name, prec in preconditioners.items():
+        if dist.is_initialized():
+            dist.all_reduce(prec)
+
+        chols[name] = torch.linalg.cholesky(prec / len(data))
+
+    processor.preconditioners = chols
     if dist.is_initialized():
         dist.reduce(per_doc_losses, dst=0)
 
-        for prec in preconditioners.values():
-            dist.all_reduce(prec)
-
-    # Divide the preconditioners by the number of documents processed
-    processor.preconditioners = {
-        name: prec / len(data) for name, prec in preconditioners.items()
-    }
     if rank == 0:
         data = data.sort("_row").remove_columns("_row")
         data = data.add_column(
