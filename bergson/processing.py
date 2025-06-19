@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from datasets import Dataset
+from datasets import Dataset, Value
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel
 
@@ -72,7 +72,12 @@ def collect_gradients(
         dtype=np.float16,
         shape=(len(data), grad_size),
     )
-    per_token_losses: list[np.ndarray] = []
+    per_doc_losses = torch.full(
+        (len(data),),
+        device=model.device,
+        dtype=torch.float16,
+        fill_value=0.0,
+    )
 
     for sl in tqdm(batches, disable=rank != 0, desc="Building index"):
         batch = data[sl]
@@ -92,17 +97,9 @@ def collect_gradients(
 
             masks = y[:, 1:] != -100
             denoms = masks.sum(dim=1, dtype=logits.dtype)
-            avg_loss = losses.sum(1).div(denoms).mean()
+            losses = losses.sum(1).div(denoms)
 
-            # Start sending losses to the CPU just before the backward. Don't force
-            # a blocking host-device sync here.
-            losses = losses.detach().to(
-                device="cpu",
-                dtype=torch.float16,
-                non_blocking=True,
-            )
-            masks = masks.to(device="cpu", non_blocking=True)
-            avg_loss.backward()
+            losses.mean().backward()
 
             model.zero_grad()
 
@@ -112,14 +109,30 @@ def collect_gradients(
         # longer before syncing.
         indices = batch.get("_row") or sl
         grad_buffer[indices, :] = torch.cat(mod_grads, dim=1).numpy()
+        per_doc_losses[indices] = losses.detach()
         mod_grads.clear()
 
-        for loss, mask in zip(losses, masks):
-            # We only store the losses for the tokens that are not masked
-            per_token_losses.append(loss[mask].numpy())
+    if dist.is_initialized():
+        dist.reduce(per_doc_losses, dst=0)
 
-    processor.preconditioners = preconditioners
-    processor.save(path)
+        for prec in preconditioners.values():
+            dist.all_reduce(prec)
+
+    # Divide the preconditioners by the number of documents processed
+    processor.preconditioners = {
+        name: prec / len(data) for name, prec in preconditioners.items()
+    }
+    if rank == 0:
+        data = data.add_column(
+            "loss",
+            per_doc_losses,
+            feature=Value("float16"),
+            new_fingerprint="loss",
+        )
+        data = data.sort("_row").remove_columns("_row")
+        data.save_to_disk(path + "/data.hf")
+
+        processor.save(path)
 
     # Make sure the gradients are written to disk
     grad_buffer.flush()

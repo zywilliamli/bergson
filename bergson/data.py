@@ -75,8 +75,10 @@ class IndexConfig:
 def compute_batches(lengths, max_tokens: int):
     """Split a list of lengths into batches that do not exceed `max_tokens`.
 
-    If `torch.distributed` is initialized, the batches are sliced to ensure
-    that each process only works on its own subset of the data.
+    Each batch is intended to be sharded into roughly equal parts across all available
+    processes in a distributed setup. Accordingly, if `torch.distributed` is
+    initialized, the batches are sliced to ensure that each process only works on its
+    own subset of the data.
     """
     start = 0
     tokens_in_batch = 0
@@ -88,8 +90,9 @@ def compute_batches(lengths, max_tokens: int):
     for idx, length in enumerate(lengths):
         # Would adding this `length` exceed the capacity?
         if tokens_in_batch + length > max_tokens:
-            # Close the previous batch: slice(start, idx)
-            batches.append(slice(start + rank, idx, world_size))
+            batch = slice(start + rank, idx, world_size)
+            if lengths[batch]:
+                batches.append(batch)
 
             # Start a new batch with this item
             start = idx
@@ -100,7 +103,9 @@ def compute_batches(lengths, max_tokens: int):
 
     # Add the last batch if it has any items
     if start < len(lengths):
-        batches.append(slice(start + rank, len(lengths), world_size))
+        batch = slice(start + rank, len(lengths), world_size)
+        if lengths[batch]:
+            batches.append(batch)
 
     return batches
 
