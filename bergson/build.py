@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from datasets import Dataset, load_dataset
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from torch.distributed.fsdp import fully_shard
@@ -15,7 +16,7 @@ from .processing import collect_gradients, fit_normalizers
 from .utils import assert_type, get_layer_list
 
 
-def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
+def _worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
     # These should be set by the main process
     addr = os.environ.get("MASTER_ADDR", "localhost")
     port = os.environ.get("MASTER_PORT", "29500")
@@ -97,50 +98,56 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
 
                 target_modules.add(name.removeprefix("model."))
 
-    batches = compute_batches(ds["length"], cfg.token_batch_size)
-    try:
-        if os.path.exists(cfg.processor_path):
-            if rank == 0:
-                print(f"Loading processor from '{cfg.processor_path}'")
+    if os.path.exists(cfg.processor_path):
+        if rank == 0:
+            print(f"Loading processor from '{cfg.processor_path}'")
 
-            processor = GradientProcessor.load(
-                cfg.processor_path,
-                map_location=f"cuda:{rank}",
+        processor = GradientProcessor.load(
+            cfg.processor_path,
+            map_location=f"cuda:{rank}",
+        )
+    else:
+        if cfg.normalizer != "none":
+            normalizers = fit_normalizers(
+                model,
+                ds,
+                kind=cfg.normalizer,
+                max_documents=cfg.stats_sample_size or None,
+                target_modules=target_modules,
             )
         else:
-            if cfg.normalizer != "none":
-                normalizers = fit_normalizers(
-                    model,
-                    ds,
-                    kind=cfg.normalizer,
-                    max_documents=cfg.stats_sample_size or None,
-                    target_modules=target_modules,
-                )
-            else:
-                normalizers = {}
+            normalizers = {}
 
-            processor = GradientProcessor(
-                normalizers,
-                fisher_fourth_root=cfg.fisher_fourth_root,
-                projection_dim=cfg.projection_dim or None,
-            )
-            if rank == 0:
-                processor.save(cfg.run_path)
-
-        collect_gradients(
-            model,
-            ds,
-            processor,
-            cfg.run_path,
-            batches=batches,
-            skip_preconditioners=cfg.skip_preconditioners,
-            target_modules=target_modules,
+        processor = GradientProcessor(
+            normalizers,
+            fisher_fourth_root=cfg.fisher_fourth_root,
+            projection_dim=cfg.projection_dim or None,
         )
+        if rank == 0:
+            processor.save(cfg.run_path)
+
+    batches = compute_batches(ds["length"], cfg.token_batch_size)
+    collect_gradients(
+        model,
+        ds,
+        processor,
+        cfg.run_path,
+        batches=batches,
+        skip_preconditioners=cfg.skip_preconditioners,
+        target_modules=target_modules,
+    )
+
+
+def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
+    try:
+        _worker(rank, world_size, cfg, ds)
     finally:
         dist.destroy_process_group()
 
 
 def build_index(cfg: IndexConfig):
+    mp.set_sharing_strategy("file_system")
+
     # Do all the data loading and preprocessing on the main process
     data_str = cfg.data.dataset
     if data_str.endswith(".csv"):
@@ -189,6 +196,5 @@ def build_index(cfg: IndexConfig):
             for i in range(world_size)
         },
         logs_specs=DefaultLogsSpecs(),
-        start_method="forkserver",
     )
     ctx.wait()
