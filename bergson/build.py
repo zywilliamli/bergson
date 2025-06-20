@@ -180,6 +180,7 @@ def build_gradient_dataset(cfg: IndexConfig):
         batched=True,
         fn_kwargs=dict(args=cfg.data, tokenizer=tokenizer),
     )
+    ds = ds.map(lambda _, idx: dict(_row=idx), with_indices=True)
 
     world_size = torch.cuda.device_count()
     if world_size <= 1:
