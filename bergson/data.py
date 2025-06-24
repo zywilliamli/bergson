@@ -73,6 +73,9 @@ class IndexConfig:
     drop_columns: bool = False
     """Only return the new dataset columns."""
 
+    revision: str | None = None
+    """Revision of the model."""
+
 
 def ceildiv(a: int, b: int) -> int:
     """Ceiling division of two integers."""

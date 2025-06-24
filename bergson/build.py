@@ -61,6 +61,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
             else None
         ),
         torch_dtype=dtype,
+        revision=cfg.revision,
     )
 
     embed = model.get_input_embeddings()
