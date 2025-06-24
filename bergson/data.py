@@ -67,7 +67,7 @@ class IndexConfig:
     skip_preconditioners: bool = False
     """Whether to skip computing preconditioners for the gradients."""
 
-    stats_sample_size: int = 10_000
+    stats_sample_size: int | None = 10_000
     """Number of examples to use for estimating processor statistics."""
 
     drop_columns: bool = False

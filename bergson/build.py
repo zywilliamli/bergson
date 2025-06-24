@@ -112,14 +112,18 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
         )
     else:
         if cfg.normalizer != "none":
-            # Sample evenly stats_sample_size examples to compute statistics
+            # Evenly sample `stats_sample_size` examples to compute statistics
             if isinstance(ds, Dataset):
-                stats_ds = ds.shuffle(seed=0).select(range(cfg.stats_sample_size))
+                if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(ds):
+                    stats_ds = ds.shuffle(seed=0).select(range(cfg.stats_sample_size))
+                else:
+                    stats_ds = ds
             else:
-                stats_iterable_ds = ds.shuffle(seed=0).take(cfg.stats_sample_size)
-                stats_ds = assert_type(
-                    Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds))
-                )
+                if cfg.stats_sample_size is not None:
+                    stats_iterable_ds = ds.shuffle(seed=0).take(cfg.stats_sample_size)
+                    stats_ds = assert_type(Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds)))
+                else:
+                    stats_ds = assert_type(Dataset, Dataset.from_generator(lambda: iter(ds)))
 
             normalizers = fit_normalizers(
                 model,
