@@ -73,6 +73,12 @@ class IndexConfig:
     drop_columns: bool = False
     """Only return the new dataset columns."""
 
+    streaming: bool = False
+    """Whether to use streaming mode for the dataset."""
+
+    streaming_chunk_size: int = 100_000
+    """Chunk size for streaming the dataset into Dataset objects."""
+
     revision: str | None = None
     """Revision of the model."""
 
