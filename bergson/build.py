@@ -6,7 +6,7 @@ from tqdm.auto import tqdm
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from datasets import Dataset, IterableDataset, load_dataset
+from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, load_dataset
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -190,10 +190,6 @@ def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
         dist.destroy_process_group()
 
 
-def add_row(_, i):
-    return dict(_row=i)
-
-
 def build_gradient_dataset(cfg: IndexConfig):
     # Do all the data loading and preprocessing on the main process
     data_str = cfg.data.dataset
@@ -204,7 +200,6 @@ def build_gradient_dataset(cfg: IndexConfig):
     else:
         try:
             ds = load_dataset(data_str, split="train", streaming=cfg.streaming)
-            from datasets import DatasetDict, IterableDatasetDict
 
             if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
                 raise NotImplementedError(
@@ -217,10 +212,8 @@ def build_gradient_dataset(cfg: IndexConfig):
             else:
                 raise e
 
-    metadata = {"length"}
-    if cfg.drop_columns:
-        metadata |= set(ds.column_names)  # type: ignore
-
+    remove_columns = ds.column_names if cfg.drop_columns else None
+    
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model, model_max_length=cfg.token_batch_size, revision=cfg.revision
     )
@@ -228,8 +221,8 @@ def build_gradient_dataset(cfg: IndexConfig):
         tokenize,
         batched=True,
         fn_kwargs=dict(args=cfg.data, tokenizer=tokenizer),
+        remove_columns=remove_columns,
     )
-    ds = ds.map(add_row, with_indices=True).shuffle(seed=42)
 
     world_size = torch.cuda.device_count()
     if world_size <= 1:
