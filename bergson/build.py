@@ -2,10 +2,11 @@ import os
 import socket
 from datetime import timedelta
 
+from tqdm.auto import tqdm
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from datasets import Dataset, load_dataset
+from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, load_dataset
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from torch.distributed.fsdp import fully_shard
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -16,7 +17,7 @@ from .processing import collect_gradients, fit_normalizers
 from .utils import assert_type, get_layer_list
 
 
-def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
+def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableDataset):
     torch.cuda.set_device(rank)
 
     # These should be set by the main process
@@ -61,6 +62,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
             else None
         ),
         torch_dtype=dtype,
+        revision=cfg.revision,
     )
 
     embed = model.get_input_embeddings()
@@ -110,11 +112,18 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
         )
     else:
         if cfg.normalizer != "none":
-            # Sample evenly stats_sample_size examples to compute statistics
-            if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(ds):
-                stats_ds = ds.shuffle(seed=0).select(range(cfg.stats_sample_size))
+            # Evenly sample `stats_sample_size` examples to compute statistics
+            if isinstance(ds, Dataset):
+                if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(ds):
+                    stats_ds = ds.shuffle(seed=0).select(range(cfg.stats_sample_size))
+                else:
+                    stats_ds = ds
             else:
-                stats_ds = ds
+                if cfg.stats_sample_size is not None:
+                    stats_iterable_ds = ds.shuffle(seed=0).take(cfg.stats_sample_size)
+                    stats_ds = assert_type(Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds)))
+                else:
+                    stats_ds = assert_type(Dataset, Dataset.from_generator(lambda: iter(ds)))
 
             normalizers = fit_normalizers(
                 model,
@@ -134,16 +143,44 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
         if rank == 0:
             processor.save(cfg.run_path)
 
-    batches = allocate_batches(ds["length"], cfg.token_batch_size)
-    collect_gradients(
-        model,
-        ds,
-        processor,
-        cfg.run_path,
-        batches=batches,
-        skip_preconditioners=cfg.skip_preconditioners,
-        target_modules=target_modules,
-    )
+    if isinstance(ds, Dataset):
+        batches = allocate_batches(ds["length"], cfg.token_batch_size)
+        collect_gradients(
+            model,
+            ds,
+            processor,
+            cfg.run_path,
+            batches=batches,
+            skip_preconditioners=cfg.skip_preconditioners,
+            target_modules=target_modules,
+        )
+    else:
+        # Convert each chunk of the IterableDataset to Dataset then collect their gradients
+        buf, chunk_id = [], 0
+
+        def flush():
+            nonlocal buf, chunk_id
+            if not buf:
+                return
+            sub_ds = assert_type(Dataset, Dataset.from_list(buf))
+            batches = allocate_batches(sub_ds["length"], cfg.token_batch_size)
+            collect_gradients(
+                model,
+                sub_ds,
+                processor,
+                os.path.join(cfg.run_path, f"chunk-{chunk_id:05d}"),
+                batches=batches,
+                skip_preconditioners=cfg.skip_preconditioners,
+                target_modules=target_modules,
+            )
+            buf.clear()
+            chunk_id += 1
+
+        for ex in tqdm(ds, desc="Collecting gradients"):
+            buf.append(ex)
+            if len(buf) == cfg.streaming_chunk_size:
+                flush()
+        flush()
 
 
 def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
@@ -162,7 +199,12 @@ def build_gradient_dataset(cfg: IndexConfig):
         ds = assert_type(Dataset, Dataset.from_json(data_str))
     else:
         try:
-            ds = assert_type(Dataset, load_dataset(data_str, split="train"))
+            ds = load_dataset(data_str, split="train", streaming=cfg.streaming)
+
+            if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
+                raise NotImplementedError(
+                    "DatasetDicts and IterableDatasetDicts are not supported."
+                )
         except ValueError as e:
             # Automatically use load_from_disk if appropriate
             if "load_from_disk" in str(e):
@@ -170,15 +212,16 @@ def build_gradient_dataset(cfg: IndexConfig):
             else:
                 raise e
 
-    metadata = {"length"}
-    if cfg.drop_columns:
-        metadata |= set(ds.column_names)
-
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+    remove_columns = ds.column_names if cfg.drop_columns else None
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model, model_max_length=cfg.token_batch_size, revision=cfg.revision
+    )
     ds = ds.map(
         tokenize,
         batched=True,
         fn_kwargs=dict(args=cfg.data, tokenizer=tokenizer),
+        remove_columns=remove_columns,
     )
 
     world_size = torch.cuda.device_count()

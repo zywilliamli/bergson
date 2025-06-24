@@ -67,11 +67,20 @@ class IndexConfig:
     skip_preconditioners: bool = False
     """Whether to skip computing preconditioners for the gradients."""
 
-    stats_sample_size: int = 10_000
+    stats_sample_size: int | None = 10_000
     """Number of examples to use for estimating processor statistics."""
 
     drop_columns: bool = False
     """Only return the new dataset columns."""
+
+    streaming: bool = False
+    """Whether to use streaming mode for the dataset."""
+
+    streaming_chunk_size: int = 100_000
+    """Chunk size for streaming the dataset into Dataset objects."""
+
+    revision: str | None = None
+    """Revision of the model."""
 
 
 def ceildiv(a: int, b: int) -> int:
