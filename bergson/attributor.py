@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from typing import Generator
 
 import torch
+from datasets import load_from_disk
 from torch import Tensor, nn
 
 from .data import load_gradients
@@ -37,9 +38,14 @@ class Attributor:
     def __init__(
         self,
         index_path: str,
+        *,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float16,
+        unit_norm: bool = True,
     ):
+        # Load the examples from which the gradients were computed
+        self.dataset = load_from_disk(index_path + "/data.hf")
+
         # Map the gradients into memory (very fast)
         mmap = load_gradients(index_path)
 
@@ -47,7 +53,8 @@ class Attributor:
         self.grads = torch.tensor(mmap, device=device, dtype=dtype)
 
         # In-place normalize for numerical stability
-        self.grads /= self.grads.norm(dim=1, keepdim=True)
+        if unit_norm:
+            self.grads /= self.grads.norm(dim=1, keepdim=True)
 
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
