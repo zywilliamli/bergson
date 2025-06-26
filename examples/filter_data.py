@@ -115,10 +115,7 @@ def precondition(
         P = processor.preconditioners[name]
         g = g.flatten(1).type_as(P)
         # Figure out why we use this method and if it makes sense in unbatched context
-        try:
-            g = torch.cholesky_solve(g.mT, P).mT
-        except RuntimeError:
-            breakpoint()
+        g = torch.cholesky_solve(g.mT, P).mT
 
         return g
 
