@@ -12,6 +12,7 @@ import torch.distributed as dist
 from datasets import Dataset, concatenate_datasets
 from numpy.typing import DTypeLike
 from simple_parsing import field
+from natsort import natsorted
 
 from .utils import assert_type
 
@@ -234,7 +235,6 @@ def create_index(
 
     # ── 1. Rank-0 creates file & metadata exactly once ─────────────────────────
     if rank == 0:
-        # Ensure the directory exists
         os.makedirs(root, exist_ok=True)
 
         # Allocate (extends file to right size without writing zeros byte-by-byte)
@@ -299,6 +299,7 @@ def load_gradients(root_dir: str) -> np.memmap:
 
 def load_gradient_dataset(root_dir: str, concatenate_gradients: bool = True) -> Dataset:
     """Load a dataset of gradients from `root_dir`."""
+
     def load_shard(dir: str) -> Dataset:
         mmap = load_gradients(dir)
 

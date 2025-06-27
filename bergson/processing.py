@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from datasets import Dataset, Value
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel
+from natsort import natsorted
 
 from .data import create_index, pad_and_tensor
 from .gradients import (
