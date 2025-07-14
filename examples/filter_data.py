@@ -37,6 +37,15 @@ class FilterConfig:
     index_dataset: str = ""
     """Bergson index to use for attribution and loss filtering."""
 
+    query_dataset: str = ""
+    """
+    Use the mean of this dataset's gradients as the query for attribution 
+    filtering. If unspecified the query is calculated over the index dataset.
+    """
+
+    query_scores: bool = False
+    """Use the top-scored dataset items for the attribution query."""
+
     precondition: bool = False
     """Whether to use preconditioner for attribution filtering."""
 
@@ -61,12 +70,6 @@ class FilterConfig:
     seed: int = 42
     """Seed for reproducibility."""
 
-    query_dataset: str = ""
-    """
-    Use the mean of this dataset's gradients as the query for attribution 
-    filtering. If unspecified the query is calculated over the index dataset.
-    """
-
     lowest: bool = False
     """Select the lowest scores."""
 
@@ -84,6 +87,15 @@ class FilterConfig:
 
     hf_token: str | None = None
     """Hugging Face token to use for the dataset."""
+
+    dry_run: bool = False
+    """Whether to run the script in dry run mode."""
+
+    revision: str | None = None
+    """Revision of the model to use."""
+
+    query_method: Literal["mean", "nearest"] = "mean"
+    """Method to use for computing the query."""
 
 
 def worker(rank: int, world_size: int, cfg: FilterConfig, train, eval, run_name):
@@ -106,6 +118,7 @@ def worker(rank: int, world_size: int, cfg: FilterConfig, train, eval, run_name)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model,
         torch_dtype="bfloat16",
+        revision=cfg.revision,
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.model, max_length=8192)
     model, tokenizer = setup_chat_format(model, tokenizer)
@@ -138,6 +151,10 @@ def worker(rank: int, world_size: int, cfg: FilterConfig, train, eval, run_name)
             seed=cfg.seed,
         ),
     )
+
+    if cfg.dry_run:
+        print("Dry run mode, exiting...")
+        exit()
 
     trainer.train()
 
@@ -197,43 +214,37 @@ def precondition(
     ], dim=1)
 
 
-def get_mean_normalized_gradients(
-    dataset: Dataset,
-    processor: GradientProcessor | None,
-    shapes: dict[str, Sequence[int]],
-    batch_size: int,
-) -> Tensor:
-    """Compute the mean of the gradients in the dataset."""
-    acc = {"sum": torch.zeros_like(dataset[0]["gradients"], device="cuda")}
-
-    def sum_(col):
-        acc["sum"] += col.cuda().sum(0)
-
-    # RAM usage climbs here; it's intentionally only evicted under pressure
-    # Do not use num_proc here because we are accumulating in a single variable
-    # nproc solution must use reduce as in
-    # https://colab.research.google.com/drive/1jCLv31Y4cDfqD0lhO0AnqEv3Or-LLvWe?usp=sharing
-    dataset.map(sum_, input_columns="gradients", batched=True, batch_size=batch_size)
-
-    mean_gradients = acc["sum"] / len(dataset)
-
-    if processor is not None:
-        mean_gradients = precondition(mean_gradients.unsqueeze(0), processor, shapes).squeeze(0)
-
-    return mean_gradients / mean_gradients.norm()
-
-
 def attribution_filter(
     args: FilterConfig,
     train: Dataset,
     model: PreTrainedModel,
+    run_name: str,
     projection_dim: int = 16,
+    query_method: Literal["mean", "nearest"] = "mean",
 ) -> Dataset:
-    query_dataset = (
-        load_gradient_dataset(args.query_dataset).with_format("torch")
-        if args.query_dataset
-        else train
-    )
+    if args.query_scores:
+        query_dataset = train.filter(lambda x: x["quality"] == "excellent")
+    elif args.query_dataset:
+        query_dataset = load_gradient_dataset(args.query_dataset).with_format("torch")
+    else:
+        query_dataset = train
+
+    # Compute the mean of the normalized gradients in the query index
+    if query_method == "mean":
+        acc = {"sum": torch.zeros_like(query_dataset[0]["gradients"], device="cuda")}
+
+        def sum_(col):
+            acc["sum"] += col.cuda().sum(0)
+
+        # RAM usage climbs here; it's intentionally only evicted under pressure
+        # Do not use num_proc here because we are accumulating in a single variable
+        # nproc solution must use reduce as in
+        # https://colab.research.google.com/drive/1jCLv31Y4cDfqD0lhO0AnqEv3Or-LLvWe?usp=sharing
+        query_dataset.map(sum_, input_columns="gradients", batched=True, batch_size=args.batch_size)
+
+        query = acc["sum"] / len(query_dataset)
+    elif query_method == "nearest":
+        query = assert_type(Tensor, query_dataset["gradients"]).cuda()
 
     if args.precondition:
         # Load the gradient processor
@@ -251,19 +262,19 @@ def attribution_filter(
             if args.query_dataset
             else index_processor
         )
+
+        query = precondition(query.unsqueeze(0), query_processor, shapes).squeeze(0)
     else:
-        query_processor, index_processor, shapes = None, None, {}
+        index_processor, shapes = None, {}
+        
+    query /= query.norm()
 
-    # Compute the mean of the normalized gradients in the query index
-    query = get_mean_normalized_gradients(
-        query_dataset, query_processor, shapes, args.batch_size
-    )
-    del query_dataset, query_processor
+    del query_dataset
 
+    # Score the training set
     acc = {"scores": []}
 
-
-    def score_(batch):
+    def score(batch):
         gradients_batch = batch.cuda()
         
         if index_processor and shapes:
@@ -274,8 +285,27 @@ def attribution_filter(
 
         acc["scores"].append(batch_scores)
 
-    train.map(score_, input_columns="gradients", batched=True, batch_size=args.batch_size)
+    def score_nearest(batch):
+        gradients_batch = batch.cuda()
+
+        if index_processor and shapes:
+            gradients_batch = precondition(gradients_batch, index_processor, shapes)
+
+        gradients_batch /= gradients_batch.norm(dim=1, keepdim=True)
+        batch_scores = gradients_batch @ query.T
+
+        # Take the maximum batch score for each item in the batch (query has multiple rows)
+        batch_scores = batch_scores.max(dim=-1).values
+
+        acc["scores"].append(batch_scores)
+
+    score_fn = score_nearest if query_method == "nearest" else score
+    train.map(score_fn, input_columns="gradients", batched=True, batch_size=args.batch_size)
     importance_scores = torch.cat(acc["scores"], dim=0).cuda()
+
+    print("Saving importance scores to disk.")
+    os.makedirs(f"examples/runs/{run_name}", exist_ok=True)
+    torch.save(importance_scores, f"examples/runs/{run_name}/importance_scores.pt")
 
     if args.sample:
         probs = torch.softmax(importance_scores / args.temperature, dim=0)
@@ -298,6 +328,7 @@ def main(
     args: FilterConfig,
 ):
     set_seeds(args.seed)
+    print("Running")
 
     if args.name is None:
         run_name = (
@@ -328,6 +359,7 @@ def main(
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype="bfloat16",
+        revision=args.revision,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model, max_length=8192)
     model, tokenizer = setup_chat_format(model, tokenizer)
@@ -336,21 +368,25 @@ def main(
     if args.num_examples == 0:
         pass
     elif args.filter == "attribution":
-        train = attribution_filter(args, train, model)
+        train = attribution_filter(args, train, model, run_name, query_method=args.query_method)
     elif args.filter == "classification":
-        ranks = {"excellent": 4, "good": 3, "average": 2, "poor": 1, "very poor": 0}
+        if "score" in train.column_names:
+            train = train.sort("score", reverse=not args.lowest)
+            train = train.select(range(min(args.num_examples, len(train))))
+        else:
+            ranks = {"excellent": 4, "good": 3, "average": 2, "poor": 1, "very poor": 0}
 
-        def add_rank(ex):
-            q = ex.get("quality")
-            return {"_q": ranks.get(q, -1)}
+            def add_rank(ex):
+                q = ex.get("quality")
+                return {"_q": ranks.get(q, -1)}
 
-        train = (
-            train.map(add_rank)
-            .filter(lambda x: x["_q"] >= 0)
-            .sort("_q", reverse=not args.lowest)
-            .select(range(min(args.num_examples, len(train))))
-            .remove_columns("_q")
-        )
+            train = (
+                train.map(add_rank)
+                .filter(lambda x: x["_q"] >= 0)
+                .sort("_q", reverse=not args.lowest)
+                .select(range(min(args.num_examples, len(train))))
+                .remove_columns("_q")
+            )
     elif args.filter == "loss":
         train = train.map(
             lambda x: {"loss": x["loss"].item()},
