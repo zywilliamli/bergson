@@ -12,7 +12,6 @@ import torch.distributed as dist
 from datasets import Dataset, concatenate_datasets
 from numpy.typing import DTypeLike
 from simple_parsing import field
-from natsort import natsorted
 
 from .utils import assert_type
 
