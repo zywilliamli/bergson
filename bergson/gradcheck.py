@@ -2,6 +2,7 @@ from contextlib import contextmanager
 
 import torch
 from torch import Tensor, nn
+from transformers import PreTrainedModel
 
 from .gradients import Normalizer
 
@@ -17,7 +18,7 @@ class FiniteDiff:
         self.normalizers = normalizers or {}
         self.params: dict[str, Tensor] = {}
 
-    def compute(self, step_size: float):
+    def store(self, step_size: float):
         """Compute and store finite differences for the model parameters.
 
         This method assumes that you've just called .backward() on some loss function,
@@ -77,3 +78,37 @@ class FiniteDiff:
         Clear the stored finite differences.
         """
         self.params.clear()
+
+
+def compute_effect(
+    model: PreTrainedModel,
+    x: Tensor,
+    y: Tensor,
+    *,
+    eps: float | None = None,
+    normalizers: dict[str, Normalizer] | None = None,
+):
+    """Compute the normalized effect on `y` of perturbing the model along `x` grads."""
+    fd = FiniteDiff(
+        model.base_model,
+        normalizers=normalizers,
+    )
+    eps = eps or torch.finfo(model.dtype).eps
+
+    with torch.no_grad():
+        loss1 = model(y, labels=y).loss
+
+    model(x, labels=x).loss.backward()
+    fd.store(eps)
+    model.zero_grad()
+
+    with fd.apply(), torch.no_grad():
+        loss2 = model(y, labels=y).loss
+
+    fd.clear()
+
+    # Divide by the number of parameters because for small eps, the diff is an inner
+    # product of gradients, whose scale will be proportional to the number of
+    # parameters, especially if the two inputs are similar.
+    N = sum(p.numel() for p in model.parameters())
+    return (loss2 - loss1) / (eps * N)
