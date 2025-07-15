@@ -2,8 +2,8 @@ from contextlib import contextmanager
 from typing import Generator
 
 import torch
-from torch import Tensor, nn
 from numpy.lib.recfunctions import structured_to_unstructured
+from torch import Tensor, nn
 
 from .data import load_gradients
 from .gradients import GradientCollector, GradientProcessor
@@ -40,16 +40,19 @@ class Attributor:
         index_path: str,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float16,
+        unit_norm: bool = True,
     ):
         # Map the gradients into memory (very fast)
         mmap = load_gradients(index_path)
-        mmap = structured_to_unstructured(mmap)
+        if mmap.dtype.names is not None:
+            mmap = structured_to_unstructured(mmap)
 
         # Load them onto the desired device (slow)
         self.grads = torch.tensor(mmap, device=device, dtype=dtype)
 
         # In-place normalize for numerical stability
-        self.grads /= self.grads.norm(dim=1, keepdim=True)
+        if unit_norm:
+            self.grads /= self.grads.norm(dim=1, keepdim=True)
 
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
