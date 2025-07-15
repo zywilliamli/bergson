@@ -2,13 +2,19 @@ import os
 import socket
 from datetime import timedelta
 
-from tqdm.auto import tqdm
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from datasets import Dataset, IterableDataset, DatasetDict, IterableDatasetDict, load_dataset
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    load_dataset,
+)
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from torch.distributed.fsdp import fully_shard
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .data import IndexConfig, allocate_batches, tokenize
@@ -83,10 +89,11 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
     except ValueError:
         target_modules = None
     else:
+        cfg.normalizer = "adam"
+        cfg.reshape_to_square = True
+
         if rank == 0:
             print("PEFT model detected. Using Adam and reshape_to_square = True")
-            cfg.normalizer = "adam"
-            cfg.reshape_to_square = True
 
         target_modules = set()
 
@@ -116,16 +123,22 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
         if cfg.normalizer != "none":
             # Evenly sample `stats_sample_size` examples to compute statistics
             if isinstance(ds, Dataset):
-                if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(ds):
+                if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(
+                    ds
+                ):
                     stats_ds = ds.shuffle(seed=0).select(range(cfg.stats_sample_size))
                 else:
                     stats_ds = ds
             else:
                 if cfg.stats_sample_size is not None:
                     stats_iterable_ds = ds.shuffle(seed=0).take(cfg.stats_sample_size)
-                    stats_ds = assert_type(Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds)))
+                    stats_ds = assert_type(
+                        Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds))
+                    )
                 else:
-                    stats_ds = assert_type(Dataset, Dataset.from_generator(lambda: iter(ds)))
+                    stats_ds = assert_type(
+                        Dataset, Dataset.from_generator(lambda: iter(ds))
+                    )
 
             normalizers = fit_normalizers(
                 model,
@@ -158,7 +171,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             target_modules=target_modules,
         )
     else:
-        # Convert each chunk of the IterableDataset to Dataset then collect their gradients
+        # Convert each chunk of the IterableDataset to Dataset then collect their grads
         buf, chunk_id = [], 0
 
         def flush():
@@ -216,7 +229,7 @@ def build_gradient_dataset(cfg: IndexConfig):
                 raise e
 
     remove_columns = ds.column_names if cfg.drop_columns else None
-    
+
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model, model_max_length=cfg.token_batch_size, revision=cfg.revision
     )
