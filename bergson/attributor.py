@@ -3,6 +3,7 @@ from typing import Generator
 
 import torch
 from datasets import load_from_disk
+from numpy.lib.recfunctions import structured_to_unstructured
 from torch import Tensor, nn
 
 from .data import load_gradients
@@ -48,6 +49,8 @@ class Attributor:
 
         # Map the gradients into memory (very fast)
         mmap = load_gradients(index_path)
+        if mmap.dtype.names is not None:
+            mmap = structured_to_unstructured(mmap)
 
         # Load them onto the desired device (slow)
         self.grads = torch.tensor(mmap, device=device, dtype=dtype)
