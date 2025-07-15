@@ -40,6 +40,7 @@ class Attributor:
         index_path: str,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float16,
+        use_faiss: bool = True,
         unit_norm: bool = True,
     ):
         # Map the gradients into memory (very fast)
@@ -53,6 +54,43 @@ class Attributor:
         # In-place normalize for numerical stability
         if unit_norm:
             self.grads /= self.grads.norm(dim=1, keepdim=True)
+
+        # Load gradients into a FAISS index for fast queries
+        if use_faiss:
+            import faiss
+            import numpy as np
+            from tqdm import tqdm
+            from time import time
+            from pathlib import Path
+
+
+            # batch_size = 100_000 if len(mmap) > 100_000 else len(mmap)
+            name = Path(index_path).stem
+
+            Path(f'faiss/{name}').mkdir(exist_ok=True, parents=True)
+
+            index = faiss.index_factory(mmap.shape[1], "IVF1024_HNSW32,Flat")
+            print("Training FAISS index...")
+            start = time()
+            index.train(mmap)
+            # index.train(mmap[:batch_size])
+            # faiss.write_index(index, f"faiss/{name}/clusters.index")
+            print(f"Built clusters index in {(time() - start) / 60} minutes")
+
+            # n_batches = len(mmap) // batch_size
+            # for i in tqdm(range(n_batches)):
+            # index = faiss.read_index(f"faiss/{name}/clusters.index")
+            # index.add_with_ids(
+            #     mmap[i * batch_size : (i + 1) * batch_size],
+            #     np.arange(i * batch_size, (i + 1) * batch_size),
+            # )
+            index.add_with_ids(
+                mmap,
+                np.arange(len(mmap)),
+            )
+            # print(f"writing block_{i}.index with {i*batch_size} as starting index")
+            faiss.write_index(index, f"faiss/{name}/train.index")
+
 
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
