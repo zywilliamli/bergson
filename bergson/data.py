@@ -6,6 +6,7 @@ from typing import Literal, Sequence
 from pathlib import Path
 
 import numpy as np
+from numpy.lib.recfunctions import structured_to_unstructured
 import pyarrow as pa
 import torch
 import torch.distributed as dist
@@ -227,7 +228,6 @@ def create_index(
 
     struct_dtype = {
         "names": [name for name in grad_sizes.keys()],
-        # "formats": [np.dtype(dtype).name] * len(grad_sizes),
         "formats": [f"({size},){np.dtype(dtype).str}" for size in grad_sizes.values()],
         "itemsize": dtype_itemsize * sum(grad_sizes.values())
     }
@@ -301,25 +301,21 @@ def load_gradient_dataset(root_dir: str, concatenate_gradients: bool = True) -> 
     """Load a dataset of gradients from `root_dir`."""
     def load_shard(dir: str) -> Dataset:
         mmap = load_gradients(dir)
-
-        arrays = {}
-        for field_name in mmap.dtype.names:
-            flat = pa.array(mmap[field_name].reshape(-1))
-            col = pa.FixedSizeListArray.from_arrays(flat, mmap[field_name].shape[1])
-            arrays[field_name] = col
-        
         ds = Dataset.load_from_disk(dir + "/data.hf")
 
         # concatenate the extracted module gradients into a single column
         if concatenate_gradients:
-            col = np.concatenate([mmap[field_name] for field_name in mmap.dtype.names], axis=1)
-            flat = pa.array(col.reshape(-1))
-            col_arrow = pa.FixedSizeListArray.from_arrays(flat, col.shape[1])
-            ds = ds.add_column("gradients", col_arrow, new_fingerprint="gradients")       
+            unstructured_data = structured_to_unstructured(mmap)
+            flat = pa.array(unstructured_data.reshape(-1))
+            col_arrow = pa.FixedSizeListArray.from_arrays(flat, unstructured_data.shape[1])
+            
+            ds = ds.add_column("gradients", col_arrow, new_fingerprint="gradients")
         # Add a column for each module's gradient vectors
         else:
             for field_name in mmap.dtype.names:
-                ds = ds.add_column(field_name, arrays[field_name], new_fingerprint=field_name)
+                flat = pa.array(mmap[field_name].reshape(-1))
+                col = pa.FixedSizeListArray.from_arrays(flat, mmap[field_name].shape[1])
+                ds = ds.add_column(field_name, col, new_fingerprint=field_name)
         return ds
 
     root = Path(root_dir)
