@@ -8,7 +8,9 @@ from bergson import Attributor
 def main():
     parser = ArgumentParser()
     parser.add_argument("index", type=str)
-    parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B-Instruct")
+    parser.add_argument(
+        "--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B-Instruct"
+    )
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -32,7 +34,13 @@ def main():
 
         # Print the results
         print(f"Top 5 results for '{query}':")
-        for i, (d, idx) in enumerate(zip(result.scores.squeeze(), result.indices.squeeze())):
+        for i, (d, idx) in enumerate(
+            zip(result.scores.squeeze(), result.indices.squeeze())
+        ):
+            if idx == -1:
+                print("Found invalid result, skipping")
+                continue
+
             # tokens = dataset[idx.item()]["input_ids"]
             # string = tokenizer.decode(tokens, skip_special_tokens=True)
             print(f"{i + 1}: (distance: {d.item():.4f})")
