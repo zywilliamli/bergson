@@ -1,17 +1,17 @@
+import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from time import time
 from typing import Generator
 
+import faiss
 import numpy as np
 import torch
 from numpy.lib.recfunctions import structured_to_unstructured
 from torch import Tensor, nn
-from tqdm import tqdm
 
-import faiss
-
-from .data import load_gradients
+from .data import load_unstructured_gradients
 from .gradients import GradientCollector, GradientProcessor
 
 
@@ -40,21 +40,56 @@ class TraceResult:
         return self._scores
 
 
+def gradients_loader(root_dir: str):
+    def load_shard(shard_dir: str) -> np.memmap:
+        print("shard dir", shard_dir)
+        with open(os.path.join(shard_dir, "info.json")) as f:
+            info = json.load(f)
+
+        if "grad_size" in info:
+            return load_unstructured_gradients(shard_dir)
+
+        dtype = info["dtype"]
+        num_grads = info["num_grads"]
+
+        return np.memmap(
+            os.path.join(shard_dir, "gradients.bin"),
+            dtype=dtype,
+            mode="r",
+            shape=(num_grads,),
+        )
+
+    root_path = Path(root_dir)
+    if (root_path / "info.json").exists():
+        yield load_shard(root_dir)
+    else:
+        for shard_path in sorted(root_path.iterdir()):
+            if shard_path.is_dir():
+                yield load_shard(str(shard_path))
+
+
 class Attributor:
     def __init__(
         self,
         index_path: str,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float32,
-        faiss_cfg: str = "IVF1024,Flat",
         unit_norm: bool = True,
+        batch_size: int = 1024,
+        faiss_cfg: str = "PQ16",
     ):
         """
-        [Guidelines on choosing your FAISS configuration](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
+        [Guidelines on building your FAISS configuration string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
 
-        Attributor will build an index even when its building time is greater
-        than the expected direct query time to ensure query time speed.
+        Common configurations:
+        - "Flat": exact nearest neighbors with brute force search.
+        - "PQ16": nearest neighbors with PQ16 compression. Reduces memory usage.
+        - "IVF1024,Flat": approximate nearest neighbors with IVF1024 clustering.
+            Enables faster queries at the cost of a slower initial index build.
+
+        GPU indexes will be sharded across GPUs.
         """
+
         path = (
             Path("runs/faiss")
             / Path(index_path).stem
@@ -65,39 +100,48 @@ class Attributor:
         if path.exists():
             index = faiss.read_index(str(path))
         else:
-            grads = load_gradients(index_path)
+            index = None
 
-            if grads.dtype.names is not None:
-                grads = structured_to_unstructured(grads)
+            dl = gradients_loader(index_path)
 
-            np_dtype = np.array(torch.tensor([], dtype=dtype)).dtype
-            if unit_norm:
-                preprocessed = np.zeros_like(grads).astype(np_dtype)
-                batch_size = 1024
-                for i in tqdm(range(0, grads.shape[0], batch_size)):
-                    batch = torch.from_numpy(grads[i : i + batch_size]).to(device)
-                    batch /= batch.norm(dim=1, keepdim=True)
-                    preprocessed[i : i + batch_size] = batch.cpu().numpy()
-            else:
-                preprocessed = np.copy(grads).astype(np_dtype)
+            for grads in dl:
+                if grads.dtype.names is not None:
+                    grads = structured_to_unstructured(grads)
 
-            # Load them onto the desired device (slow)
-            index = faiss.index_factory(
-                preprocessed.shape[1], faiss_cfg, faiss.METRIC_INNER_PRODUCT
+                np_dtype = np.array(torch.tensor([], dtype=dtype)).dtype
+                grads = grads.astype(np_dtype)
+
+                if index is None:
+                    index = faiss.index_factory(
+                        grads.shape[1], faiss_cfg, faiss.METRIC_INNER_PRODUCT
+                    )
+
+                    if device != "cpu":
+                        gpus = (
+                            list(range(torch.cuda.device_count()))
+                            if device == "cuda"
+                            else [int(str(device).split(":")[1])]
+                        )
+
+                        options = faiss.GpuMultipleClonerOptions()
+                        options.shard = True
+                        index = faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
+
+                    print("Building FAISS index...")
+                    start = time()
+                    index.train(grads)
+
+                index.add(grads)
+
+            print(
+                f"Built index in {(time() - start) / 60:.2f} minutes."
+                f"Saving to {path}..."
             )
 
-            if device != "cpu":
-                index = faiss.index_cpu_to_all_gpus(index)
-
-            print("Building FAISS index...")
-            start = time()
-            index.train(preprocessed)
-            print(f"Built index in {(time() - start) / 60:.2f} minutes")
-
-            index.add(preprocessed)
             faiss.write_index(faiss.index_gpu_to_cpu(index), str(path))
+            print("Saved index.")
 
-        self.faiss_index = index
+        self.index = index
         self.device = device
         self.dtype = dtype
         self.faiss_cfg = faiss_cfg
@@ -106,7 +150,7 @@ class Attributor:
         self.processor = GradientProcessor.load(index_path, map_location=device)
 
     def search(
-        self, queries: Tensor, k: int, nprobe: int = 100
+        self, queries: Tensor, k: int, nprobe: int = 10
     ) -> tuple[Tensor, Tensor]:
         """
         Search for the `k` nearest examples in the index based on the query or queries.
@@ -122,11 +166,12 @@ class Attributor:
             A namedtuple containing the top `k` indices and inner products for each
             query. Both have shape [..., k].
         """
-        self.faiss_index.nprobe = nprobe
+        q = queries / queries.norm(dim=1, keepdim=True)
+        q = q.to("cpu", non_blocking=True).numpy()
 
-        q = queries.to("cpu", non_blocking=True).numpy()
+        self.index.nprobe = nprobe
 
-        distances, indices = self.faiss_index.search(q, k)
+        distances, indices = self.index.search(q, k)
 
         return torch.from_numpy(distances), torch.from_numpy(indices)
 

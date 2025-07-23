@@ -41,6 +41,7 @@ def collect_gradients(
 
     # Mutable state for the GradientCollector callback
     mod_grads = {}
+    mod_grad_sum_sqs = {}
     preconditioners = {}
 
     # TODO: Handle this more elegantly
@@ -52,6 +53,7 @@ def collect_gradients(
 
         # Asynchronously move the gradient to CPU and convert to fp16
         mod_grads[name] = g.to(device="cpu", dtype=torch.float16, non_blocking=True)
+        mod_grad_sum_sqs[name] = g.pow(2).sum(dim=1)
 
         # Compute the outer product of the flattened gradient
         if not skip_preconditioners:
@@ -68,18 +70,15 @@ def collect_gradients(
         processor,
         target_modules=target_modules,
     )
-    
+
     # Allocate space ahead of time for the gradients
     grad_sizes = {name: math.prod(s) for name, s in collector.shapes().items()}
-    
+
     # Allocate structured space ahead of time for the gradients
     grad_buffer = create_index(
-        path,
-        num_grads=len(data),
-        grad_sizes=grad_sizes,
-        dtype=np.float16
+        path, num_grads=len(data), grad_sizes=grad_sizes, dtype=np.float16
     )
-    
+
     per_doc_losses = torch.full(
         (len(data),),
         device=model.device,
@@ -111,13 +110,19 @@ def collect_gradients(
 
             model.zero_grad()
 
+        norm = (
+            torch.sqrt(torch.stack(list(mod_grad_sum_sqs.values()), dim=0).sum(dim=0))
+            .unsqueeze(1)
+            .to(device="cpu", non_blocking=True)
+        )
+
         # It turns out that it's very important for efficiency to write the gradients
-        # sequentially instead of first concatenating them and then writing to one vector.
+        # sequentially instead of first concatenating them and then writing to a vector.
         for layer_name in mod_grads.keys():
-            if layer_name in mod_grads:
-                grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
+            grad_buffer[layer_name][indices] = (mod_grads[layer_name] / norm).numpy()
 
         mod_grads.clear()
+        mod_grad_sum_sqs.clear()
         per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
 
     chols = {}

@@ -16,7 +16,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, device_map={"": "cuda:0"})
 
-    attr = Attributor(args.index, device="cuda:0")
+    attr = Attributor(args.index, device="cuda")  # device="cuda:0"
 
     # Query loop
     while True:
