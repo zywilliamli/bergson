@@ -279,7 +279,6 @@ def load_gradients(root_dir: str) -> Union[np.memmap, NDArray]:
     """Map the structured gradients stored in `root_dir` into memory."""
 
     def load_shard(shard_dir: str) -> np.memmap:
-        print("shard dir", shard_dir)
         with open(os.path.join(shard_dir, "info.json")) as f:
             info = json.load(f)
 

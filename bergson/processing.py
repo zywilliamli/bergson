@@ -41,7 +41,6 @@ def collect_gradients(
 
     # Mutable state for the GradientCollector callback
     mod_grads = {}
-    mod_grad_sum_sqs = {}
     preconditioners = {}
 
     # TODO: Handle this more elegantly
@@ -53,7 +52,6 @@ def collect_gradients(
 
         # Asynchronously move the gradient to CPU and convert to fp16
         mod_grads[name] = g.to(device="cpu", dtype=torch.float16, non_blocking=True)
-        mod_grad_sum_sqs[name] = g.pow(2).sum(dim=1)
 
         # Compute the outer product of the flattened gradient
         if not skip_preconditioners:
@@ -110,19 +108,12 @@ def collect_gradients(
 
             model.zero_grad()
 
-        norm = (
-            torch.sqrt(torch.stack(list(mod_grad_sum_sqs.values()), dim=0).sum(dim=0))
-            .unsqueeze(1)
-            .to(device="cpu", non_blocking=True)
-        )
-
         # It turns out that it's very important for efficiency to write the gradients
         # sequentially instead of first concatenating them and then writing to a vector.
         for layer_name in mod_grads.keys():
-            grad_buffer[layer_name][indices] = (mod_grads[layer_name] / norm).numpy()
+            grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
 
         mod_grads.clear()
-        mod_grad_sum_sqs.clear()
         per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
 
     chols = {}

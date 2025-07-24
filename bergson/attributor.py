@@ -9,7 +9,9 @@ import faiss
 import numpy as np
 import torch
 from numpy.lib.recfunctions import structured_to_unstructured
+from numpy.typing import NDArray
 from torch import Tensor, nn
+from tqdm import tqdm
 
 from .data import load_unstructured_gradients
 from .gradients import GradientCollector, GradientProcessor
@@ -38,6 +40,22 @@ class TraceResult:
             raise ValueError("No scores available. Exit the context manager first.")
 
         return self._scores
+
+
+def normalize_grads(
+    grads: NDArray,
+    device: torch.device | str,
+    batch_size: int,
+) -> NDArray:
+    normalized_grads = np.zeros_like(grads).astype(grads.dtype)
+
+    for i in tqdm(range(0, grads.shape[0], batch_size)):
+        batch = torch.from_numpy(grads[i : i + batch_size]).to(device)
+        normalized_grads[i : i + batch_size] = (
+            (batch / batch.norm(dim=1, keepdim=True)).cpu().numpy()
+        )
+
+    return normalized_grads
 
 
 def gradients_loader(root_dir: str):
@@ -72,18 +90,19 @@ class Attributor:
     def __init__(
         self,
         index_path: str,
-        device: torch.device | str = "cpu",
+        device: str = "cpu",
         dtype: torch.dtype = torch.float32,
         unit_norm: bool = True,
         batch_size: int = 1024,
-        faiss_cfg: str = "PQ16",
+        faiss_cfg: str = "Flat",
     ):
         """
         [Guidelines on building your FAISS configuration string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
 
         Common configurations:
         - "Flat": exact nearest neighbors with brute force search.
-        - "PQ16": nearest neighbors with PQ16 compression. Reduces memory usage.
+        - "PQ6720": nearest neighbors with vector product quantization to 6720 elements.
+            Reduces memory usage.
         - "IVF1024,Flat": approximate nearest neighbors with IVF1024 clustering.
             Enables faster queries at the cost of a slower initial index build.
 
@@ -100,6 +119,8 @@ class Attributor:
         if path.exists():
             index = faiss.read_index(str(path))
         else:
+            print("Building FAISS index...")
+            start = time()
             index = None
 
             dl = gradients_loader(index_path)
@@ -111,6 +132,9 @@ class Attributor:
                 np_dtype = np.array(torch.tensor([], dtype=dtype)).dtype
                 grads = grads.astype(np_dtype)
 
+                if unit_norm:
+                    grads = normalize_grads(grads, device, batch_size)
+
                 if index is None:
                     index = faiss.index_factory(
                         grads.shape[1], faiss_cfg, faiss.METRIC_INNER_PRODUCT
@@ -120,15 +144,13 @@ class Attributor:
                         gpus = (
                             list(range(torch.cuda.device_count()))
                             if device == "cuda"
-                            else [int(str(device).split(":")[1])]
+                            else [int(device.split(":")[1])]
                         )
 
                         options = faiss.GpuMultipleClonerOptions()
                         options.shard = True
                         index = faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
 
-                    print("Building FAISS index...")
-                    start = time()
                     index.train(grads)
 
                 index.add(grads)
@@ -160,7 +182,7 @@ class Attributor:
         Args:
             queries: The query tensor of shape [..., d].
             k: The number of nearest examples to return for each query.
-            nprobe: The number of FAISS vector clusters to search
+            nprobe: The number of FAISS vector clusters to search if using ANN.
 
         Returns:
             A namedtuple containing the top `k` indices and inner products for each
