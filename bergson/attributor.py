@@ -1,9 +1,10 @@
 import json
+import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
 from time import time
-from typing import Generator
+from typing import Generator, Protocol
 
 import faiss
 import numpy as np
@@ -13,7 +14,7 @@ from numpy.typing import NDArray
 from torch import Tensor, nn
 from tqdm import tqdm
 
-from .data import load_unstructured_gradients
+from .data import load_gradients, load_unstructured_gradients
 from .gradients import GradientCollector, GradientProcessor
 
 
@@ -42,9 +43,24 @@ class TraceResult:
         return self._scores
 
 
+class Index(Protocol):
+    """Protocol for any FAISS index that supports search operations."""
+
+    def search(self, x: NDArray, k: int) -> tuple[NDArray, NDArray]: ...
+    @property
+    def ntotal(self) -> int: ...
+    @property
+    def nprobe(self) -> int: ...
+    @nprobe.setter
+    def nprobe(self, value: int) -> None: ...
+    def train(self, x: NDArray) -> None: ...
+    def add(self, x: NDArray) -> None: ...
+
+
 def normalize_grads(
+    root_dir: str,
     grads: NDArray,
-    device: torch.device | str,
+    device: str,
     batch_size: int,
 ) -> NDArray:
     normalized_grads = np.zeros_like(grads).astype(grads.dtype)
@@ -55,12 +71,20 @@ def normalize_grads(
             (batch / batch.norm(dim=1, keepdim=True)).cpu().numpy()
         )
 
-    return normalized_grads
+    # Write to mmap
+    mmap = np.memmap(
+        os.path.join(root_dir, "normalized_grads.bin"),
+        dtype=normalized_grads.dtype,
+        mode="w+",
+        shape=normalized_grads.shape,
+    )
+    mmap[:] = normalized_grads
+
+    return mmap
 
 
 def gradients_loader(root_dir: str):
     def load_shard(shard_dir: str) -> np.memmap:
-        print("shard dir", shard_dir)
         with open(os.path.join(shard_dir, "info.json")) as f:
             info = json.load(f)
 
@@ -86,87 +110,151 @@ def gradients_loader(root_dir: str):
                 yield load_shard(str(shard_path))
 
 
+def index_to_device(index: Index, device: str) -> Index:
+    if device != "cpu":
+        gpus = (
+            list(range(torch.cuda.device_count()))
+            if device == "cuda"
+            else [int(device.split(":")[1])]
+        )
+
+        options = faiss.GpuMultipleClonerOptions()
+        options.shard = True
+        return faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
+
+    return faiss.index_gpu_to_cpu(index)
+
+
+def load_faiss_index(
+    index_path: str,
+    faiss_factory: str,
+    device: str,
+    batch_size: int,
+    num_shards: int,
+    unit_norm: bool,
+    mmap_index: bool,
+) -> list[Index]:
+    import faiss
+
+    faiss_path = (
+        Path("runs/faiss")
+        / Path(index_path).stem
+        / f"{faiss_factory.replace(',', '_')}{'_unit_norm' if unit_norm else ''}"
+    )
+
+    if faiss_path.exists():
+        print("Building FAISS index...")
+        start = time()
+
+        faiss_path.mkdir(exist_ok=True, parents=True)
+
+        num_dataset_shards = len(list(Path(index_path).iterdir()))
+        shards_per_index = math.ceil(num_dataset_shards / num_shards)
+        print(f"Building {num_shards} shards, each of {shards_per_index} chunks.")
+
+        dl = gradients_loader(index_path)
+        buffer = []
+        index_idx = 0
+
+        for grads in dl:
+            if grads.dtype.names is not None:
+                grads = structured_to_unstructured(grads)
+
+            if unit_norm:
+                grads = normalize_grads(str(faiss_path), grads, device, batch_size)
+
+            buffer.append(grads)
+
+            if len(buffer) == shards_per_index:
+                # Build index shard
+                print(f"Building shard {index_idx}...")
+
+                grads = np.concatenate(buffer, axis=0)
+                buffer = []
+
+                index = faiss.index_factory(
+                    grads.shape[1], faiss_factory, faiss.METRIC_INNER_PRODUCT
+                )
+                index = index_to_device(index, device)
+                index.train(grads)
+                index.add(grads)
+
+                # Write index to disk
+                index = index_to_device(index, "cpu")
+                faiss.write_index(index, str(faiss_path / f"{index_idx}.faiss"))
+
+                index_idx += 1
+
+        print(f"Built index in {(time() - start) / 60:.2f} minutes.")
+
+    shards = []
+    for i in range(num_shards):
+        shard = faiss.read_index(str(faiss_path / f"{i}.faiss"), faiss.IO_FLAG_MMAP)
+        if not mmap_index:
+            shard = index_to_device(shard, device)
+
+        shards.append(shard)
+
+    return shards
+
+
 class Attributor:
     def __init__(
         self,
         index_path: str,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
-        unit_norm: bool = True,
+        unit_norm: bool = False,
         batch_size: int = 1024,
-        faiss_cfg: str = "Flat",
+        use_faiss: bool = False,
+        faiss_factory: str = "IVF1,SQfp16",
+        mmap_index: bool = False,
+        num_shards: int = 1,
     ):
         """
-        [Guidelines on building your FAISS configuration string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
+        Args:
+            dtype: The dtype of the query gradients.
+            unit_norm: Whether to normalize the query and index gradients.
+            batch_size: The batch size for unit normalizing gradients.
+            use_faiss: Whether to use FAISS for querying the index.
+            faiss_factory: The [FAISS index factory string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
+                Leave empty for direct in-memory search.
+            mmap_index: Whether to query the gradients on-disk when using FAISS.
+            num_shards: The number of shards to build for an index.
+                Using more shards reduces peak RAM usage when building a FAISS index.
 
-        Common configurations:
-        - "Flat": exact nearest neighbors with brute force search.
+        Common FAISS factory strings:
+        - "IVF1,SQfp16": exact nearest neighbors with brute force search and fp16.
+        - "IVF1024,SQfp16": approximate nearest neighbors with 1024 cluster centers
+            and fp16. Fast approximate queries are produced at the cost of a slower
+            initial index build.
         - "PQ6720": nearest neighbors with vector product quantization to 6720 elements.
-            Reduces memory usage.
-        - "IVF1024,Flat": approximate nearest neighbors with IVF1024 clustering.
-            Enables faster queries at the cost of a slower initial index build.
-
-        GPU indexes will be sharded across GPUs.
+            Reduces memory usage at the cost of accuracy.
         """
-
-        path = (
-            Path("runs/faiss")
-            / Path(index_path).stem
-            / f"{faiss_cfg.replace(',', '_')}.index"
-        )
-        path.parent.mkdir(exist_ok=True, parents=True)
-
-        if path.exists():
-            index = faiss.read_index(str(path))
-        else:
-            print("Building FAISS index...")
-            start = time()
-            index = None
-
-            dl = gradients_loader(index_path)
-
-            for grads in dl:
-                if grads.dtype.names is not None:
-                    grads = structured_to_unstructured(grads)
-
-                np_dtype = np.array(torch.tensor([], dtype=dtype)).dtype
-                grads = grads.astype(np_dtype)
-
-                if unit_norm:
-                    grads = normalize_grads(grads, device, batch_size)
-
-                if index is None:
-                    index = faiss.index_factory(
-                        grads.shape[1], faiss_cfg, faiss.METRIC_INNER_PRODUCT
-                    )
-
-                    if device != "cpu":
-                        gpus = (
-                            list(range(torch.cuda.device_count()))
-                            if device == "cuda"
-                            else [int(device.split(":")[1])]
-                        )
-
-                        options = faiss.GpuMultipleClonerOptions()
-                        options.shard = True
-                        index = faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
-
-                    index.train(grads)
-
-                index.add(grads)
-
-            print(
-                f"Built index in {(time() - start) / 60:.2f} minutes."
-                f"Saving to {path}..."
+        if use_faiss:
+            self.faiss_shards = load_faiss_index(
+                index_path,
+                faiss_factory,
+                device,
+                batch_size,
+                num_shards,
+                unit_norm,
+                mmap_index,
             )
+        else:
+            mmap = load_gradients(index_path)
+            if mmap.dtype.names is not None:
+                mmap = structured_to_unstructured(mmap)
 
-            faiss.write_index(faiss.index_gpu_to_cpu(index), str(path))
-            print("Saved index.")
+            self.grads = torch.tensor(mmap, device=device, dtype=dtype)
 
-        self.index = index
+            # In-place normalize for numerical stability
+            if unit_norm:
+                self.grads /= self.grads.norm(dim=1, keepdim=True)
+
         self.device = device
         self.dtype = dtype
-        self.faiss_cfg = faiss_cfg
+        self.use_faiss = use_faiss
 
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
@@ -189,13 +277,37 @@ class Attributor:
             query. Both have shape [..., k].
         """
         q = queries / queries.norm(dim=1, keepdim=True)
+
+        if not self.use_faiss:
+            return torch.topk(q.to(self.device) @ self.grads.mT, k)
+
         q = q.to("cpu", non_blocking=True).numpy()
 
-        self.index.nprobe = nprobe
+        shard_distances = []
+        shard_indices = []
+        offset = 0
 
-        distances, indices = self.index.search(q, k)
+        for index in self.faiss_shards:
+            index.nprobe = nprobe
+            distances, indices = index.search(q, k)
 
-        return torch.from_numpy(distances), torch.from_numpy(indices)
+            indices += offset
+            offset += index.ntotal
+
+            shard_distances.append(distances)
+            shard_indices.append(indices)
+
+        distances = np.concatenate(shard_distances, axis=1)
+        indices = np.concatenate(shard_indices, axis=1)
+
+        # Rerank overfetched results if multiple shards were searched
+        if len(self.faiss_shards) > 1:
+            indices = np.argsort(distances, axis=1)[:, :k]
+            distances = distances[np.arange(distances.shape[0])[:, None], indices]
+
+        return torch.from_numpy(distances.squeeze()), torch.from_numpy(
+            indices.squeeze()
+        )
 
     @contextmanager
     def trace(
@@ -232,6 +344,9 @@ class Attributor:
             raise ValueError("No grads collected. Did you forget to call backward?")
 
         queries = torch.cat(mod_grads, dim=1)
+
+        if queries.isnan().any():
+            raise ValueError("NaN found in queries.")
 
         if unit_norm:
             queries /= queries.norm(dim=1, keepdim=True)
