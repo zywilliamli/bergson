@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bergson import Attributor
@@ -9,15 +10,15 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("index", type=str)
     parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-135M")
-    # parser.add_argument("--dataset", type=str, default="EleutherAI/SmolLM2-135M-10B")
-    # parser.add_argument("--text_field", type=str, default="text")
+    parser.add_argument("--dataset", type=str, default="EleutherAI/SmolLM2-135M-10B")
+    parser.add_argument("--text_field", type=str, default="text")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, device_map={"": "cuda:0"})
-    # dataset = load_dataset(args.dataset, split="train")
+    dataset = load_dataset(args.dataset, split="train")
 
-    attr = Attributor(args.index, device="cuda")
+    attr = Attributor(args.index, device="cuda:0")
 
     # Query loop
     while True:
@@ -42,8 +43,8 @@ def main():
                 print("Found invalid result, skipping")
                 continue
 
-            # text = dataset[idx.item()][args.text_field]
-            # print(text[:5000])
+            text = dataset[idx.item()][args.text_field]
+            print(text[:5000])
 
             print(f"{i + 1}: (distance: {d.item():.4f})")
 

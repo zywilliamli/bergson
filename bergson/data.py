@@ -3,7 +3,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence, Union
+from typing import Literal, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset, concatenate_datasets
 from numpy.lib.recfunctions import structured_to_unstructured
-from numpy.typing import DTypeLike, NDArray
+from numpy.typing import DTypeLike
 from simple_parsing import field
 
 from .utils import assert_type
@@ -275,37 +275,24 @@ def load_unstructured_gradients(root_dir: str) -> np.memmap:
     return mmap
 
 
-def load_gradients(root_dir: str) -> Union[np.memmap, NDArray]:
+def load_gradients(root_dir: str) -> np.memmap:
     """Map the structured gradients stored in `root_dir` into memory."""
 
-    def load_shard(shard_dir: str) -> np.memmap:
-        with open(os.path.join(shard_dir, "info.json")) as f:
-            info = json.load(f)
+    with open(os.path.join(root_dir, "info.json")) as f:
+        info = json.load(f)
 
-        # TODO 2025-08-01 Remove legacy loading
-        if "grad_size" in info:
-            return load_unstructured_gradients(shard_dir)
+    # TODO 2025-08-01 Remove legacy loading
+    if "grad_size" in info:
+        return load_unstructured_gradients(root_dir)
 
-        dtype = info["dtype"]
-        num_grads = info["num_grads"]
+    dtype = info["dtype"]
+    num_grads = info["num_grads"]
 
-        return np.memmap(
-            os.path.join(shard_dir, "gradients.bin"),
-            dtype=dtype,
-            mode="r",
-            shape=(num_grads,),
-        )
-
-    root_path = Path(root_dir)
-    if (root_path / "info.json").exists():
-        return load_shard(root_dir)
-
-    return np.concatenate(
-        [
-            load_shard(str(shard_path))
-            for shard_path in sorted(root_path.iterdir())
-            if shard_path.is_dir()
-        ]
+    return np.memmap(
+        os.path.join(root_dir, "gradients.bin"),
+        dtype=dtype,
+        mode="r",
+        shape=(num_grads,),
     )
 
 

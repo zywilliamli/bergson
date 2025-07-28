@@ -2,6 +2,7 @@ import json
 import math
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from time import time
 from typing import Generator, Protocol
@@ -57,6 +58,34 @@ class Index(Protocol):
     def add(self, x: NDArray) -> None: ...
 
 
+@dataclass
+class FaissConfig:
+    """Configuration for FAISS index."""
+
+    index_factory: str = "IVF1,SQfp16"
+    """
+    The [FAISS index factory string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
+
+    Common FAISS factory strings:
+        - "IVF1,SQfp16": exact nearest neighbors with brute force search and fp16.
+        - "IVF1024,SQfp16": approximate nearest neighbors with 1024 cluster centers
+            and fp16. Fast approximate queries are produced at the cost of a slower
+            initial index build.
+        - "PQ6720": nearest neighbors with vector product quantization to 6720 elements.
+            Reduces memory usage at the cost of accuracy.
+    """
+    mmap_index: bool = False
+    """Whether to query the gradients on-disk."""
+    max_train_examples: int | None = None
+    """The maximum number of examples to train the index on.
+        If `None`, all examples will be used."""
+    batch_size: int = 1024
+    """The batch size for pre-processing gradients."""
+    num_shards: int = 1
+    """The number of shards to build for an index.
+        Using more shards reduces peak RAM usage."""
+
+
 def normalize_grads(
     root_dir: str,
     grads: NDArray,
@@ -65,7 +94,7 @@ def normalize_grads(
 ) -> NDArray:
     normalized_grads = np.zeros_like(grads).astype(grads.dtype)
 
-    for i in tqdm(range(0, grads.shape[0], batch_size)):
+    for i in range(0, grads.shape[0], batch_size):
         batch = torch.from_numpy(grads[i : i + batch_size]).to(device)
         normalized_grads[i : i + batch_size] = (
             (batch / batch.norm(dim=1, keepdim=True)).cpu().numpy()
@@ -127,41 +156,42 @@ def index_to_device(index: Index, device: str) -> Index:
 
 def load_faiss_index(
     index_path: str,
-    faiss_factory: str,
     device: str,
-    batch_size: int,
-    num_shards: int,
     unit_norm: bool,
-    mmap_index: bool,
+    faiss_cfg: FaissConfig,
 ) -> list[Index]:
     import faiss
 
     faiss_path = (
         Path("runs/faiss")
         / Path(index_path).stem
-        / f"{faiss_factory.replace(',', '_')}{'_unit_norm' if unit_norm else ''}"
+        / (
+            f"{faiss_cfg.index_factory.replace(',', '_')}"
+            f"{'_unit_norm' if unit_norm else ''}"
+        )
     )
 
-    if faiss_path.exists():
+    if not faiss_path.exists():
         print("Building FAISS index...")
         start = time()
 
         faiss_path.mkdir(exist_ok=True, parents=True)
 
         num_dataset_shards = len(list(Path(index_path).iterdir()))
-        shards_per_index = math.ceil(num_dataset_shards / num_shards)
-        print(f"Building {num_shards} shards, each of {shards_per_index} chunks.")
+        shards_per_index = math.ceil(num_dataset_shards / faiss_cfg.num_shards)
 
         dl = gradients_loader(index_path)
         buffer = []
         index_idx = 0
 
-        for grads in dl:
+        for grads in tqdm(dl, desc="Loading gradients"):
             if grads.dtype.names is not None:
                 grads = structured_to_unstructured(grads)
 
             if unit_norm:
-                grads = normalize_grads(str(faiss_path), grads, device, batch_size)
+                grads = normalize_grads(
+                    str(faiss_path), grads, device, faiss_cfg.batch_size
+                )
 
             buffer.append(grads)
 
@@ -173,10 +203,11 @@ def load_faiss_index(
                 buffer = []
 
                 index = faiss.index_factory(
-                    grads.shape[1], faiss_factory, faiss.METRIC_INNER_PRODUCT
+                    grads.shape[1], faiss_cfg.index_factory, faiss.METRIC_INNER_PRODUCT
                 )
                 index = index_to_device(index, device)
-                index.train(grads)
+                train_examples = faiss_cfg.max_train_examples or grads.shape[0]
+                index.train(grads[:train_examples])
                 index.add(grads)
 
                 # Write index to disk
@@ -185,12 +216,23 @@ def load_faiss_index(
 
                 index_idx += 1
 
+        if buffer:
+            grads = np.concatenate(buffer, axis=0)
+            index = faiss.index_factory(
+                grads.shape[1], faiss_cfg.index_factory, faiss.METRIC_INNER_PRODUCT
+            )
+            index = index_to_device(index, device)
+            index.train(grads)
+            index.add(grads)
+            index = index_to_device(index, "cpu")
+            faiss.write_index(index, str(faiss_path / f"{index_idx}.faiss"))
+
         print(f"Built index in {(time() - start) / 60:.2f} minutes.")
 
     shards = []
-    for i in range(num_shards):
+    for i in range(faiss_cfg.num_shards):
         shard = faiss.read_index(str(faiss_path / f"{i}.faiss"), faiss.IO_FLAG_MMAP)
-        if not mmap_index:
+        if not faiss_cfg.mmap_index:
             shard = index_to_device(shard, device)
 
         shards.append(shard)
@@ -205,41 +247,11 @@ class Attributor:
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
         unit_norm: bool = False,
-        batch_size: int = 1024,
-        use_faiss: bool = False,
-        faiss_factory: str = "IVF1,SQfp16",
-        mmap_index: bool = False,
-        num_shards: int = 1,
+        faiss_cfg: FaissConfig | None = None,
     ):
-        """
-        Args:
-            dtype: The dtype of the query gradients.
-            unit_norm: Whether to normalize the query and index gradients.
-            batch_size: The batch size for unit normalizing gradients.
-            use_faiss: Whether to use FAISS for querying the index.
-            faiss_factory: The [FAISS index factory string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
-                Leave empty for direct in-memory search.
-            mmap_index: Whether to query the gradients on-disk when using FAISS.
-            num_shards: The number of shards to build for an index.
-                Using more shards reduces peak RAM usage when building a FAISS index.
-
-        Common FAISS factory strings:
-        - "IVF1,SQfp16": exact nearest neighbors with brute force search and fp16.
-        - "IVF1024,SQfp16": approximate nearest neighbors with 1024 cluster centers
-            and fp16. Fast approximate queries are produced at the cost of a slower
-            initial index build.
-        - "PQ6720": nearest neighbors with vector product quantization to 6720 elements.
-            Reduces memory usage at the cost of accuracy.
-        """
-        if use_faiss:
+        if faiss_cfg:
             self.faiss_shards = load_faiss_index(
-                index_path,
-                faiss_factory,
-                device,
-                batch_size,
-                num_shards,
-                unit_norm,
-                mmap_index,
+                index_path, device, unit_norm, faiss_cfg
             )
         else:
             mmap = load_gradients(index_path)
@@ -254,7 +266,7 @@ class Attributor:
 
         self.device = device
         self.dtype = dtype
-        self.use_faiss = use_faiss
+        self.use_faiss = faiss_cfg is not None
 
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
@@ -300,7 +312,7 @@ class Attributor:
         distances = np.concatenate(shard_distances, axis=1)
         indices = np.concatenate(shard_indices, axis=1)
 
-        # Rerank overfetched results if multiple shards were searched
+        # Rerank results overfetched from multiple shards
         if len(self.faiss_shards) > 1:
             indices = np.argsort(distances, axis=1)[:, :k]
             distances = distances[np.arange(distances.shape[0])[:, None], indices]
