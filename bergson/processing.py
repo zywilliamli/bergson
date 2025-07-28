@@ -68,18 +68,15 @@ def collect_gradients(
         processor,
         target_modules=target_modules,
     )
-    
+
     # Allocate space ahead of time for the gradients
     grad_sizes = {name: math.prod(s) for name, s in collector.shapes().items()}
-    
+
     # Allocate structured space ahead of time for the gradients
     grad_buffer = create_index(
-        path,
-        num_grads=len(data),
-        grad_sizes=grad_sizes,
-        dtype=np.float16
+        path, num_grads=len(data), grad_sizes=grad_sizes, dtype=np.float16
     )
-    
+
     per_doc_losses = torch.full(
         (len(data),),
         device=model.device,
@@ -112,10 +109,9 @@ def collect_gradients(
             model.zero_grad()
 
         # It turns out that it's very important for efficiency to write the gradients
-        # sequentially instead of first concatenating them and then writing to one vector.
+        # sequentially instead of first concatenating them and then writing to a vector.
         for layer_name in mod_grads.keys():
-            if layer_name in mod_grads:
-                grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
+            grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
 
         mod_grads.clear()
         per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
