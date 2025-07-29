@@ -87,7 +87,6 @@ class FaissConfig:
 
 
 def normalize_grads(
-    root_dir: str,
     grads: NDArray,
     device: str,
     batch_size: int,
@@ -100,16 +99,7 @@ def normalize_grads(
             (batch / batch.norm(dim=1, keepdim=True)).cpu().numpy()
         )
 
-    # Write to mmap
-    mmap = np.memmap(
-        os.path.join(root_dir, "normalized_grads.bin"),
-        dtype=normalized_grads.dtype,
-        mode="w+",
-        shape=normalized_grads.shape,
-    )
-    mmap[:] = normalized_grads
-
-    return mmap
+    return normalized_grads
 
 
 def gradients_loader(root_dir: str):
@@ -189,9 +179,7 @@ def load_faiss_index(
                 grads = structured_to_unstructured(grads)
 
             if unit_norm:
-                grads = normalize_grads(
-                    str(faiss_path), grads, device, faiss_cfg.batch_size
-                )
+                grads = normalize_grads(grads, device, faiss_cfg.batch_size)
 
             buffer.append(grads)
 
@@ -211,6 +199,7 @@ def load_faiss_index(
                 index.add(grads)
 
                 # Write index to disk
+                del grads
                 index = index_to_device(index, "cpu")
                 faiss.write_index(index, str(faiss_path / f"{index_idx}.faiss"))
 
@@ -218,16 +207,21 @@ def load_faiss_index(
 
         if buffer:
             grads = np.concatenate(buffer, axis=0)
+            buffer = []
             index = faiss.index_factory(
                 grads.shape[1], faiss_cfg.index_factory, faiss.METRIC_INNER_PRODUCT
             )
             index = index_to_device(index, device)
             index.train(grads)
             index.add(grads)
+
+            # Write index to disk
+            del grads
             index = index_to_device(index, "cpu")
             faiss.write_index(index, str(faiss_path / f"{index_idx}.faiss"))
 
         print(f"Built index in {(time() - start) / 60:.2f} minutes.")
+        del buffer, index, grads
 
     shards = []
     for i in range(faiss_cfg.num_shards):
@@ -266,6 +260,7 @@ class Attributor:
 
         self.device = device
         self.dtype = dtype
+        self.unit_norm = unit_norm
         self.use_faiss = faiss_cfg is not None
 
         # Load the gradient processor
@@ -288,12 +283,15 @@ class Attributor:
             A namedtuple containing the top `k` indices and inner products for each
             query. Both have shape [..., k].
         """
-        q = queries / queries.norm(dim=1, keepdim=True)
+        q = queries
+
+        if self.unit_norm:
+            q /= q.norm(dim=1, keepdim=True)
 
         if not self.use_faiss:
             return torch.topk(q.to(self.device) @ self.grads.mT, k)
 
-        q = q.to("cpu", non_blocking=True).numpy()
+        q = q.cpu().numpy()
 
         shard_distances = []
         shard_indices = []
