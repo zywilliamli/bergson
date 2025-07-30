@@ -150,7 +150,10 @@ def load_faiss_index(
     unit_norm: bool,
     faiss_cfg: FaissConfig,
 ) -> list[Index]:
-    import faiss
+    try:
+        import faiss
+    except ImportError:
+        print("Faiss not found, run `pip install faiss-gpu-cu12`...")
 
     faiss_path = (
         Path("runs/faiss")
@@ -221,11 +224,13 @@ def load_faiss_index(
             faiss.write_index(index, str(faiss_path / f"{index_idx}.faiss"))
 
         print(f"Built index in {(time() - start) / 60:.2f} minutes.")
-        del buffer, index, grads
+        del buffer, index
 
     shards = []
     for i in range(faiss_cfg.num_shards):
-        shard = faiss.read_index(str(faiss_path / f"{i}.faiss"), faiss.IO_FLAG_MMAP)
+        shard = faiss.read_index(
+            str(faiss_path / f"{i}.faiss"), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY
+        )
         if not faiss_cfg.mmap_index:
             shard = index_to_device(shard, device)
 
