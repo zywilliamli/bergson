@@ -14,4 +14,4 @@ RUN apt-get update && \
 RUN conda install -y ipykernel ipywidgets && conda clean -afy
 
 # Install FAISS
-conda install -c pytorch -c nvidia faiss-gpu=1.11.0
+RUN conda install -c pytorch -c nvidia faiss-gpu=1.11.0
