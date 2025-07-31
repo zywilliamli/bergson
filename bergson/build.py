@@ -17,9 +17,9 @@ from torch.distributed.fsdp import fully_shard
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+from .collection import collect_gradients, fit_normalizers
 from .data import IndexConfig, allocate_batches, tokenize
 from .gradients import GradientProcessor
-from .processing import collect_gradients, fit_normalizers
 from .utils import assert_type, get_layer_list
 
 
@@ -171,7 +171,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             target_modules=target_modules,
         )
     else:
-        # Convert each chunk of the IterableDataset to Dataset then collect their grads
+        # Convert each chunk to Dataset then collect their gradients
         buf, chunk_id = [], 0
 
         def flush():
