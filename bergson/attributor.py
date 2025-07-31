@@ -317,8 +317,9 @@ class Attributor:
 
         # Rerank results overfetched from multiple shards
         if len(self.faiss_shards) > 1:
-            indices = np.argsort(distances, axis=1)[:, :k]
-            distances = distances[np.arange(distances.shape[0])[:, None], indices]
+            topk_indices = np.argsort(distances, axis=1)[:, :k]
+            indices = indices[np.arange(indices.shape[0])[:, None], topk_indices]
+            distances = distances[np.arange(distances.shape[0])[:, None], topk_indices]
 
         return torch.from_numpy(distances.squeeze()), torch.from_numpy(
             indices.squeeze()
