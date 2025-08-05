@@ -1,15 +1,13 @@
 import math
 import os
 import socket
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Literal
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from datasets import Dataset, load_dataset
-from simple_parsing import field, parse
+from simple_parsing import parse
 from torch import Tensor
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -27,49 +25,16 @@ from bergson.data import (
     DataConfig,
     IndexConfig,
     allocate_batches,
-    load_gradient_dataset,
     tokenize,
 )
 from bergson.utils import assert_type
 
 
-@dataclass
-class TrainerCollectionConfig(IndexConfig):
-    """Config for building the index and running the model/dataset pipeline."""
-
-    query_datasets: list[str] = field(default_factory=list)
-    """Datasets to use for the query."""
-
-    name: str | None = None
-    """Name of the run, used to save the model and tokenizer."""
-
-    split: str = "train"
-    """Split to use for training."""
-
-    fraction_examples: float = 0.05
-    """Fraction of examples to select from the training set."""
-
-    batch_size: int = 512
-    """Batch size for processing the dataset."""
-
-    seed: int = 42
-    """Seed for reproducibility."""
-
-    num_epochs: int = 4
-    """Number of epochs to train for."""
-
-    hf_token: str | None = None
-    """Hugging Face token to use for the dataset."""
-
-    dry_run: bool = False
-    """Whether to run the script in dry run mode."""
-
-    query_method: Literal["mean", "nearest"] = "mean"
-    """Method to use for computing the query."""
-
-
-def set_up_gradient_collection(
-    cfg: TrainerCollectionConfig, model: PreTrainedModel, rank: int, train: Dataset
+def configure_gradient_collection(
+    cfg: IndexConfig,
+    model: PreTrainedModel,
+    rank: int,
+    train: Dataset,
 ):
     # Set up closure for collecting gradients
     lo = torch.finfo(torch.float16).min
@@ -135,27 +100,10 @@ def set_up_gradient_collection(
     else:
         if cfg.normalizer != "none":
             # Evenly sample `stats_sample_size` examples to compute statistics
-            if isinstance(train, Dataset):
-                if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(
-                    train
-                ):
-                    stats_ds = train.shuffle(seed=0).select(
-                        range(cfg.stats_sample_size)
-                    )
-                else:
-                    stats_ds = train
+            if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(train):
+                stats_ds = train.shuffle(seed=0).select(range(cfg.stats_sample_size))
             else:
-                if cfg.stats_sample_size is not None:
-                    stats_iterable_ds = train.shuffle(seed=0).take(
-                        cfg.stats_sample_size
-                    )
-                    stats_ds = assert_type(
-                        Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds))
-                    )
-                else:
-                    stats_ds = assert_type(
-                        Dataset, Dataset.from_generator(lambda: iter(train))
-                    )
+                stats_ds = train
 
             stats_ds.set_format(None)
             normalizers = fit_normalizers(
@@ -180,28 +128,10 @@ def set_up_gradient_collection(
     return closure, processor, mod_grads, preconditioners, target_modules
 
 
-def mean_query(datasets: list[str], batch_size: int):
-    queries = []
-    for dataset_name in datasets:
-        query_dataset = load_gradient_dataset(dataset_name).with_format("torch")
-        acc = {"sum": torch.zeros_like(query_dataset[0]["gradients"], device="cuda")}
-
-        def sum_(col):
-            acc["sum"] += col.cuda().sum(0)
-
-        query_dataset.map(
-            sum_, input_columns="gradients", batched=True, batch_size=batch_size
-        )
-
-        queries.append(acc["sum"] / len(query_dataset))
-
-    return torch.stack(queries).mean(0)
-
-
 def worker(
     rank: int,
     world_size: int,
-    cfg: TrainerCollectionConfig,
+    cfg: IndexConfig,
     train: Dataset,
     eval: Dataset,
     run_name,
@@ -232,7 +162,7 @@ def worker(
     model, tokenizer = setup_chat_format(model, tokenizer)
 
     closure, processor, mod_grads, preconditioners, target_modules = (
-        set_up_gradient_collection(cfg, model, rank, train)
+        configure_gradient_collection(cfg, model, rank, train)
     )
 
     gradient_collector = GradientCollector(
@@ -259,6 +189,7 @@ def worker(
         model=model,
         train_dataset=train,  # type: ignore
         eval_dataset=eval,
+        callbacks=[gradient_collector_callback],
         args=SFTConfig(
             max_length=8192,
             output_dir=f"examples/runs/{run_name}",
@@ -266,30 +197,29 @@ def worker(
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=32,
             gradient_checkpointing=True,
-            num_train_epochs=cfg.num_epochs,
+            num_train_epochs=2,
             logging_steps=10,
             eval_steps=20,
             save_total_limit=3,
             group_by_length=True,
             completion_only_loss=True,
             ddp_find_unused_parameters=False,
-            seed=cfg.seed,
+            seed=0,
         ),
     )
-
-    # Set the callback
     trainer = prepare_for_gradient_collection(trainer)
-    trainer.add_callback(gradient_collector_callback)
-
-    train.set_format("torch")
-    eval.set_format("torch")
 
     with gradient_collector:
         trainer.train()
 
 
 def dist_worker(
-    rank: int, world_size: int, cfg: TrainerCollectionConfig, train, eval, run_name
+    rank: int,
+    world_size: int,
+    cfg: IndexConfig,
+    train: Dataset,
+    eval: Dataset,
+    run_name: str,
 ):
     try:
         worker(rank, world_size, cfg, train, eval, run_name)
@@ -304,17 +234,14 @@ def set_seeds(seed: int):
 
 
 def main(
-    args: TrainerCollectionConfig,
+    args: IndexConfig,
 ):
-    set_seeds(args.seed)
+    seed = 0
+    set_seeds(seed)
 
-    if args.name is None:
-        run_name = (
-            f"{args.model.split('/')[-1]}-{args.data.dataset.split('/')[-1]}"
-            f"-s={args.seed}"
-        )
-    else:
-        run_name = args.name
+    run_name = (
+        f"{args.model.split('/')[-1]}-{args.data.dataset.split('/')[-1]}" f"-s={seed}"
+    )
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -331,7 +258,7 @@ def main(
         completion_column=args.data.completion_column,
         conversation_column=args.data.conversation_column,
     )
-    dataset = assert_type(Dataset, load_dataset(args.data.dataset, split=args.split))
+    dataset = assert_type(Dataset, load_dataset(args.data.dataset, split="train"))
     dataset = dataset.map(
         tokenize,
         batched=True,
@@ -340,7 +267,7 @@ def main(
 
     train, eval = dataset.train_test_split(
         test_size=0.05,
-        seed=args.seed,
+        seed=seed,
     ).values()
 
     world_size = torch.cuda.device_count()
@@ -378,8 +305,6 @@ def main(
 
 
 if __name__ == "__main__":
-    # from simple_parsing import NestedMode
-
-    args = parse(TrainerCollectionConfig)
+    args = parse(IndexConfig)
 
     main(args)

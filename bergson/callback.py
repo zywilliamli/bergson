@@ -63,11 +63,11 @@ class GradientCollectorCallback(TrainerCallback):
         self,
         grad_buffer: np.memmap,
         mod_grads: dict[str, Tensor],
-        indices: Tensor,
+        indices: list[int],
     ):
         for layer_name in mod_grads.keys():
             torch.cuda.synchronize()
-            grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
+            grad_buffer[layer_name][indices] += mod_grads[layer_name].numpy() / self.div
         self.mod_grads.clear()
 
     def on_train_begin(
@@ -81,29 +81,7 @@ class GradientCollectorCallback(TrainerCallback):
             "Gradient collection is not enabled. Please enable it by "
             "calling bergson.prepare_gradient_collection on the trainer."
         )
-
-    def on_train_end(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ):
-        if not self.mean_gradients:
-            return
-
-        num_epochs = args.num_train_epochs
-
-        # Divide all the summed gradient buffers by the number of epochs
-        self.train_grad_buffer /= num_epochs
-        self.train_grad_buffer.flush()
-
-        if not self.eval_grad_buffers:
-            return
-
-        for grad_buffer in self.eval_grad_buffers.values():
-            grad_buffer /= num_epochs
-            grad_buffer.flush()
+        self.div = args.num_train_epochs if self.mean_gradients else 1
 
     def on_epoch_begin(
         self,
@@ -206,12 +184,9 @@ class GradientCollectorCallback(TrainerCallback):
     ):
         """Called at the end of each training step.
         If using gradient accumulation, one training step might take several inputs."""
-        indices = torch.tensor(
-            self.train_indices[
-                self.train_step_idx : self.train_step_idx
-                + args.per_device_train_batch_size
-            ]
-        )
+        indices = self.train_indices[
+            self.train_step_idx : self.train_step_idx + args.per_device_train_batch_size
+        ]
         self.train_step_idx += args.per_device_train_batch_size
 
         self.write_grads(self.train_grad_buffer, self.mod_grads, indices)
@@ -230,12 +205,11 @@ class GradientCollectorCallback(TrainerCallback):
     def on_prediction_step(self, args, state, control, **kwargs):
         dataset_name = kwargs["inputs"]["dataset_name"]
 
-        indices = torch.tensor(
-            self.eval_indices[dataset_name][
-                self.eval_step_idxs[dataset_name] : self.eval_step_idxs[dataset_name]
-                + args.per_device_eval_batch_size
-            ]
-        )
+        indices = self.eval_indices[dataset_name][
+            self.eval_step_idxs[dataset_name] : self.eval_step_idxs[dataset_name]
+            + args.per_device_eval_batch_size
+        ]
+
         self.eval_step_idxs[dataset_name] += args.per_device_eval_batch_size
 
         self.write_grads(
