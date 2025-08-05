@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 from functools import wraps
 
 import numpy as np
@@ -141,8 +142,7 @@ class GradientCollectorCallback(TrainerCallback):
             ]
 
         if epoch > 0 and not self.normalize_eval:
-            # Enable normalization for training
-            raise NotImplementedError("Not normalizing is not supported yet.")
+            self.collector.processor = self.processor
 
     def on_epoch_end(
         self,
@@ -199,8 +199,9 @@ class GradientCollectorCallback(TrainerCallback):
         **kwargs,
     ):
         if not self.normalize_eval:
-            # Disable normalization in the gradient collector
-            raise NotImplementedError("Not normalizing is not supported yet.")
+            eval_processor = deepcopy(self.collector.processor)
+            eval_processor.normalizers = {}
+            self.collector.processor = eval_processor
 
     def on_prediction_step(self, args, state, control, **kwargs):
         dataset_name = kwargs["inputs"]["dataset_name"]
