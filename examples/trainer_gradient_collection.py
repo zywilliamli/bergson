@@ -3,7 +3,6 @@ import os
 import socket
 from dataclasses import dataclass
 from datetime import timedelta
-from functools import wraps
 from typing import Literal
 
 import torch
@@ -17,11 +16,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_utils import PreTrainedModel
 from trl import SFTConfig, SFTTrainer, setup_chat_format
 
-from bergson import GradientCollector, GradientProcessor
-from bergson.callback import GradientCollectorCallback
+from bergson import (
+    GradientCollector,
+    GradientCollectorCallback,
+    GradientProcessor,
+    prepare_for_gradient_collection,
+)
 from bergson.collection import fit_normalizers
-
-# from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 from bergson.data import (
     DataConfig,
     IndexConfig,
@@ -197,64 +198,6 @@ def mean_query(datasets: list[str], batch_size: int):
     return torch.stack(queries).mean(0)
 
 
-def add_gradient_collector_callback(
-    trainer, gradient_collector, processor, mod_grads, preconditioners, run_name
-):
-    """Mutate the trainer object and its datasets in-place to expose the dataset
-    indices to the gradient collector callback."""
-    # Add indices to the training dataset
-    if trainer.train_dataset is not None:
-        trainer.train_dataset = trainer.train_dataset.map(
-            lambda ex, idx: {"_idx": idx}, with_indices=True
-        )
-
-    # Add indices to the evaluation dataset/s if they exist
-    eval_datasets = {}
-    if trainer.eval_dataset is not None:
-        if isinstance(trainer.eval_dataset, dict):
-            for eval_name, dataset in trainer.eval_dataset.items():
-                trainer.eval_dataset[eval_name] = dataset.map(
-                    lambda ex, idx: {"_idx": idx}, with_indices=True
-                )
-                eval_datasets[eval_name] = len(trainer.eval_dataset[eval_name])
-        else:
-            trainer.eval_dataset = trainer.eval_dataset.map(
-                lambda ex, idx: {"_idx": idx}, with_indices=True
-            )
-            eval_datasets["eval"] = len(trainer.eval_dataset)
-
-    # Mutate the trainer to retain the indices
-    def retain_idx(collator):
-        @wraps(collator)
-        def wrapper(features):
-            batch = collator(features)
-            batch.setdefault("_idx", torch.tensor([f["_idx"] for f in features]))
-            return batch
-
-        return wrapper
-
-    trainer.data_collator = retain_idx(trainer.data_collator)
-    trainer.args.remove_unused_columns = False
-
-    # Create the callback
-    grad_sizes = {name: math.prod(s) for name, s in gradient_collector.shapes().items()}
-
-    gradient_collector_callback = GradientCollectorCallback(
-        collector=gradient_collector,
-        processor=processor,
-        mod_grads=mod_grads,
-        preconditioners=preconditioners,
-        grad_sizes=grad_sizes,
-        path=f"examples/runs/gradients/{run_name}",
-        mean_gradients=True,
-    )
-
-    # Set the callback
-    trainer.add_callback(gradient_collector_callback)
-
-    return trainer
-
-
 def worker(
     rank: int,
     world_size: int,
@@ -299,6 +242,19 @@ def worker(
         target_modules=target_modules,
     )
 
+    # Create the callback
+    grad_sizes = {name: math.prod(s) for name, s in gradient_collector.shapes().items()}
+
+    gradient_collector_callback = GradientCollectorCallback(
+        collector=gradient_collector,
+        processor=processor,
+        mod_grads=mod_grads,
+        preconditioners=preconditioners,
+        grad_sizes=grad_sizes,
+        path=f"examples/runs/gradients/{run_name}",
+        mean_gradients=True,
+    )
+
     trainer = SFTTrainer(
         model=model,
         train_dataset=train,  # type: ignore
@@ -321,9 +277,12 @@ def worker(
         ),
     )
 
-    trainer = add_gradient_collector_callback(
-        trainer, gradient_collector, processor, mod_grads, preconditioners, run_name
-    )
+    # Set the callback
+    trainer = prepare_for_gradient_collection(trainer)
+    trainer.add_callback(gradient_collector_callback)
+
+    train.set_format("torch")
+    eval.set_format("torch")
 
     with gradient_collector:
         trainer.train()
