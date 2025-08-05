@@ -6,7 +6,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from simple_parsing import parse
 from torch import Tensor
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
@@ -16,18 +16,20 @@ from trl import SFTConfig, SFTTrainer, setup_chat_format
 
 from bergson import (
     GradientCollector,
-    GradientCollectorCallback,
     GradientProcessor,
-    prepare_for_gradient_collection,
 )
 from bergson.collection import fit_normalizers
 from bergson.data import (
     DataConfig,
     IndexConfig,
     allocate_batches,
+    load_data_string,
     tokenize,
 )
-from bergson.utils import assert_type
+from bergson.huggingface import (
+    GradientCollectorCallback,
+    prepare_for_gradient_collection,
+)
 
 
 def configure_gradient_collection(
@@ -233,9 +235,7 @@ def set_seeds(seed: int):
     torch.cuda.manual_seed(seed)
 
 
-def main(
-    args: IndexConfig,
-):
+def main(args: IndexConfig):
     seed = 0
     set_seeds(seed)
 
@@ -258,7 +258,7 @@ def main(
         completion_column=args.data.completion_column,
         conversation_column=args.data.conversation_column,
     )
-    dataset = assert_type(Dataset, load_dataset(args.data.dataset, split="train"))
+    dataset = load_data_string(args.data.dataset, streaming=args.streaming)
     dataset = dataset.map(
         tokenize,
         batched=True,

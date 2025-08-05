@@ -9,7 +9,14 @@ import numpy as np
 import pyarrow as pa
 import torch
 import torch.distributed as dist
-from datasets import Dataset, concatenate_datasets
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    concatenate_datasets,
+    load_dataset,
+)
 from numpy.lib.recfunctions import structured_to_unstructured
 from numpy.typing import DTypeLike
 from simple_parsing import field
@@ -254,6 +261,32 @@ def create_index(
         mode="r+",
         shape=(num_grads,),
     )
+
+
+def load_data_string(
+    data_str: str, streaming: bool = False
+) -> Dataset | IterableDataset:
+    """Load a dataset from a string identifier or path."""
+    if data_str.endswith(".csv"):
+        ds = assert_type(Dataset, Dataset.from_csv(data_str))
+    elif data_str.endswith(".json") or data_str.endswith(".jsonl"):
+        ds = assert_type(Dataset, Dataset.from_json(data_str))
+    else:
+        try:
+            ds = load_dataset(data_str, split="train", streaming=streaming)
+
+            if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
+                raise NotImplementedError(
+                    "DatasetDicts and IterableDatasetDicts are not supported."
+                )
+        except ValueError as e:
+            # Automatically use load_from_disk if appropriate
+            if "load_from_disk" in str(e):
+                ds = Dataset.load_from_disk(data_str, keep_in_memory=False)
+            else:
+                raise e
+
+    return ds
 
 
 def load_unstructured_gradients(root_dir: str) -> np.memmap:

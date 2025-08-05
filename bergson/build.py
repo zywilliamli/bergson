@@ -5,20 +5,14 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from datasets import (
-    Dataset,
-    DatasetDict,
-    IterableDataset,
-    IterableDatasetDict,
-    load_dataset,
-)
+from datasets import Dataset, IterableDataset
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from torch.distributed.fsdp import fully_shard
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .collection import collect_gradients, fit_normalizers
-from .data import IndexConfig, allocate_batches, tokenize
+from .data import IndexConfig, allocate_batches, load_data_string, tokenize
 from .gradients import GradientProcessor
 from .utils import assert_type, get_layer_list
 
@@ -208,25 +202,7 @@ def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
 
 def build_gradient_dataset(cfg: IndexConfig):
     # Do all the data loading and preprocessing on the main process
-    data_str = cfg.data.dataset
-    if data_str.endswith(".csv"):
-        ds = assert_type(Dataset, Dataset.from_csv(data_str))
-    elif data_str.endswith(".json") or data_str.endswith(".jsonl"):
-        ds = assert_type(Dataset, Dataset.from_json(data_str))
-    else:
-        try:
-            ds = load_dataset(data_str, split="train", streaming=cfg.streaming)
-
-            if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
-                raise NotImplementedError(
-                    "DatasetDicts and IterableDatasetDicts are not supported."
-                )
-        except ValueError as e:
-            # Automatically use load_from_disk if appropriate
-            if "load_from_disk" in str(e):
-                ds = Dataset.load_from_disk(data_str, keep_in_memory=False)
-            else:
-                raise e
+    ds = load_data_string(cfg.data.dataset, streaming=cfg.streaming)
 
     remove_columns = ds.column_names if cfg.drop_columns else None
 
