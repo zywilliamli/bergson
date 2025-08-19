@@ -440,7 +440,15 @@ def tokenize(batch: dict, *, args: DataConfig, tokenizer):
 
             ans = msg["content"]
             start = strings[i].find(ans, pos)
-            pos = start + len(ans)  # move past this match
+            if start < 0:
+                raise RuntimeError(
+                    "Failed to find completion in the chat-formatted conversation. "
+                    "Make sure the chat template does not alter the completion, e.g. "
+                    "by removing leading whitespace."
+                )
+
+            # move past this match
+            pos = start + len(ans)
 
             start_token = encodings.char_to_token(i, start)
             end_token = encodings.char_to_token(i, pos)
