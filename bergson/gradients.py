@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 from abc import ABC, abstractmethod
@@ -12,7 +11,7 @@ from torch import Tensor
 from torch.utils.hooks import RemovableHandle
 
 from .math import reshape_to_nearest_square
-from .utils import assert_type
+from .utils import assert_type, create_projection_matrix
 
 NORMALIZER_TYPES: dict[str, type["Normalizer"]] = {}
 
@@ -45,7 +44,6 @@ class Normalizer(ABC):
     def normalize_(
         self,
         grad: Tensor,
-        fisher_fourth_root: bool = False,
         eps: float = 1e-8,
     ) -> Tensor:
         """
@@ -81,7 +79,6 @@ class AdafactorNormalizer(Normalizer):
     def normalize_(
         self,
         grad: Tensor,
-        fisher_fourth_root: bool = False,
         eps: float = 1e-30,
     ) -> Tensor:
         """
@@ -109,12 +106,8 @@ class AdafactorNormalizer(Normalizer):
         # by diag(a) and right-multiplying by diag(b). In this case we can represent
         # the elementwise reciprocal square root of V as ab^T where:
         # a = denom.sqrt() * r.rsqrt() and b = c.rsqrt()
-        if fisher_fourth_root:
-            a = denom.pow(0.25) * r.pow(-0.25)
-            b = c.pow(-0.25)
-        else:
-            a = denom.sqrt() * r.rsqrt_()  # shape [O]
-            b = c.rsqrt_()
+        a = denom.sqrt() * r.rsqrt_()  # shape [O]
+        b = c.rsqrt_()
 
         # Implicitly do the Hadamard product
         grad *= a[:, None]  # [N, O] * [O] → [N, O]
@@ -146,12 +139,11 @@ class AdamNormalizer(Normalizer):
     def normalize_(
         self,
         grad: Tensor,
-        fisher_fourth_root: bool = False,
         eps: float = 1e-8,
     ) -> Tensor:
         """Normalize the gradients by the square root of the second moments."""
         # Adam-style epsilon is added outside the square root
-        denom = self.avg_sq.pow(0.25) if fisher_fourth_root else self.avg_sq.sqrt()
+        denom = self.avg_sq.sqrt()
         return grad.div_(denom.add_(eps))
 
     def to_adafactor(self) -> AdafactorNormalizer:
@@ -189,19 +181,26 @@ class GradientProcessor:
     These are applied after the normalization and random projection steps.
     """
 
-    fisher_fourth_root: bool = False
-    """
-    Whether to use the fourth root of the inverse Fisher information matrix when
-    normalizing gradients. This means any inner product between normalized gradients
-    will implicitly use the square root of the inverse Fisher, rather than the inverse
-    Fisher itself.
-    """
-
     projection_dim: int | None = None
     """Number of rows and columns to project the gradients to. If `None`, keep the
     original shape of the gradients."""
 
     reshape_to_square: bool = False
+    """Whether to reshape the gradients into a nearly square matrix before projection.
+    This is useful when the matrix-valued parameters are far from square, like in the
+    case of LoRA adapters."""
+
+    projection_type: Literal["normal", "rademacher"] = "rademacher"
+    """
+    Type of random projection to use for compressing gradients. Can be either "normal"
+    for Gaussian projections or "rademacher" for Rademacher projections, which use a
+    uniform distribution over {-1, 1}.
+    """
+
+    def __post_init__(self):
+        self._projection_matrices: dict[
+            tuple[str, Literal["left", "right"]], Tensor
+        ] = {}
 
     @classmethod
     def load(
@@ -221,6 +220,10 @@ class GradientProcessor:
         with open(cfg_path, "r") as f:
             cfg = json.load(f)
 
+        # Backward compatibility
+        if "projection_type" not in cfg:
+            cfg["projection_type"] = "normal"
+
         # Load normalizers
         norm_state = torch.load(
             norm_path,
@@ -239,7 +242,7 @@ class GradientProcessor:
                 map_location=map_location,
                 weights_only=True,
             ),
-            projection_dim=cfg.get("projection_dim"),
+            **cfg,
         )
 
     def save(self, path: str):
@@ -331,16 +334,16 @@ class GradientCollector(ContextDecorator):
         dtype: torch.dtype,
     ) -> Tensor:
         """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
-        # Seed the PRNG with the name of the layer and what "side" we are projecting
-        message = bytes(f"{name}/{side}", "utf-8")
-        digest = hashlib.md5(message).digest()
-        seed = int.from_bytes(digest, byteorder="big") % (2**63 - 1)
+        key = (name, side)
+        if key in self.processor._projection_matrices:
+            return self.processor._projection_matrices[key]
 
+        identifier = f"{name}/{side}"
         device, _ = self.target_info[name]
-        prng = torch.Generator(device).manual_seed(seed)
-
-        A = torch.randn(m, n, device=device, dtype=dtype, generator=prng)
-        A /= A.norm(dim=1, keepdim=True)
+        A = create_projection_matrix(
+            identifier, m, n, dtype, device, self.processor.projection_type
+        )
+        self.processor._projection_matrices[key] = A
         return A
 
     def __enter__(self):
@@ -371,10 +374,7 @@ class GradientCollector(ContextDecorator):
         norm = self.processor.normalizers.get(name)
         if isinstance(norm, AdafactorNormalizer):
             b = norm.col.add(1e-30)
-            if self.processor.fisher_fourth_root:
-                b.pow_(-0.25)
-            else:
-                b.rsqrt_()
+            b.rsqrt_()
 
             x = x * b.type_as(x)  # [N, S, I] * [I] → [N, S, I]
 
@@ -403,11 +403,7 @@ class GradientCollector(ContextDecorator):
         if isinstance(norm, AdafactorNormalizer):
             # Compare to the normalize_ method in AdafactorNormalizer
             r = norm.row.add(1e-30)
-
-            if self.processor.fisher_fourth_root:
-                a = r.mean().pow(0.25) * r.pow(-0.25)
-            else:
-                a = r.mean().sqrt() * r.rsqrt_()
+            a = r.mean().sqrt() * r.rsqrt_()
 
             G = G * a.type_as(G)  # [N, S, O] * [O] → [N, S, O]
 

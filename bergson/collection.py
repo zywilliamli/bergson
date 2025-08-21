@@ -18,6 +18,7 @@ from .gradients import (
     GradientProcessor,
     Normalizer,
 )
+from .peft import set_peft_enabled
 
 
 def collect_gradients(
@@ -29,6 +30,7 @@ def collect_gradients(
     batches: list[list[int]] | None = None,
     skip_preconditioners: bool = False,
     target_modules: set[str] | None = None,
+    kl_divergence: bool | None = None,
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -44,14 +46,16 @@ def collect_gradients(
     preconditioners = {}
 
     # TODO: Handle this more elegantly
-    lo = torch.finfo(torch.float16).min
-    hi = torch.finfo(torch.float16).max
+    dtype = torch.float32 if model.dtype == torch.float32 else torch.float16
+    np_dtype = np.float32 if dtype == torch.float32 else np.float16
+    lo = torch.finfo(dtype).min
+    hi = torch.finfo(dtype).max
 
     def callback(name: str, g: torch.Tensor):
         g = g.flatten(1).clamp_(lo, hi)
 
         # Asynchronously move the gradient to CPU and convert to fp16
-        mod_grads[name] = g.to(device="cpu", dtype=torch.float16, non_blocking=True)
+        mod_grads[name] = g.to(device="cpu", dtype=dtype, non_blocking=True)
 
         # Compute the outer product of the flattened gradient
         if not skip_preconditioners:
@@ -74,13 +78,13 @@ def collect_gradients(
 
     # Allocate structured space ahead of time for the gradients
     grad_buffer = create_index(
-        path, num_grads=len(data), grad_sizes=grad_sizes, dtype=np.float16
+        path, num_grads=len(data), grad_sizes=grad_sizes, dtype=np_dtype
     )
 
     per_doc_losses = torch.full(
         (len(data),),
         device=model.device,
-        dtype=torch.float16,
+        dtype=dtype,
         fill_value=0.0,
     )
 
@@ -91,26 +95,41 @@ def collect_gradients(
             labels=batch.get("labels"),  # type: ignore
             device=model.device,
         )
+        masks = y[:, 1:] != -100
+        denoms = masks.sum(dim=1, dtype=dtype)
 
-        with collector:
-            logits = model(x).logits
+        if kl_divergence:
+            with torch.inference_mode():
+                set_peft_enabled(model, False)
+                ref_lps = torch.log_softmax(model(x).logits[:, :-1], dim=-1)
+                set_peft_enabled(model, True)
 
-            losses = F.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                y[:, 1:].flatten(),
-                reduction="none",
-            ).reshape_as(y[:, 1:])
+            with collector:
+                ft_lps = torch.log_softmax(model(x).logits[:, :-1], dim=-1)
 
-            masks = y[:, 1:] != -100
-            denoms = masks.sum(dim=1, dtype=logits.dtype)
-            losses = losses.sum(1).div(denoms)
-            losses.mean().backward()
+                # Compute average KL across all unmasked tokens
+                kls = torch.sum(ft_lps.exp() * (ft_lps - ref_lps), dim=-1)
+                losses = torch.sum(kls * masks, dim=-1) / denoms
+                losses.mean().backward()
+        else:
+            with collector:
+                logits = model(x).logits[:, :-1]
 
-            model.zero_grad()
+                losses = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    y[:, 1:].flatten(),
+                    reduction="none",
+                ).reshape_as(y[:, 1:])
+                losses = losses.sum(1).div(denoms)
+                losses.mean().backward()
+
+        # Weirdly you need to explicitly synchronize here in order to make sure that
+        # the nonblocking copies actually finish before we call .numpy()
+        model.zero_grad()
+        torch.cuda.synchronize()
 
         # It turns out that it's very important for efficiency to write the gradients
         # sequentially instead of first concatenating them, then writing to one vector
-        torch.cuda.synchronize()
         for layer_name in mod_grads.keys():
             grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
 
@@ -136,7 +155,7 @@ def collect_gradients(
         data = data.add_column(
             "loss",
             per_doc_losses.cpu().numpy(),
-            feature=Value("float16"),
+            feature=Value("float16" if dtype == torch.float16 else "float32"),
             new_fingerprint="loss",
         )
         data.save_to_disk(path + "/data.hf")

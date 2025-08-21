@@ -9,7 +9,14 @@ import numpy as np
 import pyarrow as pa
 import torch
 import torch.distributed as dist
-from datasets import Dataset, concatenate_datasets
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    concatenate_datasets,
+    load_dataset,
+)
 from numpy.lib.recfunctions import structured_to_unstructured
 from numpy.typing import DTypeLike
 from simple_parsing import field
@@ -22,6 +29,9 @@ class DataConfig:
     dataset: str = "EleutherAI/SmolLM2-135M-10B"
     """Dataset identifier to build the index from."""
 
+    split: str = "train"
+    """Split of the dataset to use for building the index."""
+
     prompt_column: str = "text"
     """Column in the dataset that contains the prompts."""
 
@@ -30,6 +40,9 @@ class DataConfig:
 
     conversation_column: str = ""
     """Optional column in the dataset that contains the conversation."""
+
+    truncation: bool = False
+    """Whether to truncate long documents to fit the token budget."""
 
 
 @dataclass
@@ -48,7 +61,7 @@ class IndexConfig:
     fsdp: bool = False
     """Whether to use Fully Sharded Data Parallel (FSDP) for collecing gradients."""
 
-    precision: Literal["bf16", "fp16", "fp32", "int4", "int8"] = "bf16"
+    precision: Literal["auto", "bf16", "fp16", "fp32", "int4", "int8"] = "auto"
     """Precision to use for the model parameters."""
 
     projection_dim: int = 16
@@ -57,14 +70,14 @@ class IndexConfig:
     reshape_to_square: bool = False
     """Whether to reshape the gradients to a square matrix."""
 
+    projection_type: Literal["normal", "rademacher"] = "rademacher"
+    """Type of random projections to use for the gradients."""
+
     token_batch_size: int = 8192
     """Batch size in tokens for building the index."""
 
-    normalizer: Literal["adafactor", "adam", "none"] = "adafactor"
+    normalizer: Literal["adafactor", "adam", "none"] = "none"
     """Type of normalizer to use for the gradients."""
-
-    fisher_fourth_root: bool = False
-    """Whether to use the fourth root of the Fisher information matrix."""
 
     processor_path: str = ""
     """Path to a precomputed processor."""
@@ -77,6 +90,9 @@ class IndexConfig:
 
     drop_columns: bool = False
     """Only return the new dataset columns."""
+
+    loss_fn: Literal["ce", "kl"] = "ce"
+    """Loss function to use."""
 
     streaming: bool = False
     """Whether to use streaming mode for the dataset."""
@@ -103,15 +119,13 @@ def allocate_batches(doc_lengths: list[int], N: int) -> list[list[int]]:
     doc_lengths : Sequence[int]
         Length (in tokens) of each document.  The *i-th* document is referred to
         internally by its index ``i``.
-    workers : int
-        Number of parallel workers ( 1 ≤ workers ≤ 8).
     N : int
         Hard memory budget per *batch*, expressed as
         ``max(length in batch) * (# docs in batch) ≤ N``.
 
     Returns
     -------
-    list[list[list[int]]]
+    list[list[int]]
         ``allocation[w][b]`` is the list of document indices that belong to the
         *b-th* batch assigned to worker ``w``.  Every worker receives the same
         number of (non-empty) batches.
@@ -126,45 +140,46 @@ def allocate_batches(doc_lengths: list[int], N: int) -> list[list[int]]:
     1.  **Per-batch cost constraint**:  Each batch is padded to the maximum
         sequence length *inside that batch*, so its cost in “token × examples”
         units is ``max_len_in_batch * batch_size``.  This must stay ≤ ``N``.
-    2.  **Bin-packing strategy**:  We use *first-fit decreasing* (FFD) to obtain
-        an initial near-minimal set of batches, then split some of the larger
-        batches (never increases cost) until
-
-            * every worker has at least one batch,
-            * the total number of batches is a multiple of ``workers``.
-
-        Because each split only lowers the cost of the two resulting batches,
-        the constraint in (1) remains satisfied throughout.
+    2.  **Bin-packing strategy**:  We use a simple greedy bin-packing algorithm
+        that sorts the documents by length and tries to fit them into batches
+        without exceeding the cost constraint.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    if not doc_lengths:
-        raise RuntimeError("Empty document list.")
-    if max(doc_lengths) > N:  # a single document would overflow any batch
-        raise RuntimeError("At least one document is too long for the budget N.")
+    if len(doc_lengths) < world_size:
+        raise RuntimeError("Not enough documents to distribute across workers.")
+
+    docs_sorted = sorted(enumerate(doc_lengths), key=lambda x: x[1], reverse=True)
+    if docs_sorted[0][1] > N:  # a single document would overflow any batch
+        raise RuntimeError(
+            f"At least one document is too long for the token batch size {N}."
+        )
 
     # ---------------------------------------------------------------------
-    # 1) First-fit decreasing (FFD) bin packing under the cost function
+    # 1) Bin packing under the cost function
     #    cost(batch) = max_len_in_batch * len(batch)
     # ---------------------------------------------------------------------
-    docs_sorted = sorted(enumerate(doc_lengths), key=lambda x: x[1], reverse=True)
     batches: list[list[int]] = []  # holds document *indices*
-    batch_meta = []  # (max_len, size) for each batch
+    cur_batch: list[int] = []  # holds document *indices* in the current batch
 
     for idx, length in docs_sorted:
-        placed = False
-        for j, (mx, sz) in enumerate(batch_meta):
-            new_mx = max(mx, length)
-            new_sz = sz + 1
-            if new_mx * new_sz <= N:  # still fits
-                batches[j].append(idx)
-                batch_meta[j] = (new_mx, new_sz)
-                placed = True
-                break
+        if not cur_batch:
+            # Start a new batch with the current document
+            cur_batch.append(idx)
+        else:
+            # Check if adding this document would exceed the budget
+            new_cost = max(length, doc_lengths[cur_batch[0]]) * (len(cur_batch) + 1)
+            if new_cost <= N:
+                # It fits, so add it to the current batch
+                cur_batch.append(idx)
+            else:
+                # It doesn't fit, finalize the current batch and start a new one
+                batches.append(cur_batch)
+                cur_batch = [idx]
 
-        if not placed:  # open a new batch
-            batches.append([idx])
-            batch_meta.append((length, 1))
+    # Finalize the last batch if it's not empty
+    if cur_batch:
+        batches.append(cur_batch)
 
     # ---------------------------------------------------------------------
     # 2) Ensure every worker gets ≥ 1 batch
@@ -257,6 +272,32 @@ def create_index(
         mode="r+",
         shape=(num_grads,),
     )
+
+
+def load_data_string(
+    data_str: str, split: str = "train", streaming: bool = False
+) -> Dataset | IterableDataset:
+    """Load a dataset from a string identifier or path."""
+    if data_str.endswith(".csv"):
+        ds = assert_type(Dataset, Dataset.from_csv(data_str))
+    elif data_str.endswith(".json") or data_str.endswith(".jsonl"):
+        ds = assert_type(Dataset, Dataset.from_json(data_str))
+    else:
+        try:
+            ds = load_dataset(data_str, split=split, streaming=streaming)
+
+            if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
+                raise NotImplementedError(
+                    "DatasetDicts and IterableDatasetDicts are not supported."
+                )
+        except ValueError as e:
+            # Automatically use load_from_disk if appropriate
+            if "load_from_disk" in str(e):
+                ds = Dataset.load_from_disk(data_str, keep_in_memory=False)
+            else:
+                raise e
+
+    return ds
 
 
 def load_unstructured_gradients(root_dir: str) -> np.memmap:
@@ -366,6 +407,7 @@ def tokenize(batch: dict, *, args: DataConfig, tokenizer):
     kwargs = dict(
         return_attention_mask=False,
         return_length=True,
+        truncation=args.truncation,
     )
     if args.completion_column:
         # We're dealing with a prompt-completion dataset
@@ -383,11 +425,11 @@ def tokenize(batch: dict, *, args: DataConfig, tokenizer):
         convos = assert_type(list, batch[args.conversation_column])
     else:
         # We're dealing with vanilla next-token prediction
-        return tokenizer(batch[args.prompt_column], truncation=True, **kwargs)
+        return tokenizer(batch[args.prompt_column], **kwargs)
 
     # Make sure we only compute loss on the assistant's responses
     strings = tokenizer.apply_chat_template(convos, tokenize=False)
-    encodings = tokenizer(strings, truncation=True, **kwargs)
+    encodings = tokenizer(strings, **kwargs)
     labels_list: list[list[int]] = []
 
     for i, convo in enumerate(convos):
@@ -401,7 +443,15 @@ def tokenize(batch: dict, *, args: DataConfig, tokenizer):
 
             ans = msg["content"]
             start = strings[i].rfind(ans, pos)
-            pos = start + len(ans)  # move past this match
+            if start < 0:
+                raise RuntimeError(
+                    "Failed to find completion in the chat-formatted conversation. "
+                    "Make sure the chat template does not alter the completion, e.g. "
+                    "by removing leading whitespace."
+                )
+
+            # move past this match
+            pos = start + len(ans)
 
             start_token = encodings.char_to_token(i, start)
             end_token = encodings.char_to_token(i, pos)

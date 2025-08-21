@@ -1,25 +1,27 @@
 import os
 import socket
 from datetime import timedelta
+from typing import cast
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from datasets import (
-    Dataset,
-    DatasetDict,
-    IterableDataset,
-    IterableDatasetDict,
-    load_dataset,
-)
+from datasets import Dataset, IterableDataset
+from peft import PeftConfig, PeftModel
 from torch.distributed.elastic.multiprocessing import DefaultLogsSpecs, start_processes
 from torch.distributed.fsdp import fully_shard
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    PreTrainedModel,
+)
 
-from .collection import collect_gradients, fit_normalizers
-from .data import IndexConfig, allocate_batches, tokenize
+from .collection import collect_gradients
+from .data import IndexConfig, allocate_batches, load_data_string, tokenize
 from .gradients import GradientProcessor
+from .peft import detect_peft_modules
 from .utils import assert_type, get_layer_list
 
 
@@ -49,27 +51,63 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             dtype = torch.float32
         case "int4" | "int8":
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        case "auto":
+            dtype = "auto"
         case other:
             raise ValueError(f"Unsupported precision: {other}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model,
-        device_map={"": f"cuda:{rank}" if not cfg.fsdp else "cpu"},
-        quantization_config=(
-            BitsAndBytesConfig(
-                load_in_4bit=cfg.precision == "int4",
-                load_in_8bit=cfg.precision == "int8",
-                bnb_4bit_compute_dtype=dtype,
-                bnb_4bit_quant_storage=dtype,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-            if cfg.precision in ("int4", "int8")
-            else None
-        ),
-        torch_dtype=dtype,
-        revision=cfg.revision,
-    )
+    device_map = {"": f"cuda:{rank}"} if not cfg.fsdp else "cpu"
+    quantization_config = None
+    if cfg.precision in ("int4", "int8"):
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=cfg.precision == "int4",
+            load_in_8bit=cfg.precision == "int8",
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_quant_storage=dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+
+    # Try to detect PEFT model
+    try:
+        peft_config = PeftConfig.from_pretrained(cfg.model)
+    except ValueError:
+        peft_config = None
+
+    if peft_config is None:
+        # Load regular model
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model,
+            device_map=device_map,
+            quantization_config=quantization_config,
+            torch_dtype=dtype,
+            revision=cfg.revision,
+        )
+        target_modules = None
+
+    else:
+        # Load PEFT model
+        base_model = AutoModelForCausalLM.from_pretrained(
+            peft_config.base_model_name_or_path,  # type: ignore
+            device_map=device_map,
+            quantization_config=quantization_config,
+            torch_dtype=dtype,
+            revision=cfg.revision,
+        )
+
+        model = PeftModel.from_pretrained(
+            base_model,
+            cfg.model,
+            device_map=device_map,
+            autocast_adapter_dtype=False,
+        )
+        target_modules = detect_peft_modules(model)
+
+        # Hack for type checking
+        model = cast(PreTrainedModel, model)
+
+    if rank == 0:
+        print(f"Model loaded with dtype: {model.dtype}")
 
     embed = model.get_input_embeddings()
     model.requires_grad_(False)  # Freeze the model
@@ -83,34 +121,6 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
         # Shard the entire model
         fully_shard(model)
 
-    # Check for PEFT adapters
-    try:
-        adapters = model.active_adapters()
-    except ValueError:
-        target_modules = None
-    else:
-        cfg.normalizer = "adam"
-        cfg.reshape_to_square = True
-
-        if rank == 0:
-            print("PEFT model detected. Using Adam and reshape_to_square = True")
-
-        target_modules = set()
-
-        for adapter_name in adapters:
-            state = model.get_adapter_state_dict(adapter_name)
-
-            for name in state:
-                prefix = name.removesuffix(".weight")
-                name = prefix + "." + adapter_name
-
-                try:
-                    model.get_submodule(name)
-                except AttributeError:
-                    print(f"Adapter parameter '{name}' not found in the model.")
-
-                target_modules.add(name.removeprefix("model."))
-
     if os.path.exists(cfg.processor_path):
         if rank == 0:
             print(f"Loading processor from '{cfg.processor_path}'")
@@ -120,47 +130,17 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             map_location=f"cuda:{rank}",
         )
     else:
-        if cfg.normalizer != "none":
-            # Evenly sample `stats_sample_size` examples to compute statistics
-            if isinstance(ds, Dataset):
-                if cfg.stats_sample_size is not None and cfg.stats_sample_size < len(
-                    ds
-                ):
-                    stats_ds = ds.shuffle(seed=0).select(range(cfg.stats_sample_size))
-                else:
-                    stats_ds = ds
-            else:
-                if cfg.stats_sample_size is not None:
-                    stats_iterable_ds = ds.shuffle(seed=0).take(cfg.stats_sample_size)
-                    stats_ds = assert_type(
-                        Dataset, Dataset.from_generator(lambda: iter(stats_iterable_ds))
-                    )
-                else:
-                    stats_ds = assert_type(
-                        Dataset, Dataset.from_generator(lambda: iter(ds))
-                    )
-
-            normalizers = fit_normalizers(
-                model,
-                stats_ds,
-                batches=allocate_batches(stats_ds["length"], cfg.token_batch_size),
-                kind=cfg.normalizer,
-                target_modules=target_modules,
-            )
-        else:
-            normalizers = {}
-
         processor = GradientProcessor(
-            normalizers,
-            fisher_fourth_root=cfg.fisher_fourth_root,
+            {},
             projection_dim=cfg.projection_dim or None,
             reshape_to_square=cfg.reshape_to_square,
+            projection_type=cfg.projection_type,
         )
         if rank == 0:
             processor.save(cfg.run_path)
 
     if isinstance(ds, Dataset):
-        batches = allocate_batches(ds["length"], cfg.token_batch_size)
+        batches = allocate_batches(ds["length"][:], cfg.token_batch_size)
         collect_gradients(
             model,
             ds,
@@ -169,6 +149,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             batches=batches,
             skip_preconditioners=cfg.skip_preconditioners,
             target_modules=target_modules,
+            kl_divergence=cfg.loss_fn == "kl",
         )
     else:
         # Convert each chunk to Dataset then collect their gradients
@@ -188,6 +169,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
                 batches=batches,
                 skip_preconditioners=cfg.skip_preconditioners,
                 target_modules=target_modules,
+                kl_divergence=cfg.loss_fn == "kl",
             )
             buf.clear()
             chunk_id += 1
@@ -207,39 +189,21 @@ def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
 
 
 def build_gradient_dataset(cfg: IndexConfig):
-    # Do all the data loading and preprocessing on the main process
-    data_str = cfg.data.dataset
-    if data_str.endswith(".csv"):
-        ds = assert_type(Dataset, Dataset.from_csv(data_str))
-    elif data_str.endswith(".json") or data_str.endswith(".jsonl"):
-        ds = assert_type(Dataset, Dataset.from_json(data_str))
-    else:
-        try:
-            ds = load_dataset(data_str, split="train", streaming=cfg.streaming)
+    # In many cases the token_batch_size may be smaller than the max length allowed by
+    # the model. If cfg.data.truncation is True, we use the tokenizer to truncate
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model, revision=cfg.revision)
+    tokenizer.model_max_length = min(tokenizer.model_max_length, cfg.token_batch_size)
 
-            if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
-                raise NotImplementedError(
-                    "DatasetDicts and IterableDatasetDicts are not supported."
-                )
-        except ValueError as e:
-            # Automatically use load_from_disk if appropriate
-            if "load_from_disk" in str(e):
-                ds = Dataset.load_from_disk(data_str, keep_in_memory=False)
-            else:
-                raise e
+    # Do all the data loading and preprocessing on the main process
+    ds = load_data_string(cfg.data.dataset, cfg.data.split, streaming=cfg.streaming)
 
     remove_columns = ds.column_names if cfg.drop_columns else None
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model, model_max_length=cfg.token_batch_size, revision=cfg.revision
-    )
     ds = ds.map(
         tokenize,
         batched=True,
         fn_kwargs=dict(args=cfg.data, tokenizer=tokenizer),
         remove_columns=remove_columns,
     )
-
     world_size = torch.cuda.device_count()
     if world_size <= 1:
         # Run the worker directly if no distributed training is needed. This is great
