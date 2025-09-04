@@ -89,7 +89,7 @@ class GradientCollectorCallback(TrainerCallback):
             target_modules = None
 
         self.collector = GradientCollector(
-            model=model,
+            model=getattr(model, "base_model", model),
             closure=self.on_module_backward,
             processor=GradientProcessor(
                 {},
@@ -130,19 +130,9 @@ class GradientCollectorCallback(TrainerCallback):
         if not isinstance(ds, Sized):
             raise ValueError("Dataset must be sized for gradient collection")
 
-        self.num_examples = len(ds)
-        if dist.is_initialized():
-            num_examples = torch.tensor(
-                [self.num_examples],
-                device="cuda",
-                dtype=torch.int32,
-            )
-            dist.all_reduce(num_examples, op=dist.ReduceOp.SUM)
-            self.num_examples = int(num_examples.item())
-
         self.train_grad_buffer = create_index(
             os.path.join(self.path, "train" + epoch_suffix),
-            num_grads=self.num_examples,
+            num_grads=len(ds),
             grad_sizes=self.grad_sizes,
             dtype=self.dtype,
         )
@@ -177,8 +167,12 @@ class GradientCollectorCallback(TrainerCallback):
     ):
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
+            epoch = int(state.epoch or 0) - 1
+            epoch_suffix = "" if self.accumulate_grads else f"/epoch_{epoch}"
+            path = os.path.join(self.path, "train" + epoch_suffix)
+
             assert self.collector is not None
-            self.collector.processor.save(self.path)
+            self.collector.processor.save(path)
 
         # Ensure the gradients are written to disk
         self.train_grad_buffer.flush()
@@ -221,6 +215,8 @@ class GradientCollectorCallback(TrainerCallback):
         optimizer: torch.optim.Optimizer,
         **kwargs,
     ):
+        self.on_substep_end(args, state, control)
+
         # The optimizer doesn't actually know the names of the parameters
         param_to_name = {
             param: name
