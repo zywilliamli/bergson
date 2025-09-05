@@ -107,6 +107,9 @@ def collect_gradients(
                 # Compute average KL across all unmasked tokens
                 kls = torch.sum(ft_lps.exp() * (ft_lps - ref_lps), dim=-1)
                 losses = torch.sum(kls * masks, dim=-1) / denoms
+                if "advantage" in batch:
+                    losses *= torch.tensor(batch["advantage"], device=losses.device)
+
                 losses.mean().backward()
         else:
             with collector:
@@ -118,6 +121,9 @@ def collect_gradients(
                     reduction="none",
                 ).reshape_as(y[:, 1:])
                 losses = losses.sum(1) / denoms
+                if "advantage" in batch:
+                    losses *= torch.tensor(batch["advantage"], device=losses.device)
+
                 losses.mean().backward()
 
         # Weirdly you need to explicitly synchronize here in order to make sure that
