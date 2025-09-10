@@ -30,6 +30,7 @@ class GradientCollectorCallback(TrainerCallback):
         projection_dim: int = 16,
         dtype: DTypeLike = np.float16,
         accumulate_grads: bool = False,
+        use_optimizer_state: bool = True,
     ):
         """
         Args:
@@ -39,6 +40,9 @@ class GradientCollectorCallback(TrainerCallback):
             accumulate_grads: Whether to take the sum of the gradients
                 of the same example across epochs. If `False`, the
                 gradients for each epoch are stored separately.
+            use_optimizer_state: Whether to use the optimizer state to
+                normalize the gradients. If `False`, no normalization is
+                applied.
         """
         super().__init__()
 
@@ -50,6 +54,7 @@ class GradientCollectorCallback(TrainerCallback):
         self.dtype = dtype
         self.path = path
         self.projection_dim = projection_dim
+        self.use_optimizer_state = use_optimizer_state
 
         self.eval_grad_buffers: dict[str, np.memmap] = {}
         self.eval_step_idxs: dict[str, int] = {}
@@ -217,7 +222,12 @@ class GradientCollectorCallback(TrainerCallback):
     ):
         self.on_substep_end(args, state, control)
 
+        # We can skip all this if we're not using the optimizer state
+        if not self.use_optimizer_state:
+            return
+
         # The optimizer doesn't actually know the names of the parameters
+        model = getattr(model, "base_model", model)
         param_to_name = {
             param: name
             for name, param in model.named_parameters()
@@ -235,7 +245,7 @@ class GradientCollectorCallback(TrainerCallback):
             lr_sqrt = group["lr"] ** 0.5
 
             for param in group["params"]:
-                name = param_to_name[param]
+                name = param_to_name[param].removesuffix(".weight")
                 if name not in self.collector.target_info:
                     continue
 
@@ -245,11 +255,18 @@ class GradientCollectorCallback(TrainerCallback):
                 if (eas := p_state.get("exp_avg_sq")) is not None:
                     norm = AdamNormalizer(eas).to_adafactor()
 
-                    # Scale the gradient by the current learning rate. It's factorized
-                    # so we multiply each factor by the square root of the LR.
-                    norm.row *= lr_sqrt
-                    norm.col *= lr_sqrt
-                    normalizers[name] = norm
+                # Adafactor-like optimizer
+                elif (vr := p_state.get("exp_avg_sq_row")) is not None:
+                    vc = p_state.get("exp_avg_sq_col")
+                    norm = AdafactorNormalizer(vr, vc)
+                else:
+                    continue
+
+                # Scale the gradient by the current learning rate. It's factorized
+                # so we multiply each factor by the square root of the LR.
+                norm.row *= lr_sqrt
+                norm.col *= lr_sqrt
+                normalizers[name] = norm
 
         proc.normalizers = normalizers
 
