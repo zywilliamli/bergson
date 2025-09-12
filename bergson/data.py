@@ -102,8 +102,8 @@ class IndexConfig:
     streaming: bool = False
     """Whether to use streaming mode for the dataset."""
 
-    streaming_chunk_size: int = 100_000
-    """Chunk size for streaming the dataset into Dataset objects."""
+    stream_shard_size: int = 100_000
+    """Shard size for streaming the dataset into Dataset objects."""
 
     revision: str | None = None
     """Revision of the model."""
