@@ -154,20 +154,20 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             target_modules=target_modules,
         )
     else:
-        # Convert each chunk to Dataset then collect their gradients
-        buf, chunk_id = [], 0
+        # Convert each shard to a Dataset then collect its gradients
+        buf, shard_id = [], 0
 
         def flush():
-            nonlocal buf, chunk_id
+            nonlocal buf, shard_id
             if not buf:
                 return
-            sub_ds = assert_type(Dataset, Dataset.from_list(buf))
-            batches = allocate_batches(sub_ds["length"], cfg.token_batch_size)
+            ds_shard = assert_type(Dataset, Dataset.from_list(buf))
+            batches = allocate_batches(ds_shard["length"][:], cfg.token_batch_size)
             collect_gradients(
                 model,
-                sub_ds,
+                ds_shard,
                 processor,
-                os.path.join(cfg.run_path, f"chunk-{chunk_id:05d}"),
+                os.path.join(cfg.run_path, f"shard-{shard_id:05d}"),
                 batches=batches,
                 kl_divergence=cfg.loss_fn == "kl",
                 loss_reduction=cfg.loss_reduction,
@@ -175,11 +175,11 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
                 target_modules=target_modules,
             )
             buf.clear()
-            chunk_id += 1
+            shard_id += 1
 
         for ex in tqdm(ds, desc="Collecting gradients"):
             buf.append(ex)
-            if len(buf) == cfg.streaming_chunk_size:
+            if len(buf) == cfg.stream_shard_size:
                 flush()
         flush()
 

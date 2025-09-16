@@ -1,6 +1,7 @@
-from .attributor import Attributor, FaissConfig
+from .attributor import Attributor
 from .collection import collect_gradients
 from .data import IndexConfig, load_gradients
+from .faiss_index import FaissConfig
 from .gradcheck import FiniteDiff
 from .gradients import (
     GradientCollector,

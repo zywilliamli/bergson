@@ -102,8 +102,8 @@ class IndexConfig:
     streaming: bool = False
     """Whether to use streaming mode for the dataset."""
 
-    streaming_chunk_size: int = 100_000
-    """Chunk size for streaming the dataset into Dataset objects."""
+    stream_shard_size: int = 100_000
+    """Shard size for streaming the dataset into Dataset objects."""
 
     revision: str | None = None
     """Revision of the model."""
@@ -305,31 +305,11 @@ def load_data_string(
     return ds
 
 
-def load_unstructured_gradients(root_dir: str) -> np.memmap:
-    """Map the gradients stored in `root_dir` into memory."""
-    with open(os.path.join(root_dir, "info.json")) as f:
-        info = json.load(f)
-        grad_size = info["grad_size"]
-        num_grads = info["num_grads"]
-
-    mmap = np.memmap(
-        root_dir + "/gradients.bin",
-        dtype=np.float16,
-        mode="r",
-        shape=(num_grads, grad_size),
-    )
-    return mmap
-
-
 def load_gradients(root_dir: str) -> np.memmap:
     """Map the structured gradients stored in `root_dir` into memory."""
 
     with open(os.path.join(root_dir, "info.json")) as f:
         info = json.load(f)
-
-    # TODO 2025-08-01 Remove legacy loading
-    if "grad_size" in info:
-        return load_unstructured_gradients(root_dir)
 
     dtype = info["dtype"]
     num_grads = info["num_grads"]
