@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 from datasets import Dataset
 from transformers import AutoConfig, AutoModelForCausalLM, Trainer, TrainingArguments
+from trl import SFTConfig, SFTTrainer
 
+from bergson.data import load_gradients
 from bergson.huggingface import (
     GradientCollectorCallback,
     prepare_for_gradient_collection,
@@ -17,9 +19,7 @@ from bergson.huggingface import (
 from bergson.utils import assert_type
 
 
-class TestGradientCollectorCallbackOrderTracking:
-    """Test the GradientCollectorCallback with order tracking functionality."""
-
+class TestGradientCollectorCallback:
     @pytest.fixture
     def temp_dir(self):
         """Create a temporary directory for test outputs."""
@@ -194,3 +194,60 @@ class TestGradientCollectorCallbackOrderTracking:
             assert record["_idx"] == callback.order[i]["_idx"]
             assert record["global_step"] == callback.order[i]["global_step"]
             assert record["epoch"] == callback.order[i]["epoch"]
+
+    def test_sft_trainer(self, temp_dir, model, dataset):
+        """Test that gradient and order files are created and
+        can be loaded after training with SFTTrainer."""
+        # Set up and train the model with SFT
+        sft_config = SFTConfig(
+            output_dir=str(temp_dir / "sft_output"),
+            num_train_epochs=1,
+            per_device_train_batch_size=2,
+            per_device_eval_batch_size=2,
+            gradient_accumulation_steps=1,
+            save_strategy="no",
+            logging_strategy="no",
+            remove_unused_columns=False,
+        )
+
+        callback = GradientCollectorCallback(
+            path=str(temp_dir / "gradients"),
+            track_order=True,
+            use_optimizer_state=False,
+        )
+
+        trainer = SFTTrainer(
+            model=model,
+            args=sft_config,
+            train_dataset=dataset,
+            eval_dataset=dataset,
+            callbacks=[callback],
+        )
+        trainer = prepare_for_gradient_collection(trainer)
+        trainer.train()
+
+        # Verify training order was tracked
+        assert callback.order is not None
+        assert len(callback.order) > 0
+
+        # Verify gradient files were created
+        gradient_dir = temp_dir / "gradients"
+        train_gradient_dir = gradient_dir / "train" / "epoch_0"
+
+        assert gradient_dir.exists()
+        assert train_gradient_dir.exists()
+        assert (train_gradient_dir / "gradients.bin").exists()
+        assert (train_gradient_dir / "info.json").exists()
+        assert (gradient_dir / "order.hf").exists()
+
+        # Test loading the gradient data directly
+        gradients = load_gradients(str(train_gradient_dir))
+        assert len(gradients) > 0
+
+        # Verify order data was saved and can be loaded
+        order_file = temp_dir / "gradients" / "order.hf"
+        assert order_file.exists()
+
+        saved_order = Dataset.load_from_disk(str(order_file))
+        assert len(saved_order) > 0
+        assert all(key in saved_order[0] for key in ["_idx", "global_step", "epoch"])
