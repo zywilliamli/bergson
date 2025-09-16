@@ -28,3 +28,41 @@ At the lowest level of abstraction, the `GradientCollector` context manager allo
 
 1. Using a `closure` argument, which enables you to make use of the per-example gradients immediately after they are computed, during the backward pass. If you're computing summary statistics or other per-example metrics, this is the most efficient way to do it.
 2. Without a `closure` argument, in which case the gradients are collected and returned as a dictionary mapping module names to batches of gradients. This is the simplest and most flexible approach but is a bit more memory-intensive.
+
+## Training Gradients
+
+Use the HuggingFace callback to collect gradients during training. Trainer and SFTTrainer are both supported. Gradients are saved in the order corresponding to their dataset items before training, and when the `track_order` flag is set the training steps associated with each training item are also saved.
+
+```python
+from bergson import GradientCollectorCallback, prepare_for_gradient_collection
+
+callback = GradientCollectorCallback(
+    path="runs/example",
+    track_order=True,
+    use_optimizer_state=False,
+)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    eval_dataset=dataset,
+    callbacks=[callback],
+)
+trainer = prepare_for_gradient_collection(trainer)
+trainer.train()
+```
+
+## GRPO
+
+Where a reward signal is available we compute gradients using a weighted advantage estimate based on Dr. GRPO:
+
+```bash
+bergson <output_path> --model <model_name> --dataset <dataset_name> --reward_column <reward_column_name>
+```
+
+# Development
+
+```bash
+pip install -e .[dev]
+pytest
+```
