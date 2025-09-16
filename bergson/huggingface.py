@@ -46,7 +46,7 @@ class GradientCollectorCallback(TrainerCallback):
             use_optimizer_state: Whether to use the optimizer state to
                 normalize the gradients. If `False`, no normalization is
                 applied.
-            save_order: Whether to record the shuffled order of training data.
+            track_order: Whether to record the shuffled order of training data.
         """
         super().__init__()
 
@@ -78,12 +78,6 @@ class GradientCollectorCallback(TrainerCallback):
             grad_buffer[layer_name][self.batch_indices, :] = g.numpy()
 
         self.mod_grads.clear()
-
-    def on_step_begin(self, args, state, control, **kwargs):
-        """Track the current step and epoch for training order recording."""
-        if self.order:
-            self._global_step = state.global_step
-            self._epoch = int(state.epoch or 0)
 
     def on_train_begin(
         self,
@@ -236,24 +230,28 @@ class GradientCollectorCallback(TrainerCallback):
     ):
         self.on_substep_end(args, state, control)
 
-        # We can skip all this if we're not using the optimizer state
-        if not self.use_optimizer_state:
-            return
-
         # Record training order if enabled
-        if self.order:
+        if self.order is not None:
             assert (
                 self.batch_indices is not None
             ), "Batch indices are not available for training order tracking"
 
+            epoch = int(state.epoch or 0)
+            global_step = state.global_step
+
             self.order.extend(
                 {
                     "_idx": int(idx),
-                    "global_step": getattr(self, "_current_step", 0),
-                    "epoch": getattr(self, "_current_epoch", 0),
+                    # global_step is 1-indexed.
+                    "global_step": global_step,
+                    "epoch": epoch,
                 }
                 for idx in self.batch_indices.tolist()
             )
+
+        # We can skip all this if we're not using the optimizer state
+        if not self.use_optimizer_state:
+            return
 
         # The optimizer doesn't actually know the names of the parameters
         model = getattr(model, "base_model", model)
@@ -314,7 +312,7 @@ class GradientCollectorCallback(TrainerCallback):
         self.collector.__exit__(None, None, None)
         self.fwd_handle.remove()
 
-        if self.order:
+        if self.order is not None:
             self._save_order()
 
     def _save_order(self):
