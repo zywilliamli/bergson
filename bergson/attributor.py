@@ -95,9 +95,7 @@ class Attributor:
             norm = torch.cat(list(q.values()), dim=1).norm(dim=1, keepdim=True)
 
             for name in q:
-                q[name] /= norm
-                # Zero gradients will be NaN after normalization
-                q[name] = q[name].nan_to_num(0)
+                q[name] /= norm + 1e-8
 
         if self.faiss_index:
             if modules:
