@@ -29,6 +29,7 @@ class GradientCollectorCallback(TrainerCallback):
     def __init__(
         self,
         path: str,
+        head_cfg: dict[str, tuple[int, int, int]],
         projection_dim: int = 16,
         dtype: DTypeLike = np.float16,
         accumulate_grads: bool = False,
@@ -47,6 +48,9 @@ class GradientCollectorCallback(TrainerCallback):
                 normalize the gradients. If `False`, no normalization is
                 applied.
             track_order: Whether to record the shuffled order of training data.
+            head_cfg: Information used to split matrix-valued parameters into
+            per-head matrices before down projection. Each value is a tuple of
+                (num_heads, head_size, head_axis).
         """
         super().__init__()
 
@@ -54,6 +58,7 @@ class GradientCollectorCallback(TrainerCallback):
         self.collector = None
         self.grad_sizes = {}
 
+        self.head_cfg = head_cfg
         self.accumulate_grads = accumulate_grads
         self.dtype = dtype
         self.path = path
@@ -110,6 +115,7 @@ class GradientCollectorCallback(TrainerCallback):
                 reshape_to_square=reshape_to_square,
             ),
             target_modules=target_modules,
+            head_cfg=self.head_cfg,
         )
         self.grad_sizes = {
             name: math.prod(s) for name, s in self.collector.shapes().items()
@@ -202,10 +208,19 @@ class GradientCollectorCallback(TrainerCallback):
         hi = torch.finfo(self.torch_dtype).max
         g = g.flatten(1).clamp_(lo, hi)
 
-        # Asynchronously move the gradient to CPU and convert to fp16
-        self.mod_grads[name] = g.to(
-            device="cpu", dtype=self.torch_dtype, non_blocking=True
-        )
+        if name not in self.head_cfg:
+            # Asynchronously move the gradient to CPU and convert to fp16
+            self.mod_grads[name] = g.to(
+                device="cpu", dtype=self.torch_dtype, non_blocking=True
+            )
+        else:
+            num_heads, head_size, head_axis = self.head_cfg[name]
+            g = g.reshape(num_heads, -1, head_size)
+
+            for h in range(num_heads):
+                self.mod_grads[f"{name}.head_{h}"] = g[h].to(
+                    device="cpu", dtype=self.torch_dtype, non_blocking=True
+                )
 
     def on_substep_end(
         self,

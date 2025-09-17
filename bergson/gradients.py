@@ -208,7 +208,7 @@ class GradientProcessor:
 
     def __post_init__(self):
         self._projection_matrices: dict[
-            tuple[str, Literal["left", "right"]], Tensor
+            tuple[str, Literal["left", "right"], torch.device], Tensor
         ] = {}
 
     @classmethod
@@ -318,6 +318,13 @@ class GradientCollector(ContextDecorator):
     will be collected.
     """
 
+    head_cfg: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+    """
+    Dictionary of head configurations for each matrix-valued parameter to be split
+    into head matrices in the model. Each value is a tuple of
+    (num_heads, head_size, head_axis).
+    """
+
     def __post_init__(self):
         self._fwd_hooks: list[RemovableHandle] = []
         self._bwd_hooks: list[RemovableHandle] = []
@@ -335,10 +342,26 @@ class GradientCollector(ContextDecorator):
             # Users of this class really like to know ahead of time what the shapes are
             self.target_info[name] = layer.weight.device, layer.weight.shape
 
+    def _get_head_name(self, name: str, head_idx: int) -> str:
+        """Return the name of the head for parameter `name` with index `head_idx`."""
+        if name in self.head_cfg:
+            return f"{name}.head_{head_idx}"
+        return name
+
     def shapes(self) -> Mapping[str, torch.Size]:
         """Return the shapes of the gradients collected by this collector."""
         if (p_dim := self.processor.projection_dim) is not None:
-            return {name: torch.Size((p_dim, p_dim)) for name in self.target_info}
+            shapes = {}
+            for name in self.target_info:
+                if name in self.head_cfg:
+                    num_heads, head_size, head_axis = self.head_cfg[name]
+                    for h in range(num_heads):
+                        shapes[self._get_head_name(name, h)] = torch.Size(
+                            (p_dim, p_dim)
+                        )
+                else:
+                    shapes[name] = torch.Size((p_dim, p_dim))
+            return shapes
 
         # If we don't have a projection dimension, we can just use the original shapes.
         return {name: shape for name, (_, shape) in self.target_info.items()}
@@ -349,15 +372,16 @@ class GradientCollector(ContextDecorator):
         m: int,
         n: int,
         side: Literal["left", "right"],
+        device: torch.device,
         dtype: torch.dtype,
     ) -> Tensor:
         """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
-        key = (name, side)
+        key = (name, side, device)
         if key in self.processor._projection_matrices:
             return self.processor._projection_matrices[key]
 
         identifier = f"{name}/{side}"
-        device, _ = self.target_info[name]
+
         A = create_projection_matrix(
             identifier, m, n, dtype, device, self.processor.projection_type
         )
@@ -396,12 +420,31 @@ class GradientCollector(ContextDecorator):
 
             x = x * b.type_as(x)  # [N, S, I] * [I] → [N, S, I]
 
+        if name in self.head_cfg:
+            num_heads, head_size, head_axis = self.head_cfg[name]
+            p = self.processor.projection_dim
+
+            # Uncommon case: heads tile input dim
+            if head_axis == "I":
+                inputs = []
+                for h in range(num_heads):
+                    xi = x[..., h * head_size : (h + 1) * head_size]
+                    if p is not None and not isinstance(norm, AdamNormalizer):
+                        B = self.projection(
+                            f"{name}.head_{h}", p, head_size, "right", x.device, x.dtype
+                        )
+                        # Ensure B is on the same device as xi
+                        xi = xi.to(B.device) @ B.T
+                    inputs.append(xi)
+                module._inputs = inputs
+                return
+
         # If we're not using AdamNormalizer, we can randomly project the input here
         # to save memory, rather than waiting until the backward pass.
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
             i = module.in_features
-            x = x @ self.projection(name, p, i, "right", x.dtype).T
+            x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T
 
         module._inputs = x
 
@@ -413,6 +456,49 @@ class GradientCollector(ContextDecorator):
         I = module._inputs  # [N, S, I/q]
 
         name = assert_type(str, module._name)
+
+        if name in self.head_cfg:
+            # Recursive call
+            num_heads, head_size, head_axis = self.head_cfg[name]
+
+            for h in range(num_heads):
+                head_name = self._get_head_name(name, h)
+
+                # Heads tile output dim
+                if head_axis == "O":
+                    G_head = G[..., h * head_size : (h + 1) * head_size]
+                    I_head = I
+                # Heads tile input dim
+                else:
+                    G_head = G
+                    I_head = (
+                        I[h]
+                        if isinstance(I, list)
+                        else I[..., h * head_size : (h + 1) * head_size]
+                    )
+
+                # Backtrack with state restoration
+
+                old_name, old_inputs, old_out_features = (
+                    module._name,
+                    module._inputs,
+                    module.out_features,
+                )
+                module._name, module._inputs, module.out_features = (
+                    head_name,
+                    I_head,
+                    head_size,
+                )
+
+                self._process_grad(module, None, (G_head,))
+
+                module._name, module._inputs, module.out_features = (
+                    old_name,
+                    old_inputs,
+                    old_out_features,
+                )
+            return
+
         p = self.processor.projection_dim
         o, i = module.out_features, module.in_features
 
@@ -438,14 +524,14 @@ class GradientCollector(ContextDecorator):
 
             # Project the gradients to the lower-dimensional space
             if p is not None:
-                A = self.projection(name, p, o, "left", G.dtype)
-                B = self.projection(name, p, i, "right", G.dtype)
+                A = self.projection(name, p, o, "left", P.device, G.dtype)
+                B = self.projection(name, p, i, "right", P.device, G.dtype)
                 P = A @ P @ B.T  # [N, p, q]
 
         # Both Adafactor and no normalizer, we can project G first
         else:
             if p is not None:
-                A = self.projection(name, p, o, "left", G.dtype)
+                A = self.projection(name, p, o, "left", G.device, G.dtype)
                 G = G @ A.T  # [N, S, p]
 
             P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
