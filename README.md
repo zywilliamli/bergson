@@ -54,13 +54,15 @@ trainer.train()
 
 ## Attention Head Gradients
 
-By default Bergson collects gradients for named parameter matrices. To instead collect gradients for individual attention heads within a named matrix, include a `head_cfgs` dictionary specifying how to partition modules into heads.
+By default Bergson collects gradients for named parameter matrices. To instead collect gradients for individual attention heads within a named matrix, include a `head_cfgs` dictionary in the training calllback or static index config specifying how to partition modules into heads.
 
 ```python
-from bergson import HeadConfig, GradientCollectorCallback
+from bergson import HeadConfig, IndexConfig, DataConfig
 
-callback = GradientCollectorCallback(
-    path="runs/example",
+config = IndexConfig(
+    run_path="runs/example_with_heads",
+    model="HuggingFaceTB/SmolLM2-135M",
+    data=DataConfig(dataset="EleutherAI/SmolLM2-135M-10B"),
     head_cfgs={
         "h.0.attn.c_attn": HeadConfig(num_heads=12, head_size=192, head_dim=2),
         "h.1.attn.c_proj": HeadConfig(num_heads=12, head_size=64, head_dim=2),

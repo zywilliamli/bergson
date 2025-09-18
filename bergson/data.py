@@ -21,6 +21,7 @@ from numpy.lib.recfunctions import structured_to_unstructured
 from numpy.typing import DTypeLike
 from simple_parsing import field
 
+from .gradients import HeadConfig
 from .utils import assert_type
 
 
@@ -107,6 +108,9 @@ class IndexConfig:
 
     revision: str | None = None
     """Revision of the model."""
+
+    head_cfgs: dict[str, HeadConfig] = field(default_factory=dict)
+    """Configuration for each attention module to be split into head matrices."""
 
 
 def ceildiv(a: int, b: int) -> int:

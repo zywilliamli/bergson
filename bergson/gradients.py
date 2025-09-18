@@ -359,15 +359,23 @@ class GradientCollector(ContextDecorator):
 
         shapes = {}
         for name, (_, target_shape) in self.target_info.items():
-            shape = proj_shape or target_shape
-
             if name in self.head_cfgs:
-                num_heads, _, _ = self.head_cfgs[name]
+                if not proj_shape:
+                    num_heads, head_size, head_dim = self.head_cfgs[name]
+
+                    head_shape = list(target_shape)
+                    # Exclude batch and sequence dimensions since we're working
+                    # with the weight shape
+                    head_shape[head_dim - 2] = head_size
+                    shape = torch.Size(head_shape)
+                else:
+                    shape = proj_shape
+
                 shapes.update(
                     {self.get_head_name(name, h): shape for h in range(num_heads)}
                 )
             else:
-                shapes[name] = shape
+                shapes[name] = proj_shape or target_shape
 
         return shapes
 
@@ -462,7 +470,16 @@ class GradientCollector(ContextDecorator):
                 module._name = self.get_head_name(name, h)
                 module._inputs = module_inputs
 
-                head_G = torch.narrow(G, head_dim, h * head_size, head_size)
+                try:
+                    head_G = torch.narrow(G, head_dim, h * head_size, head_size)
+                except Exception as e:
+                    print(
+                        f"Error processing gradient of shape {G.shape} for head {h}"
+                        f"in module {name}. Provided head config may be incorrect. "
+                        f"Head config: head dim {head_dim}, head size {head_size},"
+                        f" num heads {num_heads}."
+                    )
+                    raise e
 
                 self._process_grad(module, None, (head_G,))
             module._name, module._inputs, module.out_features = (

@@ -10,10 +10,7 @@ from tqdm.auto import tqdm
 from transformers import PreTrainedModel
 
 from .data import create_index, pad_and_tensor
-from .gradients import (
-    GradientCollector,
-    GradientProcessor,
-)
+from .gradients import GradientCollector, GradientProcessor, HeadConfig
 from .peft import set_peft_enabled
 
 
@@ -28,7 +25,7 @@ def collect_gradients(
     loss_reduction: Literal["mean", "sum"] = "mean",
     skip_preconditioners: bool = False,
     target_modules: set[str] | None = None,
-    head_cfg: dict[str, tuple[int, int, int]] = {},
+    head_cfgs: dict[str, HeadConfig] = {},
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -69,7 +66,7 @@ def collect_gradients(
         callback,
         processor,
         target_modules=target_modules,
-        head_cfg=head_cfg,
+        head_cfgs=head_cfgs,
     )
 
     # Allocate space ahead of time for the gradients
@@ -135,8 +132,8 @@ def collect_gradients(
 
         # It turns out that it's very important for efficiency to write the gradients
         # sequentially instead of first concatenating them, then writing to one vector
-        for layer_name in mod_grads.keys():
-            grad_buffer[layer_name][indices] = mod_grads[layer_name].numpy()
+        for module_name in mod_grads.keys():
+            grad_buffer[module_name][indices] = mod_grads[module_name].numpy()
 
         mod_grads.clear()
         per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
