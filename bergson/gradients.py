@@ -360,9 +360,9 @@ class GradientCollector(ContextDecorator):
         shapes = {}
         for name, (_, target_shape) in self.target_info.items():
             if name in self.head_cfgs:
-                if not proj_shape:
-                    num_heads, head_size, head_dim = self.head_cfgs[name]
+                num_heads, head_size, head_dim = self.head_cfgs[name]
 
+                if not proj_shape:
                     head_shape = list(target_shape)
                     # Exclude batch and sequence dimensions since we're working
                     # with the weight shape

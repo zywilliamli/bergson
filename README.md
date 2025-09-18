@@ -31,7 +31,7 @@ At the lowest level of abstraction, the `GradientCollector` context manager allo
 
 ## Training Gradients
 
-Use the HuggingFace callback to collect gradients during training. Trainer and SFTTrainer are both supported. Gradients are saved in the order corresponding to their dataset items before training, and when the `track_order` flag is set the training steps associated with each training item are also saved.
+Gradient collection during trainig is supported for HuggingFace's Trainer and SFTTrainer. Training gradients are saved in the original order corresponding to their dataset items, and when the `track_order` flag is set the training steps associated with each training item are separately saved.
 
 ```python
 from bergson import GradientCollectorCallback, prepare_for_gradient_collection
@@ -54,19 +54,24 @@ trainer.train()
 
 ## Attention Head Gradients
 
-By default Bergson collects gradients for named parameter matrices. To instead collect gradients for individual attention heads within a named matrix, include a `head_cfgs` dictionary in the training calllback or static index config specifying how to partition modules into heads.
+By default Bergson collects gradients for named parameter matrices, but gradients for individual attention heads within a named matrix can be collected to. To collect head gradients add a `head_cfgs` dictionary to the training calllback or static index config.
 
 ```python
 from bergson import HeadConfig, IndexConfig, DataConfig
+from transformers import AutoModelForCausalLM
 
-config = IndexConfig(
-    run_path="runs/example_with_heads",
-    model="HuggingFaceTB/SmolLM2-135M",
-    data=DataConfig(dataset="EleutherAI/SmolLM2-135M-10B"),
+model = AutoModelForCausalLM.from_pretrained("RonenEldan/TinyStories-1M", trust_remote_code=True, use_safetensors=True)
+
+...
+
+collect_gradients(
+    model=model,
+    data=data,
+    processor=processor,
+    path="runs/example_with_heads",
     head_cfgs={
-        "h.0.attn.c_attn": HeadConfig(num_heads=12, head_size=192, head_dim=2),
-        "h.1.attn.c_proj": HeadConfig(num_heads=12, head_size=64, head_dim=2),
-    }
+        "h.0.attn.attention.out_proj": HeadConfig(num_heads=16, head_size=4, head_dim=2),
+    },
 )
 ```
 
