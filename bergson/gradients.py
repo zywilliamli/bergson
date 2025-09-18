@@ -322,7 +322,8 @@ class GradientCollector(ContextDecorator):
     """
     Dictionary of head configurations for each matrix-valued parameter to be split
     into head matrices in the model. Each value is a tuple of
-    (num_heads, head_size, head_axis).
+    (num_heads, head_size, head_axis) where head_axis is the dimension index
+    along which heads are tiled. Use -1 for the last dimension.
     """
 
     def __post_init__(self):
@@ -342,29 +343,27 @@ class GradientCollector(ContextDecorator):
             # Users of this class really like to know ahead of time what the shapes are
             self.target_info[name] = layer.weight.device, layer.weight.shape
 
-    def _get_head_name(self, name: str, head_idx: int) -> str:
-        """Return the name of the head for parameter `name` with index `head_idx`."""
-        if name in self.head_cfg:
-            return f"{name}.head_{head_idx}"
-        return name
-
     def shapes(self) -> Mapping[str, torch.Size]:
         """Return the shapes of the gradients collected by this collector."""
-        if (p_dim := self.processor.projection_dim) is not None:
-            shapes = {}
-            for name in self.target_info:
-                if name in self.head_cfg:
-                    num_heads, head_size, head_axis = self.head_cfg[name]
-                    for h in range(num_heads):
-                        shapes[self._get_head_name(name, h)] = torch.Size(
-                            (p_dim, p_dim)
-                        )
-                else:
-                    shapes[name] = torch.Size((p_dim, p_dim))
-            return shapes
+        proj_shape = (
+            torch.Size((p_dim, p_dim))
+            if (p_dim := self.processor.projection_dim) is not None
+            else None
+        )
 
-        # If we don't have a projection dimension, we can just use the original shapes.
-        return {name: shape for name, (_, shape) in self.target_info.items()}
+        shapes = {}
+        for name, (_, target_shape) in self.target_info.items():
+            shape = proj_shape or target_shape
+
+            if name in self.head_cfg:
+                num_heads, _, _ = self.head_cfg[name]
+                shapes.update(
+                    {self.get_head_name(name, h): shape for h in range(num_heads)}
+                )
+            else:
+                shapes[name] = shape
+
+        return shapes
 
     def projection(
         self,
@@ -387,6 +386,11 @@ class GradientCollector(ContextDecorator):
         )
         self.processor._projection_matrices[key] = A
         return A
+
+    def get_head_name(self, name: str, head_idx: int) -> str:
+        """Get the name of an attention head with index `head_idx` in a
+        module with name `name`."""
+        return f"{name}.head_{head_idx}"
 
     def __enter__(self):
         # Install a hook on every Linear
@@ -420,25 +424,6 @@ class GradientCollector(ContextDecorator):
 
             x = x * b.type_as(x)  # [N, S, I] * [I] → [N, S, I]
 
-        if name in self.head_cfg:
-            num_heads, head_size, head_axis = self.head_cfg[name]
-            p = self.processor.projection_dim
-
-            # Uncommon case: heads tile input dim
-            if head_axis == "I":
-                inputs = []
-                for h in range(num_heads):
-                    xi = x[..., h * head_size : (h + 1) * head_size]
-                    if p is not None and not isinstance(norm, AdamNormalizer):
-                        B = self.projection(
-                            f"{name}.head_{h}", p, head_size, "right", x.device, x.dtype
-                        )
-                        # Ensure B is on the same device as xi
-                        xi = xi.to(B.device) @ B.T
-                    inputs.append(xi)
-                module._inputs = inputs
-                return
-
         # If we're not using AdamNormalizer, we can randomly project the input here
         # to save memory, rather than waiting until the backward pass.
         p = self.processor.projection_dim
@@ -458,45 +443,28 @@ class GradientCollector(ContextDecorator):
         name = assert_type(str, module._name)
 
         if name in self.head_cfg:
-            # Recursive call
             num_heads, head_size, head_axis = self.head_cfg[name]
 
+            # Recurse into heads with module mutation and restoration
+            module_name, module_inputs, module_out_features = (
+                module._name,
+                module._inputs,
+                module.out_features,
+            )
+            module.out_features = head_size
             for h in range(num_heads):
-                head_name = self._get_head_name(name, h)
+                module._name = self.get_head_name(name, h)
+                module._inputs = module_inputs
 
-                # Heads tile output dim
-                if head_axis == "O":
-                    G_head = G[..., h * head_size : (h + 1) * head_size]
-                    I_head = I
-                # Heads tile input dim
-                else:
-                    G_head = G
-                    I_head = (
-                        I[h]
-                        if isinstance(I, list)
-                        else I[..., h * head_size : (h + 1) * head_size]
-                    )
+                head_G = torch.narrow(G, head_axis, h * head_size, head_size)
 
-                # Backtrack with state restoration
+                self._process_grad(module, None, (head_G,))
+            module._name, module._inputs, module.out_features = (
+                module_name,
+                module_inputs,
+                module_out_features,
+            )
 
-                old_name, old_inputs, old_out_features = (
-                    module._name,
-                    module._inputs,
-                    module.out_features,
-                )
-                module._name, module._inputs, module.out_features = (
-                    head_name,
-                    I_head,
-                    head_size,
-                )
-
-                self._process_grad(module, None, (G_head,))
-
-                module._name, module._inputs, module.out_features = (
-                    old_name,
-                    old_inputs,
-                    old_out_features,
-                )
             return
 
         p = self.processor.projection_dim

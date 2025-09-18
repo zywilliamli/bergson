@@ -28,6 +28,7 @@ def collect_gradients(
     loss_reduction: Literal["mean", "sum"] = "mean",
     skip_preconditioners: bool = False,
     target_modules: set[str] | None = None,
+    head_cfg: dict[str, tuple[int, int, int]] = {},
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -68,6 +69,7 @@ def collect_gradients(
         callback,
         processor,
         target_modules=target_modules,
+        head_cfg=head_cfg,
     )
 
     # Allocate space ahead of time for the gradients

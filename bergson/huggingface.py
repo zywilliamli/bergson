@@ -48,9 +48,10 @@ class GradientCollectorCallback(TrainerCallback):
                 normalize the gradients. If `False`, no normalization is
                 applied.
             track_order: Whether to record the shuffled order of training data.
-            head_cfg: Information used to split matrix-valued parameters into
+        head_cfg: Information used to split matrix-valued parameters into
             per-head matrices before down projection. Each value is a tuple of
-                (num_heads, head_size, head_axis).
+            (num_heads, head_size, head_axis) where head_axis is the dimension
+            index along which heads are tiled. Use -1 for the last dimension.
         """
         super().__init__()
 
@@ -208,19 +209,10 @@ class GradientCollectorCallback(TrainerCallback):
         hi = torch.finfo(self.torch_dtype).max
         g = g.flatten(1).clamp_(lo, hi)
 
-        if name not in self.head_cfg:
-            # Asynchronously move the gradient to CPU and convert to fp16
-            self.mod_grads[name] = g.to(
-                device="cpu", dtype=self.torch_dtype, non_blocking=True
-            )
-        else:
-            num_heads, head_size, head_axis = self.head_cfg[name]
-            g = g.reshape(num_heads, -1, head_size)
-
-            for h in range(num_heads):
-                self.mod_grads[f"{name}.head_{h}"] = g[h].to(
-                    device="cpu", dtype=self.torch_dtype, non_blocking=True
-                )
+        # Asynchronously move the gradient to CPU and convert to fp16
+        self.mod_grads[name] = g.to(
+            device="cpu", dtype=self.torch_dtype, non_blocking=True
+        )
 
     def on_substep_end(
         self,
