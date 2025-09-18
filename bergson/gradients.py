@@ -3,7 +3,7 @@ import os
 from abc import ABC, abstractmethod
 from contextlib import ContextDecorator
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Literal, Mapping
+from typing import Callable, Literal, Mapping, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -289,6 +289,15 @@ class GradientProcessor:
         torch.save(self.preconditioners_eigen, precond_eigen_path)
 
 
+class HeadConfig(NamedTuple):
+    num_heads: int
+    """The number of heads."""
+    head_size: int
+    """The size of each head."""
+    head_dim: int
+    """The dimension along which heads are tiled."""
+
+
 @dataclass
 class GradientCollector(ContextDecorator):
     """
@@ -318,12 +327,9 @@ class GradientCollector(ContextDecorator):
     will be collected.
     """
 
-    head_cfg: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+    head_cfgs: dict[str, HeadConfig] = field(default_factory=dict)
     """
-    Dictionary of head configurations for each matrix-valued parameter to be split
-    into head matrices in the model. Each value is a tuple of
-    (num_heads, head_size, head_axis) where head_axis is the dimension index
-    along which heads are tiled. Use -1 for the last dimension.
+    Dictionary of head configurations for each module to be split into head matrices.
     """
 
     def __post_init__(self):
@@ -355,8 +361,8 @@ class GradientCollector(ContextDecorator):
         for name, (_, target_shape) in self.target_info.items():
             shape = proj_shape or target_shape
 
-            if name in self.head_cfg:
-                num_heads, _, _ = self.head_cfg[name]
+            if name in self.head_cfgs:
+                num_heads, _, _ = self.head_cfgs[name]
                 shapes.update(
                     {self.get_head_name(name, h): shape for h in range(num_heads)}
                 )
@@ -442,8 +448,8 @@ class GradientCollector(ContextDecorator):
 
         name = assert_type(str, module._name)
 
-        if name in self.head_cfg:
-            num_heads, head_size, head_axis = self.head_cfg[name]
+        if name in self.head_cfgs:
+            num_heads, head_size, head_dim = self.head_cfgs[name]
 
             # Recurse into heads with module mutation and restoration
             module_name, module_inputs, module_out_features = (
@@ -456,7 +462,7 @@ class GradientCollector(ContextDecorator):
                 module._name = self.get_head_name(name, h)
                 module._inputs = module_inputs
 
-                head_G = torch.narrow(G, head_axis, h * head_size, head_size)
+                head_G = torch.narrow(G, head_dim, h * head_size, head_size)
 
                 self._process_grad(module, None, (head_G,))
             module._name, module._inputs, module.out_features = (

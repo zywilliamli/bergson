@@ -16,7 +16,7 @@ from transformers.trainer import Trainer
 from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 
-from bergson import GradientCollector, GradientProcessor
+from bergson import GradientCollector, GradientProcessor, HeadConfig
 from bergson.data import create_index
 from bergson.gradients import AdafactorNormalizer, AdamNormalizer
 from bergson.peft import detect_peft_modules
@@ -29,7 +29,7 @@ class GradientCollectorCallback(TrainerCallback):
     def __init__(
         self,
         path: str,
-        head_cfg: dict[str, tuple[int, int, int]],
+        head_cfgs: dict[str, HeadConfig],
         projection_dim: int = 16,
         dtype: DTypeLike = np.float16,
         accumulate_grads: bool = False,
@@ -48,10 +48,8 @@ class GradientCollectorCallback(TrainerCallback):
                 normalize the gradients. If `False`, no normalization is
                 applied.
             track_order: Whether to record the shuffled order of training data.
-        head_cfg: Information used to split matrix-valued parameters into
-            per-head matrices before down projection. Each value is a tuple of
-            (num_heads, head_size, head_axis) where head_axis is the dimension
-            index along which heads are tiled. Use -1 for the last dimension.
+        head_cfgs: Information used to split matrix-valued parameters into
+            per-head matrices before down projection.
         """
         super().__init__()
 
@@ -59,7 +57,7 @@ class GradientCollectorCallback(TrainerCallback):
         self.collector = None
         self.grad_sizes = {}
 
-        self.head_cfg = head_cfg
+        self.head_cfgs = head_cfgs
         self.accumulate_grads = accumulate_grads
         self.dtype = dtype
         self.path = path
@@ -116,7 +114,7 @@ class GradientCollectorCallback(TrainerCallback):
                 reshape_to_square=reshape_to_square,
             ),
             target_modules=target_modules,
-            head_cfg=self.head_cfg,
+            head_cfgs=self.head_cfgs,
         )
         self.grad_sizes = {
             name: math.prod(s) for name, s in self.collector.shapes().items()

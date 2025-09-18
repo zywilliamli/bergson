@@ -52,6 +52,22 @@ trainer = prepare_for_gradient_collection(trainer)
 trainer.train()
 ```
 
+## Attention Head Gradients
+
+By default Bergson collects gradients for named parameter matrices. To instead collect gradients for individual attention heads within a named matrix, include a `head_cfgs` dictionary specifying how to partition modules into heads.
+
+```python
+from bergson import HeadConfig, GradientCollectorCallback
+
+callback = GradientCollectorCallback(
+    path="runs/example",
+    head_cfgs={
+        "h.0.attn.c_attn": HeadConfig(num_heads=12, head_size=192, head_dim=2),
+        "h.1.attn.c_proj": HeadConfig(num_heads=12, head_size=64, head_dim=2),
+    }
+)
+```
+
 ## GRPO
 
 Where a reward signal is available we compute gradients using a weighted advantage estimate based on Dr. GRPO:
