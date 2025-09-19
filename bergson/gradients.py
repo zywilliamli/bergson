@@ -3,7 +3,7 @@ import os
 from abc import ABC, abstractmethod
 from contextlib import ContextDecorator
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Literal, Mapping
+from typing import Callable, Literal, Mapping, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -208,7 +208,7 @@ class GradientProcessor:
 
     def __post_init__(self):
         self._projection_matrices: dict[
-            tuple[str, Literal["left", "right"]], Tensor
+            tuple[str, Literal["left", "right"], torch.device], Tensor
         ] = {}
 
     @classmethod
@@ -289,6 +289,15 @@ class GradientProcessor:
         torch.save(self.preconditioners_eigen, precond_eigen_path)
 
 
+class HeadConfig(NamedTuple):
+    num_heads: int
+    """The number of heads."""
+    head_size: int
+    """The size of each head."""
+    head_dim: int
+    """The dimension along which heads are tiled."""
+
+
 @dataclass
 class GradientCollector(ContextDecorator):
     """
@@ -318,6 +327,11 @@ class GradientCollector(ContextDecorator):
     will be collected.
     """
 
+    head_cfgs: dict[str, HeadConfig] = field(default_factory=dict)
+    """
+    Dictionary of head configurations for each module to be split into head matrices.
+    """
+
     def __post_init__(self):
         self._fwd_hooks: list[RemovableHandle] = []
         self._bwd_hooks: list[RemovableHandle] = []
@@ -337,11 +351,33 @@ class GradientCollector(ContextDecorator):
 
     def shapes(self) -> Mapping[str, torch.Size]:
         """Return the shapes of the gradients collected by this collector."""
-        if (p_dim := self.processor.projection_dim) is not None:
-            return {name: torch.Size((p_dim, p_dim)) for name in self.target_info}
+        proj_shape = (
+            torch.Size((p_dim, p_dim))
+            if (p_dim := self.processor.projection_dim) is not None
+            else None
+        )
 
-        # If we don't have a projection dimension, we can just use the original shapes.
-        return {name: shape for name, (_, shape) in self.target_info.items()}
+        shapes = {}
+        for name, (_, target_shape) in self.target_info.items():
+            if name in self.head_cfgs:
+                num_heads, head_size, head_dim = self.head_cfgs[name]
+
+                if not proj_shape:
+                    head_shape = list(target_shape)
+                    # Exclude batch and sequence dimensions since we're working
+                    # with the weight shape
+                    head_shape[head_dim - 2] = head_size
+                    shape = torch.Size(head_shape)
+                else:
+                    shape = proj_shape
+
+                shapes.update(
+                    {self.get_head_name(name, h): shape for h in range(num_heads)}
+                )
+            else:
+                shapes[name] = proj_shape or target_shape
+
+        return shapes
 
     def projection(
         self,
@@ -349,20 +385,26 @@ class GradientCollector(ContextDecorator):
         m: int,
         n: int,
         side: Literal["left", "right"],
+        device: torch.device,
         dtype: torch.dtype,
     ) -> Tensor:
         """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
-        key = (name, side)
+        key = (name, side, device)
         if key in self.processor._projection_matrices:
             return self.processor._projection_matrices[key]
 
         identifier = f"{name}/{side}"
-        device, _ = self.target_info[name]
+
         A = create_projection_matrix(
             identifier, m, n, dtype, device, self.processor.projection_type
         )
         self.processor._projection_matrices[key] = A
         return A
+
+    def get_head_name(self, name: str, head_idx: int) -> str:
+        """Get the name of an attention head with index `head_idx` in a
+        module with name `name`."""
+        return f"{name}.head_{head_idx}"
 
     def __enter__(self):
         # Install a hook on every Linear
@@ -401,7 +443,7 @@ class GradientCollector(ContextDecorator):
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
             i = module.in_features
-            x = x @ self.projection(name, p, i, "right", x.dtype).T
+            x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T
 
         module._inputs = x
 
@@ -413,6 +455,41 @@ class GradientCollector(ContextDecorator):
         I = module._inputs  # [N, S, I/q]
 
         name = assert_type(str, module._name)
+
+        if name in self.head_cfgs:
+            num_heads, head_size, head_dim = self.head_cfgs[name]
+
+            # Recurse into heads with module mutation and restoration
+            module_name, module_inputs, module_out_features = (
+                module._name,
+                module._inputs,
+                module.out_features,
+            )
+            module.out_features = head_size
+            for h in range(num_heads):
+                module._name = self.get_head_name(name, h)
+                module._inputs = module_inputs
+
+                try:
+                    head_G = torch.narrow(G, head_dim, h * head_size, head_size)
+                except Exception as e:
+                    print(
+                        f"Error processing gradient of shape {G.shape} for head {h}"
+                        f"in module {name}. Provided head config may be incorrect. "
+                        f"Head config: head dim {head_dim}, head size {head_size},"
+                        f" num heads {num_heads}."
+                    )
+                    raise e
+
+                self._process_grad(module, None, (head_G,))
+            module._name, module._inputs, module.out_features = (
+                module_name,
+                module_inputs,
+                module_out_features,
+            )
+
+            return
+
         p = self.processor.projection_dim
         o, i = module.out_features, module.in_features
 
@@ -438,14 +515,14 @@ class GradientCollector(ContextDecorator):
 
             # Project the gradients to the lower-dimensional space
             if p is not None:
-                A = self.projection(name, p, o, "left", G.dtype)
-                B = self.projection(name, p, i, "right", G.dtype)
+                A = self.projection(name, p, o, "left", P.device, G.dtype)
+                B = self.projection(name, p, i, "right", P.device, G.dtype)
                 P = A @ P @ B.T  # [N, p, q]
 
         # Both Adafactor and no normalizer, we can project G first
         else:
             if p is not None:
-                A = self.projection(name, p, o, "left", G.dtype)
+                A = self.projection(name, p, o, "left", G.device, G.dtype)
                 G = G @ A.T  # [N, S, p]
 
             P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]

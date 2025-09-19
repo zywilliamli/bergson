@@ -152,6 +152,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             loss_reduction=cfg.loss_reduction,
             skip_preconditioners=cfg.skip_preconditioners,
             target_modules=target_modules,
+            head_cfgs=cfg.head_cfgs,
         )
     else:
         # Convert each shard to a Dataset then collect its gradients
@@ -173,6 +174,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
                 loss_reduction=cfg.loss_reduction,
                 skip_preconditioners=cfg.skip_preconditioners,
                 target_modules=target_modules,
+                head_cfgs=cfg.head_cfgs,
             )
             buf.clear()
             shard_id += 1

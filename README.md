@@ -28,3 +28,64 @@ At the lowest level of abstraction, the `GradientCollector` context manager allo
 
 1. Using a `closure` argument, which enables you to make use of the per-example gradients immediately after they are computed, during the backward pass. If you're computing summary statistics or other per-example metrics, this is the most efficient way to do it.
 2. Without a `closure` argument, in which case the gradients are collected and returned as a dictionary mapping module names to batches of gradients. This is the simplest and most flexible approach but is a bit more memory-intensive.
+
+## Training Gradients
+
+Gradient collection during trainig is supported for HuggingFace's Trainer and SFTTrainer. Training gradients are saved in the original order corresponding to their dataset items, and when the `track_order` flag is set the training steps associated with each training item are separately saved.
+
+```python
+from bergson import GradientCollectorCallback, prepare_for_gradient_collection
+
+callback = GradientCollectorCallback(
+    path="runs/example",
+    track_order=True,
+    use_optimizer_state=False,
+)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    eval_dataset=dataset,
+    callbacks=[callback],
+)
+trainer = prepare_for_gradient_collection(trainer)
+trainer.train()
+```
+
+## Attention Head Gradients
+
+By default Bergson collects gradients for named parameter matrices, but gradients for individual attention heads within a named matrix can be collected to. To collect head gradients add a `head_cfgs` dictionary to the training calllback or static index config.
+
+```python
+from bergson import HeadConfig, IndexConfig, DataConfig
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("RonenEldan/TinyStories-1M", trust_remote_code=True, use_safetensors=True)
+
+...
+
+collect_gradients(
+    model=model,
+    data=data,
+    processor=processor,
+    path="runs/example_with_heads",
+    head_cfgs={
+        "h.0.attn.attention.out_proj": HeadConfig(num_heads=16, head_size=4, head_dim=2),
+    },
+)
+```
+
+## GRPO
+
+Where a reward signal is available we compute gradients using a weighted advantage estimate based on Dr. GRPO:
+
+```bash
+bergson <output_path> --model <model_name> --dataset <dataset_name> --reward_column <reward_column_name>
+```
+
+# Development
+
+```bash
+pip install -e .[dev]
+pytest
+```
