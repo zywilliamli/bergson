@@ -31,7 +31,7 @@ At the lowest level of abstraction, the `GradientCollector` context manager allo
 
 ## Training Gradients
 
-Gradient collection during trainig is supported for HuggingFace's Trainer and SFTTrainer. Training gradients are saved in the original order corresponding to their dataset items, and when the `track_order` flag is set the training steps associated with each training item are separately saved.
+Gradient collection during training is supported via an integration with HuggingFace's Trainer and SFTTrainer classes. Training gradients are saved in the original order corresponding to their dataset items, and when the `track_order` flag is set the training steps associated with each training item are separately saved.
 
 ```python
 from bergson import GradientCollectorCallback, prepare_for_gradient_collection
