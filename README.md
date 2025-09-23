@@ -62,14 +62,13 @@ from transformers import AutoModelForCausalLM
 
 model = AutoModelForCausalLM.from_pretrained("RonenEldan/TinyStories-1M", trust_remote_code=True, use_safetensors=True)
 
-...
-
 collect_gradients(
     model=model,
     data=data,
     processor=processor,
     path="runs/example_with_heads",
     head_cfgs={
+        # Head configuration for the TinyStories-1M transformer
         "h.0.attn.attention.out_proj": HeadConfig(num_heads=16, head_size=4, head_dim=2),
     },
 )
@@ -81,6 +80,34 @@ Where a reward signal is available we compute gradients using a weighted advanta
 
 ```bash
 bergson <output_path> --model <model_name> --dataset <dataset_name> --reward_column <reward_column_name>
+```
+
+## Queries
+
+We provide a query Attributor which supports unit normalized gradients and KNN search out of the box.
+
+```
+from bergson import Attributor, FaissConfig
+
+attr = Attributor(args.index, device="cuda")
+
+...
+query_tokens = tokenizer(query, return_tensors="pt").to("cuda:0")["input_ids"]
+
+# Query the index
+with attr.trace(model.base_model, 5) as result:
+    model(query_tokens, labels=query_tokens).loss.backward()
+    model.zero_grad()
+```
+
+To efficiently query on-disk indexes, perform ANN searches, and explore many other scalability features add a FAISS config:
+
+```
+attr = Attributor(args.index, device="cuda", faiss_cfg=FaissConfig("IVF1,SQfp16", mmap_index=True))
+
+with attr.trace(model.base_model, 5) as result:
+    model(query_tokens, labels=query_tokens).loss.backward()
+    model.zero_grad()
 ```
 
 # Development
