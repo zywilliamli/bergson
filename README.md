@@ -3,6 +3,18 @@ This library enables you to trace the memory of deep neural nets with gradient-b
 
 We view attribution as a counterfactual question: **_If we "unlearned" this training sample, how would the model's behavior change?_** This formulation ties attribution to some notion of what it means to "unlearn" a training sample. Here we focus on a very simple notion of unlearning: taking a gradient _ascent_ step on the loss with respect to the training sample. To mimic the behavior of popular optimizers, we precondition the gradient using Adam or Adafactor-style estimates of the second moments of the gradient.
 
+# Announcements
+
+**September 2025**
+- Saving per-head gradients: https://github.com/EleutherAI/bergson/pull/40
+- Eigendecompositions of preconditioners: https://github.com/EleutherAI/bergson/pull/34
+- Dr. GRPO-based loss gradients: https://github.com/EleutherAI/bergson/pull/35
+- Choosing between summing and averaging losses across tokens: https://github.com/EleutherAI/bergson/pull/36
+- Saving the order training data is seen in while using the gradient collector callback for HF's Trainer/SFTTrainer: https://github.com/EleutherAI/bergson/pull/40
+  - Saving training gradients adds a ~17% wall clock overhead
+- Improved static index build ETA accuracy: https://github.com/EleutherAI/bergson/pull/41
+- Several small quality of life improvements for querying indexes: https://github.com/EleutherAI/bergson/pull/38
+
 # Installation
 
 We're not yet on PyPI, but you can `git clone` the repo and install it as a package using pip:
