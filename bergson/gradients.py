@@ -443,7 +443,7 @@ class GradientCollector(ContextDecorator):
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
             i = module.in_features
-            x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T
+            x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T  # type: ignore
 
         module._inputs = x
 
