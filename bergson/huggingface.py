@@ -100,7 +100,7 @@ class GradientCollectorCallback(TrainerCallback):
 
         if isinstance(model, PeftModel):
             reshape_to_square = True
-            target_modules = detect_peft_modules(model)
+            target_modules = detect_peft_modules(model)  # type: ignore
         else:
             reshape_to_square = False
             target_modules = None
@@ -349,7 +349,7 @@ def prepare_for_gradient_collection(trainer: Trainer):
     """Mutate the trainer and its datasets in-place to expose the datasets'
     indices to the gradient collector callback."""
     # Add indices to the training dataset
-    trainer.train_dataset = trainer.train_dataset.map(
+    trainer.train_dataset = trainer.train_dataset.map(  # type: ignore
         lambda ex, idx: {"_idx": idx}, with_indices=True
     )
 
@@ -357,16 +357,16 @@ def prepare_for_gradient_collection(trainer: Trainer):
     if trainer.eval_dataset is not None:
         if isinstance(trainer.eval_dataset, dict):
             for eval_name, dataset in trainer.eval_dataset.items():
-                trainer.eval_dataset[eval_name] = dataset.map(
+                trainer.eval_dataset[eval_name] = dataset.map(  # type: ignore
                     lambda ex, idx: {"_idx": idx}, with_indices=True
                 )
         else:
-            trainer.eval_dataset = trainer.eval_dataset.map(
+            trainer.eval_dataset = trainer.eval_dataset.map(  # type: ignore
                 lambda ex, idx: {"_idx": idx}, with_indices=True
             )
 
     trainer._set_signature_columns_if_needed()
-    trainer._signature_columns.append("_idx")
+    trainer._signature_columns.append("_idx")  # type: ignore
 
     if trainer.data_collator:
         original_collator = trainer.data_collator

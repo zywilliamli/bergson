@@ -22,8 +22,9 @@ version = "0.0.1"
 [project.optional-dependencies]
 dev = [
     "pre-commit",
-    "trl",
     "pytest",
+    "pyright",
+    "trl",
 ]
 example = [
     "trl",

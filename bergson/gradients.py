@@ -467,7 +467,7 @@ class GradientCollector(ContextDecorator):
             )
             module.out_features = head_size
             for h in range(num_heads):
-                module._name = self.get_head_name(name, h)
+                module._name = self.get_head_name(name, h)  # type: ignore
                 module._inputs = module_inputs
 
                 try:
