@@ -1,3 +1,5 @@
+__version__ = "0.0.1"
+
 from .attributor import Attributor
 from .collection import collect_gradients
 from .data import DataConfig, IndexConfig, load_gradients

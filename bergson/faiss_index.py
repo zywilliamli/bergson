@@ -4,13 +4,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import Protocol
+from types import ModuleType
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 import torch
 from numpy.lib.recfunctions import structured_to_unstructured
 from numpy.typing import NDArray
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    import faiss  # noqa: F401
 
 
 @dataclass
@@ -95,12 +99,19 @@ def gradients_loader(root_dir: str):
                 yield load_shard(str(shard_path))
 
 
-def index_to_device(index: Index, device: str) -> Index:
+def _require_faiss() -> ModuleType:
+    """Import faiss at runtime and raise an error if missing."""
+
     try:
-        import faiss
-    except ImportError:
-        raise ImportError("Faiss not found, run `pip install faiss-gpu-cu12`...")
-    import faiss
+        import faiss as faiss_module  # type: ignore[import]
+    except ImportError as e:
+        raise ImportError("Faiss not found, run `pip install faiss-gpu-cu12`") from e
+
+    return faiss_module
+
+
+def index_to_device(index: Index, device: str) -> Index:
+    faiss = _require_faiss()
 
     if device != "cpu":
         gpus = (
@@ -129,11 +140,7 @@ class FaissIndex:
     shards: list[Index]
 
     def __init__(self, path: str, faiss_cfg: FaissConfig, device: str, unit_norm: bool):
-        try:
-            import faiss
-        except ImportError:
-            raise ImportError("Faiss not found, run `pip install faiss-gpu-cu12`")
-        import faiss
+        faiss = _require_faiss()
 
         self.faiss_cfg = faiss_cfg
 
@@ -208,7 +215,7 @@ class FaissIndex:
                 faiss.write_index(index, str(faiss_path / f"{index_idx}.faiss"))
 
             print(f"Built index in {(time() - start) / 60:.2f} minutes.")
-            del buffer, index
+            del buffer
 
         shards = []
         for i in range(faiss_cfg.num_shards):

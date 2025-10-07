@@ -195,8 +195,6 @@ def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
 
 def estimate_advantage(ds: Dataset, cfg: IndexConfig):
     """Group rollouts by prompt and estimate advantages."""
-    assert isinstance(ds, Dataset), "Dataset required for advantage estimation"
-
     df = ds.select_columns([cfg.data.prompt_column, cfg.data.reward_column]).to_pandas()
     df = assert_type(pd.DataFrame, df)
 
@@ -224,6 +222,7 @@ def build_gradient_dataset(cfg: IndexConfig):
         remove_columns=remove_columns,
     )
     if cfg.data.reward_column:
+        assert isinstance(ds, Dataset), "Dataset required for advantage estimation"
         ds = ds.add_column(
             "advantage",
             estimate_advantage(ds, cfg),
