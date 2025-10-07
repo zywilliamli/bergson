@@ -128,3 +128,5 @@ with attr.trace(model.base_model, 5) as result:
 pip install -e .[dev]
 pytest
 ```
+
+We use [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/) for releases.
