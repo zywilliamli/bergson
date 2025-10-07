@@ -1,5 +1,21 @@
 import os
 
+import pytest
+
+try:
+    import torch
+
+    HAS_CUDA = torch.cuda.is_available()
+except Exception:
+    HAS_CUDA = False
+
+if not HAS_CUDA:
+    pytest.skip(
+        "Skipping GPU-only tests: no CUDA/NVIDIA driver available.",
+        allow_module_level=True,
+    )
+
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["WANDB_MODE"] = "disabled"
 
