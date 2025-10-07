@@ -128,9 +128,7 @@ class TestGradientCollectorCallback:
         )
 
         callback = GradientCollectorCallback(
-            path=str(temp_dir / "gradients"),
-            track_order=False,
-            use_optimizer_state=False,
+            path=str(temp_dir / "gradients"), use_optimizer_state=False
         )
 
         trainer = Trainer(

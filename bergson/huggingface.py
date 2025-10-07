@@ -29,7 +29,7 @@ class GradientCollectorCallback(TrainerCallback):
     def __init__(
         self,
         path: str,
-        head_cfgs: dict[str, HeadConfig],
+        head_cfgs: dict[str, HeadConfig] = {},
         projection_dim: int = 16,
         dtype: DTypeLike = np.float16,
         accumulate_grads: bool = False,

@@ -23,6 +23,7 @@ version = "0.0.1"
 dev = [
     "pre-commit",
     "trl",
+    "pytest",
 ]
 example = [
     "trl",
