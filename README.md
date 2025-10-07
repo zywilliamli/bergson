@@ -17,12 +17,8 @@ We view attribution as a counterfactual question: **_If we "unlearned" this trai
 
 # Installation
 
-We're not yet on PyPI, but you can `git clone` the repo and install it as a package using pip:
-
 ```bash
-git clone https://github.com/EleutherAI/bergson.git
-cd bergson
-pip install .
+pip install bergson
 ```
 
 # Usage
