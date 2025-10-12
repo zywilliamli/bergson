@@ -25,12 +25,19 @@ def collect_gradients(
     loss_reduction: Literal["mean", "sum"] = "mean",
     skip_preconditioners: bool = False,
     target_modules: set[str] | None = None,
-    head_cfgs: dict[str, HeadConfig] = {},
+    head_cfgs: dict[str, HeadConfig] | None = None,
+    preconditioners: dict[str, torch.Tensor] | None = None,
 ):
     """
     Compute projected gradients using a subset of the dataset.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if head_cfgs is None:
+        head_cfgs = {}
+
+    if preconditioners is None:
+        preconditioners = {}
 
     # Batch size of one by default
     if batches is None:
@@ -38,7 +45,6 @@ def collect_gradients(
 
     # Mutable state for the GradientCollector callback
     mod_grads = {}
-    preconditioners = {}
 
     # TODO: Handle this more elegantly
     dtype = torch.float32 if model.dtype == torch.float32 else torch.float16

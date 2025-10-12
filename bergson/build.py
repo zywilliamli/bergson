@@ -20,7 +20,7 @@ from transformers import (
 )
 
 from .collection import collect_gradients
-from .data import IndexConfig, allocate_batches, load_data_string, tokenize
+from .data import DataConfig, IndexConfig, allocate_batches, load_data_string, tokenize
 from .gradients import GradientProcessor
 from .peft import detect_peft_modules
 from .utils import assert_type, get_layer_list
@@ -155,11 +155,11 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             head_cfgs=cfg.head_cfgs,
         )
     else:
-        # Convert each shard to a Dataset then collect its gradients
-        buf, shard_id = [], 0
+        # Convert each shard to a Dataset then query its gradients
+        buf, shard_id, preconditioners = [], 0, {}
 
         def flush():
-            nonlocal buf, shard_id
+            nonlocal buf, shard_id, preconditioners
             if not buf:
                 return
             ds_shard = assert_type(Dataset, Dataset.from_list(buf))
@@ -175,6 +175,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
                 skip_preconditioners=cfg.skip_preconditioners,
                 target_modules=target_modules,
                 head_cfgs=cfg.head_cfgs,
+                preconditioners=preconditioners,
             )
             buf.clear()
             shard_id += 1
@@ -193,13 +194,13 @@ def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):
         dist.destroy_process_group()
 
 
-def estimate_advantage(ds: Dataset, cfg: IndexConfig):
+def estimate_advantage(ds: Dataset, cfg: DataConfig):
     """Group rollouts by prompt and estimate advantages."""
-    df = ds.select_columns([cfg.data.prompt_column, cfg.data.reward_column]).to_pandas()
+    df = ds.select_columns([cfg.prompt_column, cfg.reward_column]).to_pandas()
     df = assert_type(pd.DataFrame, df)
 
-    advantages = df[cfg.data.reward_column] - df.groupby(cfg.data.prompt_column)[
-        cfg.data.reward_column
+    advantages = df[cfg.reward_column] - df.groupby(cfg.prompt_column)[
+        cfg.reward_column
     ].transform("mean")
 
     return advantages.tolist()
@@ -225,7 +226,7 @@ def build_gradient_dataset(cfg: IndexConfig):
         assert isinstance(ds, Dataset), "Dataset required for advantage estimation"
         ds = ds.add_column(
             "advantage",
-            estimate_advantage(ds, cfg),
+            estimate_advantage(ds, cfg.data),
             new_fingerprint="advantage",  # type: ignore
         )
 
