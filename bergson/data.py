@@ -95,6 +95,12 @@ class IndexConfig:
     run_path: str = field(positional=True)
     """Name of the run. Used to create a directory for the index."""
 
+    save_index: bool = True
+    """Whether to write the gradients to disk."""
+
+    save_processor: bool = True
+    """Whether to write the gradient processor to disk."""
+
     data: DataConfig = field(default_factory=DataConfig)
     """Specification of the data on which to build the index."""
 

@@ -137,7 +137,7 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             reshape_to_square=cfg.reshape_to_square,
             projection_type=cfg.projection_type,
         )
-        if rank == 0:
+        if rank == 0 and cfg.save_processor:
             processor.save(cfg.run_path)
 
     if isinstance(ds, Dataset):
@@ -153,13 +153,15 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             skip_preconditioners=cfg.skip_preconditioners,
             target_modules=target_modules,
             head_cfgs=cfg.head_cfgs,
+            save_index=cfg.save_index,
+            save_processor=cfg.save_processor,
         )
     else:
-        # Convert each shard to a Dataset then query its gradients
-        buf, shard_id, preconditioners = [], 0, {}
+        # Convert each shard to a Dataset then map over its gradients
+        buf, shard_id = [], 0
 
         def flush():
-            nonlocal buf, shard_id, preconditioners
+            nonlocal buf, shard_id
             if not buf:
                 return
             ds_shard = assert_type(Dataset, Dataset.from_list(buf))
@@ -175,7 +177,9 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
                 skip_preconditioners=cfg.skip_preconditioners,
                 target_modules=target_modules,
                 head_cfgs=cfg.head_cfgs,
-                preconditioners=preconditioners,
+                save_index=cfg.save_index,
+                # Save a processor state checkpoint after each shard
+                save_processor=cfg.save_processor,
             )
             buf.clear()
             shard_id += 1
@@ -185,6 +189,9 @@ def worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset | IterableD
             if len(buf) == cfg.stream_shard_size:
                 flush()
         flush()
+
+        if cfg.save_processor:
+            processor.save(cfg.run_path)
 
 
 def dist_worker(rank: int, world_size: int, cfg: IndexConfig, ds: Dataset):

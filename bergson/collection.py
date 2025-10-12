@@ -26,7 +26,8 @@ def collect_gradients(
     skip_preconditioners: bool = False,
     target_modules: set[str] | None = None,
     head_cfgs: dict[str, HeadConfig] | None = None,
-    preconditioners: dict[str, torch.Tensor] | None = None,
+    save_index: bool = True,
+    save_processor: bool = True,
 ):
     """
     Compute projected gradients using a subset of the dataset.
@@ -36,15 +37,13 @@ def collect_gradients(
     if head_cfgs is None:
         head_cfgs = {}
 
-    if preconditioners is None:
-        preconditioners = {}
-
     # Batch size of one by default
     if batches is None:
         batches = [[idx] for idx in range(len(data))]
 
     # Mutable state for the GradientCollector callback
     mod_grads = {}
+    preconditioners = processor.preconditioners
 
     # TODO: Handle this more elegantly
     dtype = torch.float32 if model.dtype == torch.float32 else torch.float16
@@ -79,8 +78,10 @@ def collect_gradients(
     grad_sizes = {name: math.prod(s) for name, s in collector.shapes().items()}
 
     # Allocate structured space ahead of time for the gradients
-    grad_buffer = create_index(
-        path, num_grads=len(data), grad_sizes=grad_sizes, dtype=np_dtype
+    grad_buffer = (
+        create_index(path, num_grads=len(data), grad_sizes=grad_sizes, dtype=np_dtype)
+        if save_index
+        else None
     )
 
     per_doc_losses = torch.full(
@@ -131,15 +132,19 @@ def collect_gradients(
 
                 losses.mean().backward()
 
-        # Weirdly you need to explicitly synchronize here in order to make sure that
-        # the nonblocking copies actually finish before we call .numpy()
         model.zero_grad()
-        torch.cuda.synchronize()
 
-        # It turns out that it's very important for efficiency to write the gradients
-        # sequentially instead of first concatenating them, then writing to one vector
-        for module_name in mod_grads.keys():
-            grad_buffer[module_name][indices] = mod_grads[module_name].numpy()
+        if grad_buffer is not None:
+            # Weirdly you need to explicitly synchronize here in order to make
+            # sure that the nonblocking copies actually finish before we call
+            # .numpy()
+            torch.cuda.synchronize()
+
+            # It turns out that it's very important for efficiency to write the
+            # gradients sequentially instead of first concatenating them, then
+            # writing to one vector
+            for module_name in mod_grads.keys():
+                grad_buffer[module_name][indices] = mod_grads[module_name].numpy()
 
         mod_grads.clear()
         per_doc_losses[indices] = losses.detach().type_as(per_doc_losses)
@@ -158,10 +163,12 @@ def collect_gradients(
         )
         data.save_to_disk(path + "/data.hf")
 
-        processor.save(path)
+        if save_processor:
+            processor.save(path)
 
     # Make sure the gradients are written to disk
-    grad_buffer.flush()
+    if grad_buffer is not None:
+        grad_buffer.flush()
 
 
 def process_preconditioners(
