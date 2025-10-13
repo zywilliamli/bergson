@@ -175,7 +175,7 @@ class GradientProcessor:
     a normalizer, it will be skipped.
     """
 
-    preconditioners: Mapping[str, Tensor] = field(default_factory=dict)
+    preconditioners: dict[str, Tensor] = field(default_factory=dict)
     """
     Dictionary of preconditioners for each matrix-valued parameter in the model.
     These are applied after the normalization and random projection steps.

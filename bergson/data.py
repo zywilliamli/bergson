@@ -53,11 +53,53 @@ class DataConfig:
 
 
 @dataclass
+class QueryConfig:
+    """Config for querying an index on the fly."""
+
+    query_data: DataConfig = field(default_factory=DataConfig)
+    """Data to use for the query."""
+
+    query_method: Literal["mean", "nearest"] = "mean"
+    """Method to use for computing the query."""
+
+    apply_query_preconditioner: Literal["none", "existing", "precompute"] = "none"
+    """Whether to apply (or compute and apply) a preconditioner
+    computed over the query dataset."""
+
+    apply_index_preconditioner: Literal["none", "existing", "precompute"] = "none"
+    """Whether to apply (or compute and apply) a preconditioner
+    computed over the index dataset."""
+
+    query_preconditioner_path: str | None = None
+    """Path to a precomputed preconditioner. This does not affect
+    the ability to compute a new preconditioner during the scan.
+    The precomputed preconditioner is applied to the query dataset
+    gradients."""
+
+    index_preconditioner_path: str | None = None
+    """Path to a precomputed preconditioner. This does not affect
+    the ability to compute a new preconditioner during the scan.
+    The precomputed preconditioner is applied to the query dataset
+    gradients."""
+
+    mixing_coefficient: float = 0.5
+    """Coefficient to weight the application of the query preconditioner
+    and the pre-computed index preconditioner. 0.0 means only use the
+    query preconditioner and 1.0 means only use the index preconditioner."""
+
+
+@dataclass
 class IndexConfig:
     """Config for building the index and running the model/dataset pipeline."""
 
     run_path: str = field(positional=True)
     """Name of the run. Used to create a directory for the index."""
+
+    save_index: bool = True
+    """Whether to write the gradients to disk."""
+
+    save_processor: bool = True
+    """Whether to write the gradient processor to disk."""
 
     data: DataConfig = field(default_factory=DataConfig)
     """Specification of the data on which to build the index."""
