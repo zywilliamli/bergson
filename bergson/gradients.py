@@ -501,8 +501,6 @@ class GradientCollector(ContextDecorator):
             o, i = module.out_features, module.in_features
         elif isinstance(module, Conv1D):
             o, i = module.nf, module.nx
-        else:
-            raise ValueError(f"Unsupported module type: {type(module)}")
 
         # Pre-scale G by the Adafactor row statistics
         norm = self.processor.normalizers.get(name)
