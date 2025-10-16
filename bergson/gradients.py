@@ -477,7 +477,7 @@ class GradientCollector(ContextDecorator):
     def _process_grad(self, module: nn.Module, _, grad_out):
         """Process the incoming gradient wrt the output of the module."""
         # Sanity checks
-        assert isinstance(module, LayerAdapter.supported_modules), "Expected a supported module"
+        assert isinstance(module, LayerAdapter.supported_modules), f"Expected a module of type {LayerAdapter.supported_modules}, got {type(module)}"
         G = grad_out[0]  # [N, S, O]
         I = module._inputs  # [N, S, I/q]
 

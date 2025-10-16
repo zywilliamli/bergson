@@ -79,13 +79,8 @@ def test_phi3():
 
                 for name, collected_grad in collected_grads.items():
                     layer = model.get_submodule(name)
-
-                    if hasattr(layer, 'out_features') and hasattr(layer, 'in_features'):
-                        o, i = layer.out_features, layer.in_features
-                    elif hasattr(layer, 'nf') and hasattr(layer, 'nx'):
-                        o, i = layer.nf, layer.nx
-                    else:
-                        raise ValueError(f"Unsupported layer type: {type(layer)}")
+                    i = getattr(layer, LayerAdapter.in_attr(layer))
+                    o = getattr(layer, LayerAdapter.out_attr(layer))
                     g = layer.weight.grad
                     assert g is not None
 
