@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.hooks import RemovableHandle
-from transformers.pytorch_utils import Conv1D
+from transformers.pytorch_utils import Conv1D as HFConv1D
 
 from .math import reshape_to_nearest_square
 from .utils import assert_type, create_projection_matrix
@@ -298,6 +298,32 @@ class HeadConfig(NamedTuple):
     head_dim: int
     """The dimension along which heads are tiled."""
 
+class LayerAdapter():
+    supported_modules = (nn.Linear, HFConv1D, nn.Conv1d, nn.Conv2d, nn.Conv3d)
+
+    @staticmethod
+    def in_func(layer: nn.Module) -> str:
+        match layer:
+            case nn.Linear():
+                return 'in_features'
+            case HFConv1D():
+                return 'nx'
+            case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
+                return 'in_channels'
+            case _:
+                raise ValueError(f"Unsupported layer type: {type(layer)}")
+    
+    @staticmethod
+    def out_func(layer: nn.Module) -> str:
+        match layer:
+            case nn.Linear():
+                return 'out_features'
+            case HFConv1D():
+                return 'nf'
+            case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
+                return 'out_channels'
+            case _:
+                raise ValueError(f"Unsupported layer type: {type(layer)}")
 
 @dataclass
 class GradientCollector(ContextDecorator):
@@ -341,7 +367,7 @@ class GradientCollector(ContextDecorator):
 
         # Before we add any hooks, we need to peek at what modules we need to track.
         for name, layer in self.model.named_modules():
-            if not isinstance(layer, (nn.Linear, Conv1D)):
+            if not isinstance(layer, LayerAdapter.supported_modules):
                 continue
 
             if self.target_modules is not None and name not in self.target_modules:
@@ -443,12 +469,7 @@ class GradientCollector(ContextDecorator):
         # to save memory, rather than waiting until the backward pass.
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
-            if isinstance(module, nn.Linear):
-                i = module.in_features
-            elif isinstance(module, Conv1D):
-                i = module.nx
-            else:
-                raise ValueError(f"Unsupported module type: {type(module)}")
+            i = getattr(module, LayerAdapter.in_func(module))
             x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T  # type: ignore
 
         module._inputs = x
@@ -456,7 +477,7 @@ class GradientCollector(ContextDecorator):
     def _process_grad(self, module: nn.Module, _, grad_out):
         """Process the incoming gradient wrt the output of the module."""
         # Sanity checks
-        assert isinstance(module, (nn.Linear, Conv1D)), "Expected a Linear or Conv1D module"
+        assert isinstance(module, LayerAdapter.supported_modules), "Expected a supported module"
         G = grad_out[0]  # [N, S, O]
         I = module._inputs  # [N, S, I/q]
 
@@ -469,9 +490,9 @@ class GradientCollector(ContextDecorator):
             module_name, module_inputs, module_out_features = (
                 module._name,
                 module._inputs,
-                module.out_features,
+                getattr(module, LayerAdapter.out_func(module)),
             )
-            module.out_features = head_size
+            setattr(module, LayerAdapter.out_func(module), head_size)
             for h in range(num_heads):
                 module._name = self.get_head_name(name, h)  # type: ignore
                 module._inputs = module_inputs
@@ -488,19 +509,17 @@ class GradientCollector(ContextDecorator):
                     raise e
 
                 self._process_grad(module, None, (head_G,))
-            module._name, module._inputs, module.out_features = (
+            module._name, module._inputs = (
                 module_name,
-                module_inputs,
-                module_out_features,
+                module_inputs
             )
+            setattr(module, LayerAdapter.out_func(module), module_out_features)
 
             return
 
         p = self.processor.projection_dim
-        if isinstance(module, nn.Linear):
-            o, i = module.out_features, module.in_features
-        elif isinstance(module, Conv1D):
-            o, i = module.nf, module.nx
+        i = getattr(module, LayerAdapter.in_func(module))
+        o = getattr(module, LayerAdapter.out_func(module))
 
         # Pre-scale G by the Adafactor row statistics
         norm = self.processor.normalizers.get(name)
