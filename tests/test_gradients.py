@@ -44,8 +44,8 @@ def test_phi3():
         for name, collected_grad in collected_grads.items():
             layer = model.get_submodule(name)
 
-            i = getattr(layer, LayerAdapter.in_func(layer))
-            o = getattr(layer, LayerAdapter.out_func(layer))
+            i = getattr(layer, LayerAdapter.in_attr(layer))
+            o = getattr(layer, LayerAdapter.out_attr(layer))
             g = layer.weight.grad
             assert g is not None
 

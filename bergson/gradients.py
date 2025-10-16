@@ -302,22 +302,22 @@ class LayerAdapter():
     supported_modules = (nn.Linear, HFConv1D, nn.Conv1d, nn.Conv2d, nn.Conv3d)
 
     @staticmethod
-    def in_func(layer: nn.Module) -> str:
+    def in_attr(layer: nn.Module) -> str:
         match layer:
             case nn.Linear():
-                return 'in_features'
+                return "in_features"
             case HFConv1D():
                 return 'nx'
             case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
                 return 'in_channels'
             case _:
                 raise ValueError(f"Unsupported layer type: {type(layer)}")
-    
+
     @staticmethod
-    def out_func(layer: nn.Module) -> str:
+    def out_attr(layer: nn.Module) -> str:
         match layer:
             case nn.Linear():
-                return 'out_features'
+                return "out_features"
             case HFConv1D():
                 return 'nf'
             case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
@@ -469,7 +469,7 @@ class GradientCollector(ContextDecorator):
         # to save memory, rather than waiting until the backward pass.
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
-            i = getattr(module, LayerAdapter.in_func(module))
+            i = getattr(module, LayerAdapter.in_attr(module))
             x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T  # type: ignore
 
         module._inputs = x
@@ -490,9 +490,9 @@ class GradientCollector(ContextDecorator):
             module_name, module_inputs, module_out_features = (
                 module._name,
                 module._inputs,
-                getattr(module, LayerAdapter.out_func(module)),
+                getattr(module, LayerAdapter.out_attr(module)),
             )
-            setattr(module, LayerAdapter.out_func(module), head_size)
+            setattr(module, LayerAdapter.out_attr(module), head_size)
             for h in range(num_heads):
                 module._name = self.get_head_name(name, h)  # type: ignore
                 module._inputs = module_inputs
@@ -513,13 +513,13 @@ class GradientCollector(ContextDecorator):
                 module_name,
                 module_inputs
             )
-            setattr(module, LayerAdapter.out_func(module), module_out_features)
+            setattr(module, LayerAdapter.out_attr(module), module_out_features)
 
             return
 
         p = self.processor.projection_dim
-        i = getattr(module, LayerAdapter.in_func(module))
-        o = getattr(module, LayerAdapter.out_func(module))
+        i = getattr(module, LayerAdapter.in_attr(module))
+        o = getattr(module, LayerAdapter.out_attr(module))
 
         # Pre-scale G by the Adafactor row statistics
         norm = self.processor.normalizers.get(name)
