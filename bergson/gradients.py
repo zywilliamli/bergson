@@ -443,7 +443,6 @@ class GradientCollector(ContextDecorator):
         # to save memory, rather than waiting until the backward pass.
         p = self.processor.projection_dim
         if p is not None and not isinstance(norm, AdamNormalizer):
-            # Handle both Linear and Conv1D modules
             if isinstance(module, nn.Linear):
                 i = module.in_features
             elif isinstance(module, Conv1D):
@@ -498,7 +497,6 @@ class GradientCollector(ContextDecorator):
             return
 
         p = self.processor.projection_dim
-        # Handle both Linear and Conv1D modules
         if isinstance(module, nn.Linear):
             o, i = module.out_features, module.in_features
         elif isinstance(module, Conv1D):
