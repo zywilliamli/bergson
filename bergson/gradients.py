@@ -350,7 +350,7 @@ class GradientCollector(ContextDecorator):
     target_modules: set[str] | None = None
     """
     List of parameter names to collect gradients for. Should consist only of weight
-    matrices in `nn.Linear` or `Conv1D` modules. If `None`, the gradients for all weight matrices
+    matrices in modules supported by LayerAdapter. If `None`, the gradients for all weight matrices
     will be collected.
     """
 
