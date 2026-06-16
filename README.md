@@ -274,13 +274,14 @@ We use [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/) fo
 If you found Bergson useful in your research, please cite us:
 
 ```bibtex
-@software{bergson,
-  author       = {Lucia Quirke and Louis Jaburi and David Johnston and William Li and Guillaume Martres and Gonçalo Paulo and Girish Gupta and Stella Biderman and Nora Belrose},
-  title        = {Bergson: An Open Source Library for Data Attribution},
-  year         = {2026},
-  publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.18906967},
-  url          = {https://doi.org/10.5281/zenodo.18906967}
+@misc{quirke2026bergsonopensourcelibrary,
+      title={Bergson: An Open Source Library for Data Attribution}, 
+      author={Lucia Quirke and Louis Jaburi and David Johnston and William Z. Li and Gonçalo Paulo and Guillaume Martres and Girish Gupta and Stella Biderman and Nora Belrose},
+      year={2026},
+      eprint={2606.11660},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.11660}, 
 }
 ```
 
