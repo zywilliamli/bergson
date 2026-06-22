@@ -127,8 +127,7 @@ A directory at ``run_path`` containing:
        --truncation \
        --aggregation mean \
        --unit_normalize \
-       --projection_dim 0 \
-       --skip_hessians
+       --projection_dim 0
 
 .. note::
 
@@ -196,8 +195,7 @@ A directory at ``run_path`` containing:
        --query_path runs/my-query \
        --score individual \
        --unit_normalize \
-       --projection_dim 0 \
-       --skip_hessians
+       --projection_dim 0
 
 .. _hessian-command:
 

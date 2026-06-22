@@ -186,8 +186,8 @@ steps:
     assert cmd.hessian_cfg.ev_correction == HessianConfig(method="kfac").ev_correction
 
 
-def test_build_without_method_skips_hessian(tmp_path, registry):
-    """No hessian_cfg in a build step means index-only (no Hessian)."""
+def test_build_step_is_index_only(tmp_path, registry):
+    """A build step builds the index only; Hessians are fit via the hessian step."""
     yaml_path = write(
         tmp_path,
         """
@@ -200,7 +200,6 @@ steps:
     steps = parse(yaml_path, registry)
     _, cmd = steps[0]
     assert isinstance(cmd, Build)
-    assert cmd.hessian_cfg is None
 
 
 def make_steps() -> list[tuple[str, object]]:
@@ -255,20 +254,18 @@ def test_load_subconfig_searches_all_steps(tmp_path):
     assert load_subconfig(tmp_path / "missing", "index_cfg", IndexConfig) is None
 
 
-def test_build_with_method_computes_hessian(tmp_path, registry):
-    """An explicit method on a build step requests a Hessian approximation."""
+def test_hessian_step_fits_autocorrelation(tmp_path, registry):
+    """Autocorrelation is fit via the hessian step, like every other method."""
     yaml_path = write(
         tmp_path,
         """
 steps:
-  - build:
+  - hessian:
       index_cfg: {run_path: runs/test}
-      preprocess_cfg: {}
       hessian_cfg: {method: autocorrelation}
 """,
     )
     steps = parse(yaml_path, registry)
     _, cmd = steps[0]
-    assert isinstance(cmd, Build)
-    assert cmd.hessian_cfg is not None
+    assert isinstance(cmd, Hessian)
     assert cmd.hessian_cfg.method == "autocorrelation"

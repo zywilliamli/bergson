@@ -5,27 +5,24 @@
 run_path: runs/trackstar_wmdp_pieces
 steps:
   # Step 1/5: Compute autocorrelation hessian on the value (training) dataset.
-  - build:
+  - hessian:
       index_cfg:
         run_path: runs/trackstar_wmdp_pieces/value_hessian
         overwrite: true
         model: EleutherAI/pythia-160m
-        skip_index: true
         data:
           dataset: NeelNanda/pile-10k
           split: train[:10000]
           truncation: true
       hessian_cfg:
         method: autocorrelation
-      preprocess_cfg: {}
 
   # Step 2/5: Compute autocorrelation hessian on the query dataset.
-  - build:
+  - hessian:
       index_cfg:
         run_path: runs/trackstar_wmdp_pieces/query_hessian
         overwrite: true
         model: EleutherAI/pythia-160m
-        skip_index: true
         data:
           dataset: cais/wmdp
           split: test[:10000]
@@ -34,7 +31,6 @@ steps:
           truncation: true
       hessian_cfg:
         method: autocorrelation
-      preprocess_cfg: {}
 
   # Step 3/5: Mix the query and value hessians.
   - mix:

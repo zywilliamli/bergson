@@ -12,7 +12,6 @@ steps:
         run_path: runs/compare/q3_trackstar
         model: runs/compare/q3_random/hf_model
         overwrite: true
-        stats_sample_size: 10000
         # GPT-2's max context length is 1024
         token_batch_size: 1024
         # GPT-2 uses an nn.Linear for its LM head.
@@ -28,6 +27,7 @@ steps:
           truncation: true
 
       trackstar_cfg:
+        stats_sample_size: 10000
         query:
           dataset: Salesforce/wikitext
           subset: wikitext-2-raw-v1

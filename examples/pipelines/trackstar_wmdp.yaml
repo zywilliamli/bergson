@@ -16,13 +16,13 @@ steps:
       index_cfg:
         run_path: runs/trackstar_wmdp
         model: EleutherAI/pythia-160m
-        stats_sample_size: 10000
         overwrite: true
         data:
           dataset: NeelNanda/pile-10k
           split: train
           truncation: true
       trackstar_cfg:
+        stats_sample_size: 10000
         query:
           dataset: cais/wmdp
           split: test

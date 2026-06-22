@@ -361,7 +361,6 @@ def test_token_score_e2e(tmp_path: Path, model, dataset):
         run_path=str(tmp_path / "run"),
         token_batch_size=1024,
         attribute_tokens=True,
-        skip_index=True,
     )
 
     collect_gradients(
@@ -473,7 +472,6 @@ def _collect_in_memory(
         token_batch_size=1024,
         attribute_tokens=attribute_tokens,
         loss_reduction="sum",
-        skip_index=True,
         include_bias=include_bias,
     )
     cfg.partial_run_path.mkdir(parents=True, exist_ok=True)

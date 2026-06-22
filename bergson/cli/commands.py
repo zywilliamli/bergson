@@ -62,40 +62,18 @@ class ApproxUnrolling(Serializable):
 
 @dataclass
 class Build(Serializable):
-    """
-    Build a gradient index. Simultaneously approximate an autocorrelation Hessian
-    by passing `--method autocorrelation`."""
+    """Build a gradient index."""
 
     index_cfg: IndexConfig
 
     preprocess_cfg: PreprocessConfig
 
-    # Pass `--method autocorrelation` to simultaneously approximate a Hessian.
-    # `build` only supports autocorrelation Hessians; other methods go through
-    # the `hessian` command.
-    hessian_cfg: HessianConfig | None = None
-
     def execute(self):
         """Build the gradient index."""
-        if self.index_cfg.skip_index and self.hessian_cfg is None:
-            raise ValueError(
-                "if skip_index is True HessianConfig.method must be provided"
-            )
-
-        if (
-            self.hessian_cfg is not None
-            and self.hessian_cfg.method != "autocorrelation"
-        ):
-            raise ValueError(
-                f"build only supports autocorrelation Hessians, got "
-                f"'{self.hessian_cfg.method}'. Use the `hessian` command for "
-                f"{self.hessian_cfg.method}."
-            )
-
         validate_run_path(self.index_cfg)
 
         save_run_config(self, self.index_cfg.partial_run_path)
-        build(self.index_cfg, self.preprocess_cfg, self.hessian_cfg)
+        build(self.index_cfg, self.preprocess_cfg)
 
 
 @dataclass
@@ -134,16 +112,9 @@ class Hessian(Serializable):
 
     def execute(self):
         """Compute Hessian approximation."""
-
         validate_run_path(self.index_cfg)
-
-        if self.hessian_cfg.method == "autocorrelation":
-            self.index_cfg.skip_index = True
-            save_run_config(self, self.index_cfg.partial_run_path)
-            build(self.index_cfg, PreprocessConfig(), self.hessian_cfg)
-        else:
-            save_run_config(self, self.index_cfg.partial_run_path)
-            approximate_hessians(self.index_cfg, self.hessian_cfg)
+        save_run_config(self, self.index_cfg.partial_run_path)
+        approximate_hessians(self.index_cfg, self.hessian_cfg)
 
 
 @dataclass

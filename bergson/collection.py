@@ -14,7 +14,6 @@ def collect_gradients(
     processor: GradientProcessor,
     cfg: IndexConfig,
     *,
-    skip_hessians: bool = True,
     batches: list[list[int]] | None = None,
     target_modules: set[str] | None = None,
     attention_cfgs: dict[str, AttentionConfig] | None = None,
@@ -28,7 +27,6 @@ def collect_gradients(
         model=model.base_model,  # type: ignore
         cfg=cfg,
         processor=processor,
-        skip_hessians=skip_hessians,
         target_modules=target_modules,
         data=data,
         scorer=scorer,

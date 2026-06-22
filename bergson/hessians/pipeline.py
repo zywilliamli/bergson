@@ -83,10 +83,10 @@ def hessian_pipeline(
 
             query_preprocess_cfg = PreprocessConfig(aggregation="mean")
             save_run_config(
-                Build(query_cfg, query_preprocess_cfg, None),
+                Build(query_cfg, query_preprocess_cfg),
                 query_cfg.partial_run_path,
             )
-            build(query_cfg, query_preprocess_cfg, None)
+            build(query_cfg, query_preprocess_cfg)
 
     # ── Step 2: Fit Hessian factors on training data ──────────────────────
     print(f"Step 2/4: Fitting {method} factors on training data...")

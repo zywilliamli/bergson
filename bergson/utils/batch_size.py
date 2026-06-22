@@ -1,6 +1,5 @@
 import gc
 import json
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -74,7 +73,6 @@ def maybe_auto_batch_size(
     processor: GradientProcessor,
     target_modules: set[str] | None,
     rank: int = 0,
-    skip_hessians: bool = True,
 ) -> None:
     """Run auto batch size determination if enabled.
 
@@ -97,22 +95,20 @@ def maybe_auto_batch_size(
         gloo_group = None
 
     if rank == 0:
-        # skip_index=True avoids creating a Builder, whose
-        # create_index() calls dist.barrier() on the default
-        # NCCL group — which would deadlock since only rank 0
-        # creates this collector.
-        probe_cfg = replace(cfg, skip_index=True)
         cfg.token_batch_size = determine_batch_size(
             root=Path(".cache"),
             cfg=cfg,
             model=model,
+            # skip_index=True avoids creating a Builder, whose create_index()
+            # calls dist.barrier() on the default NCCL group — which would
+            # deadlock since only rank 0 creates this collector.
             collector=GradientCollector(
                 model=model.base_model,
-                cfg=probe_cfg,
+                cfg=cfg,
                 processor=processor,
-                skip_hessians=skip_hessians,
                 target_modules=target_modules,
                 data=ds,  # type: ignore
+                skip_index=True,
             ),
             starting_batch_size=cfg.token_batch_size,
         )

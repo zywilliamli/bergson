@@ -5,28 +5,28 @@ from ..build import build
 from ..config.config import (
     HessianConfig,
     IndexConfig,
-    PreprocessConfig,
     TrackstarConfig,
 )
 from ..config.config_io import save_run_config
+from ..hessians.hessian_approximations import approximate_hessians
 from ..process_grads import mix_autocorrelation_matrices
 from ..score.score import score_dataset
 from ..utils.worker_utils import validate_run_path
-from .commands import Build, Mix, Score
+from .commands import Build, Hessian, Mix, Score
 
 
-def _limit_split_for_hess(cfg: IndexConfig) -> None:
+def _limit_split_for_hess(cfg: IndexConfig, stats_sample_size: int | None) -> None:
     """Limit the data split to stats_sample_size for hessian-only steps."""
     # TODO this code is hacky and bad
 
-    if cfg.stats_sample_size is not None:
+    if stats_sample_size is not None:
         split = cfg.data.split
         # Append HF slice notation if not already present
         if "[" not in split:
-            cfg.data.split = f"{split}[:{cfg.stats_sample_size}]"
+            cfg.data.split = f"{split}[:{stats_sample_size}]"
         else:
             base_split = split.split("[")[0]
-            cfg.data.split = f"{base_split}[:{cfg.stats_sample_size}]"
+            cfg.data.split = f"{base_split}[:{stats_sample_size}]"
 
 
 def _step_complete(path: str, resume: bool) -> bool:
@@ -49,8 +49,6 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
     scores_path = f"{run_path}/scores"
     resume = trackstar_cfg.resume
 
-    # Steps 1-2 only compute hessians, so don't preprocess grads.
-    hess_preprocess_cfg = PreprocessConfig()
     hess_cfg = HessianConfig(method="autocorrelation")
 
     def _validate(cfg: IndexConfig):
@@ -64,15 +62,13 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
     if not _step_complete(value_hess_path, resume):
         value_hess_cfg = deepcopy(index_cfg)
         value_hess_cfg.run_path = value_hess_path
-        value_hess_cfg.skip_index = True
-        if trackstar_cfg.num_stats_sample_hessian:
-            _limit_split_for_hess(value_hess_cfg)
+        _limit_split_for_hess(value_hess_cfg, trackstar_cfg.stats_sample_size)
         _validate(value_hess_cfg)
         save_run_config(
-            Build(value_hess_cfg, hess_preprocess_cfg, hess_cfg),
+            Hessian(hessian_cfg=hess_cfg, index_cfg=value_hess_cfg),
             value_hess_cfg.partial_run_path,
         )
-        build(value_hess_cfg, hess_preprocess_cfg, hess_cfg)
+        approximate_hessians(value_hess_cfg, hess_cfg)
 
     # Step 2: Compute hessians on query dataset
     print("Step 2/5: Computing hessians on query dataset...")
@@ -80,15 +76,13 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
         query_hess_cfg = deepcopy(index_cfg)
         query_hess_cfg.run_path = query_hess_path
         query_hess_cfg.data = deepcopy(trackstar_cfg.query)
-        query_hess_cfg.skip_index = True
-        if trackstar_cfg.num_stats_sample_hessian:
-            _limit_split_for_hess(query_hess_cfg)
+        _limit_split_for_hess(query_hess_cfg, trackstar_cfg.stats_sample_size)
         _validate(query_hess_cfg)
         save_run_config(
-            Build(query_hess_cfg, hess_preprocess_cfg, hess_cfg),
+            Hessian(hessian_cfg=hess_cfg, index_cfg=query_hess_cfg),
             query_hess_cfg.partial_run_path,
         )
-        build(query_hess_cfg, hess_preprocess_cfg, hess_cfg)
+        approximate_hessians(query_hess_cfg, hess_cfg)
 
     # Step 3: Mix query and value hessians
     print("Step 3/5: Mixing hessians...")
@@ -138,10 +132,10 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
 
         _validate(query_cfg)
         save_run_config(
-            Build(query_cfg, trackstar_cfg.preprocess_cfg, None),
+            Build(query_cfg, trackstar_cfg.preprocess_cfg),
             query_cfg.partial_run_path,
         )
-        build(query_cfg, trackstar_cfg.preprocess_cfg, None)
+        build(query_cfg, trackstar_cfg.preprocess_cfg)
 
     # Step 5: Score value dataset against query using mixed hessian
     print("Step 5/5: Scoring value dataset...")
