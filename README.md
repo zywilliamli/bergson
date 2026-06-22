@@ -1,7 +1,7 @@
 # Bergson
 Bergson is a python library which provides scalable, state-of-the-art data attribution methods for large language models, including  [EK-FAC](https://arxiv.org/abs/2308.03296) (2023), [TrackStar](https://arxiv.org/abs/2410.17413v3) (2024), and [Magic](https://arxiv.org/abs/2504.16430) (2025), alongside simple baselines such as gradient cosine similarity.
 
-Data attribution methods estimate the effect on a behavior of interest of removing data points from a model's training corpus. Exactly computing these effects for a corpus of N items requires 2**N retraining runs. Our most costly and powerful method, MAGIC, uses compute equivalent to 3-5 training runs to produce per-token or per-sequence scores that correlate with the effects of leave-k-out retraining at ρ>0.9 in well-behaved settings. Faster methods like EK-FAC and TrackStar use compute equivalent to ~1 training run (with more modest VRAM usage), but correlate less with leave-k-out retraining (ρ\~=0.3).
+Data attribution methods estimate the effect on a behavior of interest of removing data points from a model's training corpus. Exactly computing these effects for a corpus of N items requires 2**N retraining runs. Our most costly and powerful method, MAGIC, uses compute equivalent to 3-5 training runs to produce per-token or per-sequence scores that correlate with the effects of leave-k-out retraining at ρ>0.9 in well-behaved settings. Faster methods like EK-FAC and TrackStar use compute equivalent to ~1 training run (with more modest VRAM usage), but correlate less with leave-k-out retraining (ρ\~=0.3 with careful hyperparameter tuning).
 
 ## Core features
 
@@ -25,6 +25,8 @@ For small queries and methods that don't use gradient compression (e.g., EK-FAC)
 Per-module and per-attention head gradient storage enables mechanistic interpretability.
 
 At a higher level, `bergson trackstar`, `bergson ekfac`, and `bergson approx_unrolling` orchestrate several multi-step attribution methods.
+
+**Note: influence functions are highly sensitive to Hessian approximation inversion hyperparameters. Untuned hyperparameters can result in a linear datamodeling score of zero.**
 
 # Announcements
 
