@@ -360,8 +360,8 @@ def save_uncorrected_eigenvalues(
     out_dir = os.path.join(str(partial_run_path), "eigenvalue_sharded")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Per-factor eigenvalues, saved to enable factored Tikhonov damping. 
-    # This damping method uses the individual eigenvalues of the A and G factors. 
+    # Per-factor eigenvalues, saved to enable factored Tikhonov damping.
+    # This damping method uses the individual eigenvalues of the A and G factors.
     # `factor_eig_a` holds the full activation
     # eigenvalues λ_A [I] (replicated on every rank); `factor_eig_g` holds this
     # rank's part of the row-sharded gradient eigenvalues λ_G [O].

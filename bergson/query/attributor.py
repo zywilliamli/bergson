@@ -69,8 +69,8 @@ class Attributor:
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
 
-        # Set `hessian_path` to enable preconditioning. Two-sided 
-        # preconditioning (H^(-1/2) on index as well as query) is 
+        # Set `hessian_path` to enable preconditioning. Two-sided
+        # preconditioning (H^(-1/2) on index as well as query) is
         # applied if unit norm is enabled.
         if hessian_path is None:
             self.precondition = "none"

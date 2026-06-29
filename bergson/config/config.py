@@ -69,7 +69,7 @@ class DataConfig(Serializable):
 @dataclass
 class InversionConfig(Serializable):
     inversion: Inversion = "damped_inverse"
-    """Eigenvalue function used to invert a Hessian with regularization. 
+    """Eigenvalue function used to invert a Hessian with regularization.
     Setting ``c = damping_factor`` and ``λ`` for an eigenvalue:
 
     - "damped_inverse" (default): ``1 / (λ + c·mean(λ))`` — uniform Tikhonov
@@ -492,8 +492,8 @@ class QueryConfig(Serializable):
     """Whether to unit normalize the query."""
 
     hessian_path: str | None = None
-    """Path to a Hessian to precondition the gradients with. Two-sided 
-    preconditioning (H^(-1/2) applied to query and index) will be used 
+    """Path to a Hessian to precondition the gradients with. Two-sided
+    preconditioning (H^(-1/2) applied to query and index) will be used
     if ``unit_norm`` is enabled."""
 
     ev_correction: bool = False

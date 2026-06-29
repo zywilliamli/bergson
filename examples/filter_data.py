@@ -392,7 +392,11 @@ def _get_attribution_indices(
         preconditioner = load_preconditioner(
             hessian_path, power=-1, device=torch.device("cuda")
         )
-        h_inv = preconditioner.h_inv if isinstance(preconditioner, DensePreconditioner) else {}
+        h_inv = (
+            preconditioner.h_inv
+            if isinstance(preconditioner, DensePreconditioner)
+            else {}
+        )
 
         # Get ordered module names from info.json
         with open(index_ds_path / "info.json") as f:
