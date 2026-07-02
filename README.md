@@ -16,7 +16,7 @@ compute the gradient of a loss with respect to an implicit weighting placed on e
 
 Building a train‑time raw gradient store is also available through a HF Trainer callback, at a ~17% performance overhead.
 
-**Note: unrolled differentiation is highly sensitive to [meta-smoothness](https://bergson.readthedocs.io/en/latest/magic.html#meta-smoothness). Low metasmoothness can result in a linear datamodeling score of zero.**
+**Note: unrolled differentiation is highly sensitive to [metasmoothness](https://bergson.readthedocs.io/en/latest/magic.html#meta-smoothness). Untuned training hyperparameters can result in a linear datamodeling score of zero.**
 
 ### Attribute Post-Hoc
 
