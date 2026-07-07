@@ -370,7 +370,7 @@ def worker(
     )
     if getattr(run_cfg, "save_optimizer_state", False) and global_rank == 0:
         save_second_moments_as_optimizer_pt(
-            model,
+            model,  # type: ignore[reportArgumentType]
             fwd_state.opt_state,
             os.path.join(run_cfg.run_path, "optimizer.pt"),
         )
