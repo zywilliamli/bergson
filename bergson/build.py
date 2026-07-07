@@ -8,7 +8,7 @@ from datasets import Dataset, IterableDataset
 from tqdm.auto import tqdm
 
 from bergson.collection import collect_gradients
-from bergson.config.config import HessianConfig, IndexConfig, PreprocessConfig
+from bergson.config.config import IndexConfig, PreprocessConfig
 from bergson.data import allocate_batches
 from bergson.distributed import (
     cap_world_size_to_dataset,
@@ -35,7 +35,6 @@ def build_worker(
     world_size: int,
     index_cfg: IndexConfig,
     preprocess_cfg: PreprocessConfig,
-    hessian_cfg: HessianConfig | None,
     ds: Dataset | IterableDataset,
 ):
     """
@@ -75,12 +74,9 @@ def build_worker(
         )
 
     model, target_modules = setup_model_and_peft(index_cfg)
-    skip_hessians = hessian_cfg is None
     processor = create_processor(model, index_cfg, target_modules)
 
-    maybe_auto_batch_size(
-        index_cfg, model, ds, processor, target_modules, rank, skip_hessians
-    )
+    maybe_auto_batch_size(index_cfg, model, ds, processor, target_modules, rank)
 
     attention_cfgs = {
         module: index_cfg.attention for module in index_cfg.split_attention_modules
@@ -94,7 +90,6 @@ def build_worker(
         "target_modules": target_modules,
         "attention_cfgs": attention_cfgs,
         "preprocess_cfg": preprocess_cfg,
-        "skip_hessians": skip_hessians,
     }
 
     if isinstance(ds, Dataset):
@@ -139,7 +134,6 @@ def build_worker(
 def build(
     index_cfg: IndexConfig,
     preprocess_cfg: PreprocessConfig,
-    hessian_cfg: HessianConfig | None = None,
 ):
     """
     Convert a dataset to an on-disk index.
@@ -170,7 +164,7 @@ def build(
     launch_distributed_run(
         "build",
         build_worker,
-        [index_cfg, preprocess_cfg, hessian_cfg, ds],
+        [index_cfg, preprocess_cfg, ds],
         dist_cfg,
     )
 

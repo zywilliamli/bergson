@@ -15,6 +15,7 @@ from bergson import (
 )
 from bergson.build import build
 from bergson.data import load_gradient_dataset
+from bergson.hessians.autocorrelation import AutocorrelationCollector
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -76,20 +77,27 @@ def test_programmatic_reduce(tmp_path: Path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_reduce_with_preconditioning(tmp_path: Path, model, dataset):
-    # Step 1: build an index WITH hessians
-    build_cfg = IndexConfig(run_path=str(tmp_path / "build"), token_batch_size=1024)
+    # Step 1: fit an autocorrelation Hessian on the data
+    fit_cfg = IndexConfig(run_path=str(tmp_path / "hessian"), token_batch_size=1024)
+    fit_cfg.partial_run_path.mkdir(parents=True, exist_ok=True)
 
-    collect_gradients(
+    hess_collector = AutocorrelationCollector(
+        model=model.base_model,
+        data=dataset,
+        path=str(fit_cfg.partial_run_path),
+        processor=GradientProcessor(),
+        attention_cfgs={},
+    )
+    CollectorComputer(
         model=model,
         data=dataset,
-        processor=GradientProcessor(),
-        cfg=build_cfg,
-        skip_hessians=False,
-    )
+        collector=hess_collector,
+        cfg=fit_cfg,
+    ).run_with_collector_hooks(desc="Fit autocorrelation Hessian")
 
-    # Step 2: reduce with preconditioning pointing at the built index
+    # Step 2: reduce with preconditioning pointing at the fitted Hessian
     preprocess_cfg = PreprocessConfig(
-        aggregation="mean", hessian_path=str(build_cfg.partial_run_path)
+        aggregation="mean", hessian_path=str(fit_cfg.partial_run_path)
     )
     reduce_index_cfg = IndexConfig(
         run_path=str(tmp_path / "reduce_hess"),

@@ -14,6 +14,7 @@ from bergson.config.config import AttentionConfig, HessianConfig, IndexConfig
 from bergson.data import allocate_batches
 from bergson.distributed import init_dist, launch_distributed_run
 from bergson.gradients import GradientProcessor
+from bergson.hessians.autocorrelation import AutocorrelationCollector
 from bergson.hessians.eigenvectors import (
     LambdaCollector,
     compute_eigendecomposition,
@@ -27,6 +28,7 @@ from bergson.utils.utils import (
     setup_reproducibility,
 )
 from bergson.utils.worker_utils import (
+    create_processor,
     setup_data_pipeline,
     setup_model_and_peft,
 )
@@ -128,16 +130,42 @@ def hessian_worker(
     if target_modules is None:
         target_modules = peft_target_modules
 
+    attention_cfgs = {
+        module: index_cfg.attention for module in index_cfg.split_attention_modules
+    }
+    batches = allocate_batches(ds["length"][:], index_cfg.token_batch_size)
+
+    # The autocorrelation Hessian is a dense per-module gradient Gram so
+    # it computes in one pass and skips the factored eigendecomposition
+    if hessian_cfg.method == "autocorrelation":
+        processor = create_processor(model, index_cfg, target_modules)
+        collector = AutocorrelationCollector(
+            model=model.base_model,  # type: ignore
+            data=ds,
+            path=str(index_cfg.partial_run_path),
+            processor=processor,
+            target_modules=target_modules,
+            attention_cfgs=attention_cfgs,
+            filter_modules=index_cfg.filter_modules,
+        )
+        computer = CollectorComputer(
+            model=model,  # type: ignore
+            data=ds,
+            collector=collector,
+            batches=batches,
+            cfg=index_cfg,
+        )
+        computer.run_with_collector_hooks(desc="Approximating autocorrelation Hessian")
+        return
+
     kwargs = {
         "model": model,
         "data": ds,
         "index_cfg": index_cfg,
         "hessian_cfg": hessian_cfg,
         "target_modules": target_modules,
-        "attention_cfgs": {
-            module: index_cfg.attention for module in index_cfg.split_attention_modules
-        },
-        "batches": allocate_batches(ds["length"][:], index_cfg.token_batch_size),
+        "attention_cfgs": attention_cfgs,
+        "batches": batches,
     }
 
     collect_hessians(**kwargs)

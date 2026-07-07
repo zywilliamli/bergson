@@ -164,7 +164,6 @@ def test_gradient_collector_proj_norm():
     for p in (16, None):
         cfg = IndexConfig(
             run_path=str(temp_dir / "run"),
-            skip_index=True,
         )
         processor = GradientProcessor(projection_dim=p)
         collector = GradientCollector(
@@ -172,7 +171,7 @@ def test_gradient_collector_proj_norm():
             cfg=cfg,
             data=data,
             processor=processor,
-            skip_hessians=p is None,
+            skip_index=True,
         )
         with collector:
             model.zero_grad()
@@ -285,7 +284,6 @@ def test_gradient_collector_batched(
     # Create config for GradientCollector
     cfg = IndexConfig(
         run_path=str(temp_dir / "run"),
-        skip_index=True,
     )
 
     processor = GradientProcessor(
@@ -295,6 +293,7 @@ def test_gradient_collector_batched(
         model=model,
         cfg=cfg,
         data=dummy_data,
+        skip_index=True,
         processor=processor,
         target_modules={"fc1", "fc2"},
     )
@@ -399,7 +398,6 @@ def test_bias_gradients(test_params, simple_model_class):
     # Create config for GradientCollector
     cfg = IndexConfig(
         run_path=str(temp_dir / "run"),
-        skip_index=True,
     )
 
     processor = GradientProcessor(include_bias=True, projection_dim=None)
@@ -407,6 +405,7 @@ def test_bias_gradients(test_params, simple_model_class):
         model=model,
         cfg=cfg,
         data=dummy_data,
+        skip_index=True,
         processor=processor,
         target_modules={"fc"},
     )
@@ -464,7 +463,6 @@ def test_gradient_collector_with_projection(
     # Create config for GradientCollector
     cfg = IndexConfig(
         run_path=str(temp_dir / "run"),
-        skip_index=True,
     )
 
     processor = GradientProcessor(
@@ -474,6 +472,7 @@ def test_gradient_collector_with_projection(
         model=model,
         cfg=cfg,
         data=dummy_data,
+        skip_index=True,
         processor=processor,
         target_modules={"fc1", "fc2"},
     )
@@ -535,7 +534,6 @@ def test_adafactor_normalization_ground_truth(
     dummy_data = Dataset.from_dict({"input_ids": [[1] * 10] * N})
     cfg = IndexConfig(
         run_path=str(temp_dir / "run"),
-        skip_index=True,
     )
 
     processor = GradientProcessor(
@@ -547,6 +545,7 @@ def test_adafactor_normalization_ground_truth(
         model=model,
         cfg=cfg,
         data=dummy_data,
+        skip_index=True,
         processor=processor,
         target_modules={"fc1", "fc2"},
     )
@@ -617,7 +616,6 @@ def test_in_features_restored_after_collector(test_params, simple_model_class):
     dummy_data = Dataset.from_dict({"input_ids": [[1] * 10] * N})
     cfg = IndexConfig(
         run_path=str(temp_dir / "run"),
-        skip_index=True,
     )
 
     # Record original in_features for all layers
@@ -632,6 +630,7 @@ def test_in_features_restored_after_collector(test_params, simple_model_class):
         model=model,
         cfg=cfg,
         data=dummy_data,
+        skip_index=True,
         processor=processor,
         target_modules=set(original_in_features.keys()),
     )
@@ -683,7 +682,7 @@ def test_projected_bias_gradients_match_full_projection(
                 bias_avg_sq=torch.rand(layer.out_features) + 0.1,
             )
 
-    cfg = IndexConfig(run_path=str(temp_dir / "run"), skip_index=True)
+    cfg = IndexConfig(run_path=str(temp_dir / "run"))
     processor = GradientProcessor(
         normalizers=normalizers, projection_dim=P, include_bias=True
     )
@@ -692,6 +691,7 @@ def test_projected_bias_gradients_match_full_projection(
         model=model,
         cfg=cfg,
         data=dummy_data,
+        skip_index=True,
         processor=processor,
         target_modules={"fc1", "fc2"},
     )

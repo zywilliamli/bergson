@@ -185,7 +185,7 @@ def test_global_project_values_cpu(tmp_path: Path, model, dataset):
     """
     proj_dim = 16
     tokens = torch.tensor([dataset[0]["input_ids"]])
-    cfg = IndexConfig(run_path=str(tmp_path), skip_index=True)
+    cfg = IndexConfig(run_path=str(tmp_path))
 
     # First pass: capture raw per-module gradients (no projection)
     raw_collector = GradientCollector(
@@ -193,6 +193,7 @@ def test_global_project_values_cpu(tmp_path: Path, model, dataset):
         cfg=cfg,
         data=dataset,
         processor=GradientProcessor(projection_dim=None),
+        skip_index=True,
     )
     with raw_collector:
         model.zero_grad()
@@ -208,6 +209,7 @@ def test_global_project_values_cpu(tmp_path: Path, model, dataset):
         cfg=cfg,
         data=dataset,
         processor=global_processor,
+        skip_index=True,
     )
     with global_collector:
         model.zero_grad()

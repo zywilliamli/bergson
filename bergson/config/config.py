@@ -400,13 +400,6 @@ class IndexConfig(AttributionConfig, Serializable):
     or a path to an optimizer state file directly) or a Hugging Face URI
     ``hf://<repo>[@<revision>][/<path>]``."""
 
-    skip_index: bool = False
-    """Whether to skip building the gradient index."""
-
-    stats_sample_size: int | None = 10_000
-    """Number of examples to use for estimating the autocorrelation Hessian.
-    This feature is experimental and may be removed."""
-
     loss_fn: Literal["ce", "kl"] = "ce"
     """Loss function to use."""
 
@@ -677,9 +670,10 @@ class TrackstarConfig:
     index hessians intersect at this component. Typical value is
     ~1000 out of ~65K total components."""
 
-    num_stats_sample_hessian: bool = True
-    """Whether to use num_stats_sample items or the full dataset to
-    compute hessians."""
+    stats_sample_size: int | None = 10_000
+    """Number of examples to use for estimating the autocorrelation Hessian
+    in the trackstar pipeline's hessian-fitting steps. Set to None to use
+    the full dataset."""
 
     resume: bool = False
     """Skip pipeline steps whose output directory already exists."""

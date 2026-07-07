@@ -12,7 +12,6 @@ from torch import Tensor
 from bergson.builder import Builder
 from bergson.collector.collector import HookCollectorBase
 from bergson.config import IndexConfig, PreprocessConfig
-from bergson.process_autocorrelation import process_autocorrelation_matrices
 from bergson.score.scorer import Scorer
 from bergson.utils.utils import get_gradient_dtype
 
@@ -33,9 +32,6 @@ class GradientCollector(HookCollectorBase):
     cfg: IndexConfig
     """Configuration for gradient index."""
 
-    skip_hessians: bool = True
-    """Whether to skip estimating autocorrelation hessian statistics."""
-
     mod_grads: dict = field(default_factory=dict)
     """Temporary storage for gradients during a batch, keyed by module name."""
 
@@ -47,6 +43,11 @@ class GradientCollector(HookCollectorBase):
 
     scorer: Scorer | None = None
     """Optional scorer for computing scores instead of building an index."""
+
+    skip_index: bool = False
+    """Collect gradients into ``mod_grads`` without writing an on-disk index
+    (e.g. batch-size probing or gradient inspection). No effect when a
+    ``scorer`` is set, since scoring already skips the index."""
 
     def setup(self) -> None:
         """
@@ -77,7 +78,7 @@ class GradientCollector(HookCollectorBase):
         )
 
         # Compute whether we need to save the index
-        self.save_index = self.scorer is None and not self.cfg.skip_index
+        self.save_index = self.scorer is None and not self.skip_index
 
         if self.save_index:
             grad_sizes = {name: math.prod(s) for name, s in self.shapes().items()}
@@ -94,19 +95,11 @@ class GradientCollector(HookCollectorBase):
 
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
-        """Compute per-sample gradient, accumulate autocorrelation matrix, and store."""
+        """Compute the per-sample gradient and store it for the index."""
         name: str = module._name  # type: ignore[assignment]
         P = self._compute_gradient(module, g)
 
         global_proj = self.processor.projection_target == "global"
-
-        # Collect per-module hessians when projection target is per_module
-        if not self.skip_hessians and not global_proj:
-            P = P.float()
-            if name in self.processor.hessians:
-                self.processor.hessians[name].addmm_(P.mT, P)
-            else:
-                self.processor.hessians[name] = P.mT @ P
 
         if global_proj:
             assert self.processor.projection_dim is not None
@@ -158,16 +151,6 @@ class GradientCollector(HookCollectorBase):
         ), "cfg is required for GradientCollector"  # pleasing type checker
         if dist.is_initialized():
             dist.reduce(self.per_doc_losses, dst=0)
-
-        grad_sizes = {name: math.prod(s) for name, s in self.shapes().items()}
-        if self.processor.hessians:
-            process_autocorrelation_matrices(
-                self.processor,
-                self.processor.hessians,
-                len(self.data),
-                grad_sizes,
-                self.rank,
-            )
 
         if self.builder:
             self.builder.teardown()
