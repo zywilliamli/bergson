@@ -33,10 +33,10 @@ from ..config.config import ScoreConfig, TrainingConfig, ValidationConfig
 from ..config.config_io import load_subconfig, save_run_config
 from ..data import load_scores
 from ..distributed import grad_tree, launch_distributed_run
-from ..utils.logging import wandb_log_fn
 from ..utils.load_from_optimizer import (
     save_second_moments_as_optimizer_pt,
 )
+from ..utils.logging import wandb_log_fn
 from ..utils.utils import get_device, get_device_index
 from ..utils.worker_utils import (
     setup_data_pipeline,
@@ -367,6 +367,7 @@ def worker(
         log_fn=log_fn,
         resume=resume,
         fsdp=run_cfg.fsdp,
+    )
     if getattr(run_cfg, "save_optimizer_state", False) and global_rank == 0:
         save_second_moments_as_optimizer_pt(
             model,
