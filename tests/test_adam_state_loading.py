@@ -20,6 +20,7 @@ from bergson.utils.load_from_optimizer import (
     get_optimizer_state_format,
     get_unfactored_second_moment,
     load_from_optimizer,
+    save_second_moments_as_optimizer_pt,
 )
 from bergson.utils.worker_utils import extract_peft_target_modules
 
@@ -27,6 +28,60 @@ from bergson.utils.worker_utils import extract_peft_target_modules
 def _create_model():
     config = AutoConfig.from_pretrained("trl-internal-testing/tiny-Phi3ForCausalLM")
     return AutoModelForCausalLM.from_config(config, torch_dtype=torch.float32)
+
+
+class _TiedModel(nn.Module):
+    """Reproduces the GPT-2 weight tie (head.weight is emb.weight) plus a
+    couple of untied 2D layers, to exercise the name-based normalizer mapping."""
+
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(10, 4)
+        self.blk_a = nn.Linear(4, 6, bias=True)
+        self.blk_b = nn.Linear(6, 8, bias=False)
+        self.head = nn.Linear(4, 10, bias=False)
+        self.head.weight = self.emb.weight
+
+
+def test_save_second_moments_roundtrip_is_name_correct():
+    """A torchopt AdamW state exports to optimizer.pt and each normalizer lands
+    on the correct module -- even with a tied weight and torchopt's sorted-key
+    nu ordering (the module-name mismatch this guards against)."""
+    torchopt = pytest.importorskip("torchopt")
+
+    model = _TiedModel()
+    # dedup drops the tied duplicate: full param list is longer than named_parameters()
+    assert len(list(model.named_parameters(remove_duplicate=False))) == 5
+    assert len(list(model.named_parameters())) == 4
+
+    params = {
+        k: v
+        for k, v in model.named_parameters(remove_duplicate=False)
+        if v.requires_grad
+    }
+    opt = torchopt.adamw(1e-3, betas=(0.95, 0.975), eps_root=1e-8, weight_decay=0.01)
+    state = opt.init(params)
+
+    # Mark each param's second moment with a unique constant keyed by name, in
+    # torchopt's sorted-key order, so we can verify the mapping end-to-end.
+    adam = next(s for s in state if hasattr(s, "nu"))
+    marker = {}
+    for i, name in enumerate(sorted(params)):
+        adam.nu[i] = torch.full_like(adam.nu[i], float(1000 + i))
+        marker[name] = float(1000 + i)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/optimizer.pt"
+        n = save_second_moments_as_optimizer_pt(model, state, path)
+        assert n == 4  # emb(=head), blk_a, blk_b weights
+
+        normalizers = load_from_optimizer(model, path)
+
+    # tie resolves to the surviving deduplicated name, not the alias
+    assert "emb" in normalizers and "head" not in normalizers
+    for module_name, norm in normalizers.items():
+        assert isinstance(norm, AdamNormalizer)
+        assert float(norm.weight_avg_sq.flatten()[0]) == marker[module_name + ".weight"]
 
 
 def _create_fake_optimizer_state(model, lr=1e-3):

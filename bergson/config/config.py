@@ -335,6 +335,11 @@ class TrainingConfig(AttributionConfig, Serializable):
     """Optimizer to use for the training steps. Muon is an efficient
     optimizer that can reduce memory usage and speed up training."""
 
+    save_optimizer_state: bool = False
+    """After training, export the optimizer's second moments to
+    ``<run_path>/optimizer.pt`` for use as an attribution normalizer.
+    AdamW only."""
+
     weight_decay: float = 0.01
     """Weight decay coefficient for AdamW and Muon."""
 
@@ -364,7 +369,7 @@ class ValidationConfig(TrainingConfig, ABC):
     num_subsets: int = 100
     """Number of leave-k-out subsets for Spearman correlation."""
 
-    subset_strategy: Literal["random", "sorted"] = "sorted"
+    subset_strategy: Literal["random"] = "random"
     """Strategy for selecting leave-k-out subsets for validation."""
 
     exclude_zero_scores: bool = False
