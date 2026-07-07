@@ -168,20 +168,59 @@ def test_load_from_checkpoint_dir(tmp_path):
 
 
 def test_target_modules_filter(tmp_path):
-    """Only layers in target_modules are loaded."""
+    """Only layers in target_modules are loaded.
+
+    Module names are relative to ``model.base_model`` -- the collector attaches
+    hooks to ``model.base_model`` and looks up normalizers by that relative name
+    (e.g. ``layers.0.self_attn.qkv_proj``, not ``model.layers.0...``), so
+    ``load_from_optimizer`` keys and filters by the same relative names.
+    """
     model = _create_model()
     opt_state = _create_fake_optimizer_state(model)
 
     opt_path = tmp_path / "optimizer.pt"
     torch.save(opt_state, opt_path)
 
+    base = getattr(model, "base_model", model)
     all_linear = {
-        name for name, module in model.named_modules() if isinstance(module, nn.Linear)
+        name for name, module in base.named_modules() if isinstance(module, nn.Linear)
     }
-    subset = set(list(all_linear)[:2])
+    subset = set(sorted(all_linear)[:2])
 
     normalizers = load_from_optimizer(model, str(opt_path), target_modules=subset)
     assert set(normalizers.keys()) == subset
+
+
+def test_load_from_gpt2_conv1d_base_relative_keys(tmp_path):
+    """GPT-2 stores attn/mlp weights as ``Conv1D`` (layout ``[in, out]``) under a
+    ``transformer.`` prefix. load_from_optimizer must (a) key normalizers by the
+    ``model.base_model``-relative name the collector looks up (``h.0.attn.c_attn``,
+    not ``transformer.h.0...``) and (b) orient the Conv1D second moment into the
+    collector's ``[out, in]`` layout.
+    """
+    from transformers.pytorch_utils import Conv1D
+
+    model = AutoModelForCausalLM.from_pretrained("sshleifer/tiny-gpt2")
+    opt_state = _create_fake_optimizer_state(model)
+    opt_path = tmp_path / "optimizer.pt"
+    torch.save(opt_state, opt_path)
+
+    base = model.base_model
+    conv_names = sorted(n for n, m in base.named_modules() if isinstance(m, Conv1D))
+    assert conv_names, "expected Conv1D layers in GPT-2"
+    subset = set(conv_names[:2])
+
+    normalizers = load_from_optimizer(model, str(opt_path), target_modules=subset)
+
+    # Keys are base-relative (``transformer.`` stripped), matching the collector.
+    assert set(normalizers.keys()) == subset
+    for name, norm in normalizers.items():
+        assert isinstance(norm, AdamNormalizer)
+        module = base.get_submodule(name)
+        out_f = module.nf  # Conv1D output features
+        in_f = module.weight.shape[0]  # Conv1D param is [in, out]
+        # Optimizer moment is stored [in, out]; must be transposed to [out, in].
+        assert norm.weight_avg_sq.shape == (out_f, in_f)
 
 
 def test_missing_optimizer_file(tmp_path):
