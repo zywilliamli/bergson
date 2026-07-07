@@ -77,10 +77,10 @@ def test_damped_inverse_formula():
     assert torch.allclose(m, 1.0 / (lam + 0.1 * mean))
 
 
-def test_cauchy_formula():
+def test_tikhonov_filtered_formula():
     lam = torch.rand(5) + 0.1
     mean = lam.mean()
-    m = eigenvalue_multiplier("cauchy", lam, mean, 0.1)
+    m = eigenvalue_multiplier("tikhonov_filtered", lam, mean, 0.1)
     alpha = 0.1 * mean
     assert torch.allclose(m, lam / (lam * lam + alpha * alpha))
 

@@ -127,7 +127,7 @@ class FactoredPreconditioner:
         self.inversion_cfg = inversion_cfg or InversionConfig()
         self.apply_fn = apply_fn
         self.power = power
-        self._mul = ShardedMul()
+        self.shard_computer = ShardedMul()
         # Per-step debug logs are off by default; consumer code may raise this
         # logger to DEBUG to surface the apply's progress trace.
         self.logger = get_logger("FactoredPreconditioner")
@@ -146,12 +146,15 @@ class FactoredPreconditioner:
         """Single-process: load the full factors (concatenating any shards)."""
 
         def load(sub):
-            return _to(_load_full(hessian_path, sub), device)
+            return _load_full(hessian_path, sub, device)
 
         def load_replicated(sub):
-            # factor_eig_a is the full [I] in every shard, not row-sharded, so
-            # take a single shard rather than concatenating across shards.
-            return _to(_load_shard(hessian_path, sub, 0), device)
+            # The eigenvalue grid λ is [O, I] and is row-sharded along O, so only
+            # the O-indexed gradient factor (factor_eig_g, [O]) is split across
+            # shards; the I-indexed activation factor (factor_eig_a, [I]) rides
+            # the unsharded column dim and is written in full to every shard.
+            # So load a single shard rather than concatenating across shards.
+            return _load_shard(hessian_path, sub, 0, device)
 
         return cls._from_loaded(
             load, load_replicated, inversion_cfg, apply_fn, power, ev_correction
@@ -172,7 +175,7 @@ class FactoredPreconditioner:
         """Distributed: load this rank's shard of the factors."""
 
         def load(sub):
-            return _to(_load_shard(hessian_path, sub, rank), device)
+            return _load_shard(hessian_path, sub, rank, device)
 
         # Each rank's shard of factor_eig_a is already the full replicated [I].
         return cls._from_loaded(
@@ -183,11 +186,23 @@ class FactoredPreconditioner:
     def _from_loaded(
         cls, load, load_replicated, inversion_cfg, apply_fn, power, ev_correction
     ):
+        factored_tikhonov = (
+            inversion_cfg is not None and inversion_cfg.inversion == "factored_tikhonov"
+        )
+        if factored_tikhonov and ev_correction:
+            raise ValueError(
+                "factored_tikhonov inversion is incompatible with ev_correction: "
+                "the corrected eigenvalues do not factorize as λ_G ⊗ λ_A. Use a "
+                "different inversion (e.g. damped_inverse) or set ev_correction=False."
+            )
+
         lambda_dir = (
             "eigenvalue_correction_sharded" if ev_correction else "eigenvalue_sharded"
         )
         factor_eig_a = factor_eig_g = None
-        if inversion_cfg is not None and inversion_cfg.inversion == "factored_tikhonov":
+        if factored_tikhonov:
+            # factor_eig_a indexes the unsharded column dim I -> replicated, full
+            # [I]; factor_eig_g indexes the sharded row dim O -> row-sharded.
             factor_eig_a = load_replicated("factor_eig_a")  # replicated, full [I]
             factor_eig_g = load("factor_eig_g")  # row-sharded along O
         return cls(
@@ -214,7 +229,7 @@ class FactoredPreconditioner:
             inverse_eigvals = self.apply_fn(lam)
         else:
             o, i = g.shape[1], lam.shape[1]
-            mean = self._mul.global_mean(lam, o * i)
+            mean = self.shard_computer.global_mean(lam, o * i)
             inversion = self.inversion_cfg.inversion
             if inversion == "factored_tikhonov":
                 factor_a = self.factor_eig_a[name]
@@ -227,7 +242,7 @@ class FactoredPreconditioner:
                     factor_a=factor_a,
                     factor_g=factor_g,
                     mean_a=factor_a.clamp_min(0).mean(),
-                    mean_g=self._mul.global_mean(factor_g.clamp_min(0), o),
+                    mean_g=self.shard_computer.global_mean(factor_g.clamp_min(0), o),
                     power=self.power,
                 )
             else:
@@ -238,7 +253,7 @@ class FactoredPreconditioner:
                     self.inversion_cfg.damping_factor,
                     power=self.power,
                 )
-        self._mul.scale_rows_in_place(g, inverse_eigvals)
+        self.shard_computer.scale_rows_in_place(g, inverse_eigvals)
 
     def apply(self, grads: dict[str, Tensor]) -> dict[str, Tensor]:
         """Return ``grads`` with the factored inverse Hessian applied per module.
@@ -259,8 +274,8 @@ class FactoredPreconditioner:
             g = flat.to(q_a.device, torch.float32).view(-1, o, i)
 
             # Forward rotation: G' = Q_G^T @ G @ Q_A
-            g = self._mul._matmul(vector_nsa=g, matrix_cb=q_a)
-            g = self._mul._matmul(
+            g = self.shard_computer._matmul(vector_nsa=g, matrix_cb=q_a)
+            g = self.shard_computer._matmul(
                 vector_nsa=g.transpose(-2, -1), matrix_cb=q_g
             ).transpose(-2, -1)
             self.logger.debug("%s: rotated into eigenbasis (Q_G^T G Q_A)", name)
@@ -269,10 +284,10 @@ class FactoredPreconditioner:
             self.logger.debug("%s: scaled by inverse eigenvalues", name)
 
             # Rotate back: Q_G @ G' @ Q_A^T
-            g = self._mul._transpose_matmul(
+            g = self.shard_computer._transpose_matmul(
                 vector_nsa=g.transpose(-2, -1), matrix_cb=q_g
             ).transpose(-2, -1)
-            g = self._mul._transpose_matmul(vector_nsa=g, matrix_cb=q_a)
+            g = self.shard_computer._transpose_matmul(vector_nsa=g, matrix_cb=q_a)
             self.logger.debug("%s: rotated back (H^-1 G)", name)
 
             out[name] = g.reshape(flat.shape[0], -1).to(flat.dtype)
@@ -280,8 +295,9 @@ class FactoredPreconditioner:
 
 
 def is_factored_hessian(hessian_path: str | Path) -> bool:
-    """Whether ``hessian_path`` holds a factored (EKFAC) Hessian rather than a
-    dense one — detected by the presence of the eigenvector shard directory."""
+    """Whether ``hessian_path`` holds a Kronecker-factored (EKFAC) Hessian rather
+    than a dense one — detected by the presence of the eigenvector shard directory.
+    """
     return (Path(hessian_path) / "eigen_activation_sharded").is_dir()
 
 
@@ -319,9 +335,12 @@ def load_preconditioner(
     )
 
 
-def _load_full(hessian_path: str | Path, subdir: str) -> dict[str, Tensor]:
-    """Load every ``shard_*.safetensors`` under ``hessian_path/subdir`` and
-    concatenate each key along dim 0, reconstructing the full per-module tensors.
+def _load_full(
+    hessian_path: str | Path, subdir: str, device: str | torch.device
+) -> dict[str, Tensor]:
+    """Load every ``shard_*.safetensors`` under ``hessian_path/subdir`` onto
+    ``device`` and concatenate each key along dim 0, reconstructing the full
+    per-module tensors in fp32.
 
     The shards were written by row-splitting dim 0 with ``shard_bounds`` (rank 0
     takes the remainder), so concatenating in rank order is exact regardless of
@@ -336,18 +355,21 @@ def _load_full(hessian_path: str | Path, subdir: str) -> dict[str, Tensor]:
     if not shards:
         raise FileNotFoundError(f"No shard_*.safetensors found in {shard_dir}")
 
-    loaded = [load_file(s) for s in shards]
+    loaded = [load_file(s, device=str(device)) for s in shards]
     keys = loaded[0].keys()
-    return {name: torch.cat([shard[name] for shard in loaded], dim=0) for name in keys}
+    return {
+        name: torch.cat([shard[name] for shard in loaded], dim=0).to(torch.float32)
+        for name in keys
+    }
 
 
-def _load_shard(hessian_path: str | Path, subdir: str, rank: int) -> dict[str, Tensor]:
-    """Load this rank's shard of the factors under ``hessian_path/subdir``."""
-    return load_file(
-        os.path.join(str(hessian_path), subdir, f"shard_{rank}.safetensors")
+def _load_shard(
+    hessian_path: str | Path, subdir: str, rank: int, device: str | torch.device
+) -> dict[str, Tensor]:
+    """Load ``rank``'s shard of the factors under ``hessian_path/subdir``
+    onto ``device`` and cast to fp32."""
+    shard = load_file(
+        os.path.join(str(hessian_path), subdir, f"shard_{rank}.safetensors"),
+        device=str(device),
     )
-
-
-def _to(d: dict[str, Tensor], device: str | torch.device) -> dict[str, Tensor]:
-    """Move factors onto ``device`` in fp32 (the pipeline's working precision)."""
-    return {k: v.to(device=device, dtype=torch.float32) for k, v in d.items()}
+    return {k: v.to(torch.float32) for k, v in shard.items()}

@@ -13,7 +13,8 @@ Writing ``c = damping_factor`` and ``λ`` for an eigenvalue, with ``mean(λ)`` t
 mean over the whole spectrum:
 
 - ``damped_inverse``: ``1 / (λ + c·mean(λ))`` — uniform Tikhonov damping.
-- ``cauchy``: ``λ / (λ² + α²)`` with ``α = c·mean(λ)`` (Lorentzian filter).
+- ``tikhonov_filtered``: ``λ / (λ² + α²)`` with ``α = c·mean(λ)`` (the Tikhonov
+  filter factor; formerly named ``cauchy`` for its Lorentzian shape).
 - ``pseudoinverse``: ``1/λ`` where ``λ > c·mean(λ)``, else ``0``.
 - ``factored_tikhonov``: damping split across the Kronecker activation (A) and
   gradient (G) factors (see :func:`factored_tikhonov_damped`). This has no dense
@@ -26,14 +27,16 @@ from typing import Callable, Literal
 import torch
 from torch import Tensor
 
-Inversion = Literal["damped_inverse", "factored_tikhonov", "pseudoinverse", "cauchy"]
+Inversion = Literal[
+    "damped_inverse", "factored_tikhonov", "pseudoinverse", "tikhonov_filtered"
+]
 """Eigenvalue function used to invert a Hessian / preconditioner matrix."""
 
 INVERSIONS: tuple[Inversion, ...] = (
     "damped_inverse",
     "factored_tikhonov",
     "pseudoinverse",
-    "cauchy",
+    "tikhonov_filtered",
 )
 
 
@@ -43,14 +46,28 @@ def damped_inverse_eigfn(
     """Uniform Tikhonov damped inverse
     ``Let λ = eigenvals, c = damping_factor.``
     ``1 / (λ + c·mean(λ))``.
+
+    ``eigvals`` may be only this rank's shard of the spectrum, so ``mean`` is
+    passed in (the globally-reduced ``mean(λ)``) rather than recomputed here — a
+    local ``eigvals.mean()`` would be the per-shard mean, not the global one.
     """
     return (eigvals + damping_factor * mean).reciprocal()
 
 
-def cauchy_eigfn(eigenvals: Tensor, mean: Tensor, damping_factor: float) -> Tensor:
-    """Lorentzian/Tikhonov-filtered inverse
+def tikhonov_filtered_eigfn(
+    eigenvals: Tensor, mean: Tensor, damping_factor: float
+) -> Tensor:
+    """Tikhonov-filtered inverse (the Tikhonov filter factor)
     ``Let λ = eigenvals, c = damping_factor.``
     ``λ / (λ² + α²)``, ``α = c·mean(λ)``.
+
+    This is the per-eigenvalue action of the ridge / Tikhonov-regularized
+    least-squares solution ``(H² + α²I)⁻¹H`` — the standard filter factor for
+    regularizing ill-posed inverse problems. Unlike ``1/(λ + α)`` it decays to 0
+    as ``λ → 0`` rather than saturating at ``1/α``.
+
+    ``eigenvals`` may be a shard, so the
+    globally-reduced ``mean`` is passed in rather than recomputed.
     """
     alpha_sq = (damping_factor * mean) ** 2
     return eigenvals / (eigenvals * eigenvals + alpha_sq)
@@ -61,7 +78,10 @@ def pseudoinverse_eigfn(
 ) -> Tensor:
     """Truncated pseudoinverse
     ``Let λ = eigenvals, c = damping_factor.``
-    ``1/λ`` for ``λ > c·mean(λ)``, else ``0``."""
+    ``1/λ`` for ``λ > c·mean(λ)``, else ``0``.
+
+    ``eigenvals`` may be a shard, so the
+    globally-reduced ``mean`` is passed in rather than recomputed."""
     tol = damping_factor * mean
     return torch.where(
         eigenvals > tol, eigenvals.reciprocal(), torch.zeros_like(eigenvals)
@@ -74,7 +94,7 @@ def pseudoinverse_eigfn(
 # needs the per-factor A/G eigenvalues and only exists for the factored path.
 EIGENFNS: dict[str, Callable[[Tensor, Tensor, float], Tensor]] = {
     "damped_inverse": damped_inverse_eigfn,
-    "cauchy": cauchy_eigfn,
+    "tikhonov_filtered": tikhonov_filtered_eigfn,
     "pseudoinverse": pseudoinverse_eigfn,
 }
 

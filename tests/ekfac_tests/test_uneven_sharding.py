@@ -80,8 +80,8 @@ def _shard_worker(rank, world_size, port, result_dict):
                 mean_g=sharder.global_mean(lambda_g_shard.clamp_min(0), O),
             )
         )
-        results["cauchy"] = _scaled(
-            eigenvalue_multiplier("cauchy", lambda_shard, mean, 0.1)
+        results["tikhonov_filtered"] = _scaled(
+            eigenvalue_multiplier("tikhonov_filtered", lambda_shard, mean, 0.1)
         )
         results["pseudoinverse"] = _scaled(
             eigenvalue_multiplier("pseudoinverse", lambda_shard, mean, 0.1)
@@ -142,11 +142,11 @@ def test_sharded_ops_match_dense_with_uneven_shards():
         result_dict["factored_tikhonov"], grads * damped.reciprocal()
     )
 
-    # Cauchy and pseudoinverse dense references.
+    # Tikhonov-filtered and pseudoinverse dense references.
     mean = lambda_full.mean()
     alpha_sq = (0.1 * mean) ** 2
-    cauchy_mult = lambda_full / (lambda_full**2 + alpha_sq)
-    torch.testing.assert_close(result_dict["cauchy"], grads * cauchy_mult)
+    tikhonov_mult = lambda_full / (lambda_full**2 + alpha_sq)
+    torch.testing.assert_close(result_dict["tikhonov_filtered"], grads * tikhonov_mult)
 
     tol = 0.1 * mean
     pinv_mult = torch.where(

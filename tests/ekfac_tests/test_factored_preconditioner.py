@@ -38,12 +38,19 @@ def _make_query_gradients(query_path: str, grad_sizes: dict[str, int], num_grads
     index.flush()
 
 
-def _apply(hessian_path, query_path, out_path, inversion, damping_factor=0.1):
+def _apply(
+    hessian_path,
+    query_path,
+    out_path,
+    inversion,
+    damping_factor=0.1,
+    ev_correction=True,
+):
     cfg = EkfacConfig(
         hessian_method_path=hessian_path,
         gradient_path=query_path,
         run_path=out_path,
-        ev_correction=True,
+        ev_correction=ev_correction,
     )
     inversion_cfg = InversionConfig(inversion=inversion, damping_factor=damping_factor)
     EkfacApplicator(cfg, inversion_cfg=inversion_cfg).compute_ivhp_sharded()
@@ -69,9 +76,17 @@ def test_factored_matches_ekfac_applicator(
     query_path = str(tmp_path / "query")
     _make_query_gradients(query_path, grad_sizes, num_grads)
 
+    # factored_tikhonov assumes the eigenvalue grid factorizes as λ = λ_G ⊗ λ_A,
+    # which the EV-corrected eigenvalues do not; apply it to the uncorrected grid.
+    ev_correction = inversion != "factored_tikhonov"
+
     # Reference: the pipeline's file-based applicator (full inverse).
     ref = _apply(
-        hessian_path, query_path, str(tmp_path / f"out_{inversion}"), inversion
+        hessian_path,
+        query_path,
+        str(tmp_path / f"out_{inversion}"),
+        inversion,
+        ev_correction=ev_correction,
     )
     reference = {
         name: torch.from_numpy(np.asarray(ref[name][:])) for name in grad_sizes
@@ -87,7 +102,7 @@ def test_factored_matches_ekfac_applicator(
         hessian_path,
         inversion_cfg=InversionConfig(inversion=inversion, damping_factor=0.1),
         power=-1.0,
-        ev_correction=True,
+        ev_correction=ev_correction,
         device="cuda",
     )
     got = pre.apply(grads)

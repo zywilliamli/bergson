@@ -136,8 +136,20 @@ class ShardedMul:
         """
         if not self.dist:
             matrix_noi.mul_(inverse_eigvals_ci)
-            return
+        else:
+            self._sharded_scale_rows_in_place(matrix_noi, inverse_eigvals_ci)
 
+    def _sharded_scale_rows_in_place(
+        self,
+        matrix_noi: Float[Tensor, "n o i"],
+        inverse_eigvals_ci: Float[Tensor, "c i"],
+    ):
+        """Sharded in-place ``matrix_noi[:, row_block_r, :] *= inverse_eigvals_r``.
+
+        Each rank broadcasts its ``[c, i]`` row-shard of the inverse eigenvalues in
+        turn; every rank multiplies that shard into the matching ``[start:end]``
+        row block, so all ranks end with the fully-scaled ``matrix_noi``.
+        """
         o = matrix_noi.shape[1]
         for rank_index in range(self.world_size):
             start_row, end_row = self.shard_bounds(o, rank_index)

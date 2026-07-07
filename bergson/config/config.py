@@ -81,8 +81,8 @@ class InversionConfig(Serializable):
       Hessian, which has no Kronecker structure.
     - "pseudoinverse": ``1/λ`` where ``λ > c·mean(λ)``, else ``0`` (truncated
       Moore-Penrose pseudoinverse).
-    - "cauchy": ``λ / (λ² + α²)`` with ``α = c·mean(λ)`` (Lorentzian/Tikhonov-
-      filtered inverse)."""
+    - "tikhonov_filtered": ``λ / (λ² + α²)`` with ``α = c·mean(λ)`` — the
+      Tikhonov filter factor / ridge solution ``(H² + α²I)⁻¹H``."""
 
     damping_factor: float = 0.1
     """Damping / truncation strength, relative to the mean eigenvalue."""
