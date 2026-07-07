@@ -19,6 +19,7 @@ from ..config.config import (
     MixConfig,
     PreprocessConfig,
     QueryConfig,
+    RecallConfig,
     ScoreConfig,
     TrackstarConfig,
     TrainingConfig,
@@ -30,6 +31,7 @@ from ..hessians.hessian_approximations import approximate_hessians
 from ..magic import MagicConfig, run_magic
 from ..process_grads import mix_autocorrelation_matrices
 from ..query.query_index import query
+from ..recall.recall import run_recall
 from ..score.score import score_dataset
 from ..utils.worker_utils import validate_run_path
 
@@ -156,6 +158,17 @@ class Query(QueryConfig):
     def execute(self):
         """Query an existing gradient index."""
         query(self)
+
+
+@dataclass
+class Recall(RecallConfig):
+    """Evaluate attribution scores by synthetic factual recall (MRR, Recall@k)."""
+
+    def execute(self):
+        """Run the recall evaluation."""
+        assert self.scores, "Path to attribution scores must be provided."
+        save_run_config(self, self.run_path)
+        run_recall(self)
 
 
 @dataclass

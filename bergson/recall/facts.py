@@ -1,3 +1,9 @@
+"""Synthetic profile/fact generation for the factual-recall evaluation.
+
+Generation is fully seeded: the same ``(num_facts, seed)`` always yields
+identical rows.
+"""
+
 import random
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta

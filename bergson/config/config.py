@@ -379,6 +379,56 @@ class ValidationConfig(TrainingConfig, ABC):
 
 
 @dataclass
+class RecallDataConfig(Serializable):
+    """Identity of the cached synthetic-facts datasets used by ``recall``.
+
+    Datasets are generated once per ``(num_people, seed, single_paraphrase)``
+    and cached under ``data_dir`` with size-keyed names, e.g.
+    ``statements_1000p_seed0.hf`` / ``questions_1000p_seed0.hf``, so runs are
+    reproducible and datasets of different sizes coexist."""
+
+    num_people: int = 1000
+    """Number of synthetic people to generate facts for. Capped at the size
+    of the first-name list (~9333 with the stock ``names/`` files)."""
+
+    seed: int = 0
+    """Seed for profile generation. Part of the dataset identity."""
+
+    single_paraphrase: bool = False
+    """Keep only one statement per person and field, so each question has
+    exactly one gold document. By default every paraphrase template is kept
+    and retrieving any of them counts as a hit."""
+
+    data_dir: str = "data"
+    """Directory containing the ``names/`` and ``templates/`` source lists,
+    and where the generated ``*.hf`` datasets are cached."""
+
+
+@dataclass
+class RecallConfig(Serializable):
+    """Config for evaluating attribution scores by synthetic factual recall."""
+
+    run_path: str = field(positional=True)
+    """Directory to save results."""
+
+    scores: str = ""
+    """Path to a directory written by ``score`` containing ``scores.bin``
+    and ``info.json`` with one score column per question."""
+
+    data: RecallDataConfig = field(default_factory=RecallDataConfig)
+    """Identity of the synthetic facts datasets that were trained on and
+    scored. Statement/question paths are derived from this so they cannot
+    drift from what was scored."""
+
+    k: int = 10
+    """Cutoff for Recall@k."""
+
+    higher_is_better: bool = True
+    """True when a higher score means a stronger proponent of the query
+    (e.g. influence functions). False for unrolled differentiation."""
+
+
+@dataclass
 class AttentionConfig:
     """Config for splitting an attention module into head matrices."""
 

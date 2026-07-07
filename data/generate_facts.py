@@ -2,7 +2,7 @@ from argparse import ArgumentParser
 
 from datasets import Dataset
 
-from .dataset import fact_generator
+from bergson.recall.facts import fact_generator
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
