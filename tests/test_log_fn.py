@@ -61,6 +61,36 @@ def test_wandb_log_fn_reuses_existing_run():
         mock_wandb.log.assert_called_once_with({"train/loss": 1.5}, step=0)
 
 
+def test_wandb_log_fn_noop_when_wandb_mode_disabled(monkeypatch):
+    """With WANDB_MODE=disabled, wandb_log_fn is a no-op and never imports
+    wandb. This mirrors a MAGIC run with wandb_project set but wandb either
+    disabled or uninstalled: it must not crash post-training (bug repro
+    bug4_magic_wandb.py)."""
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+    # Make any attempt to import wandb blow up, proving we short-circuit first.
+    with patch.dict("sys.modules", {"wandb": None}):
+        log = wandb_log_fn("my-magic-run", config={"lr": 1e-4})
+
+        # Must return a callable no-op that does not raise.
+        assert callable(log)
+        assert log(0, 1.5) is None
+        assert log(7, 0.123) is None
+
+
+def test_wandb_log_fn_noop_when_wandb_missing(monkeypatch):
+    """If wandb is not importable, wandb_log_fn degrades to a no-op with a
+    warning instead of raising ModuleNotFoundError/ImportError."""
+    # Exercise the import path (not the WANDB_MODE=disabled short-circuit).
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    # sys.modules["wandb"] = None makes `import wandb` raise ImportError.
+    with patch.dict("sys.modules", {"wandb": None}):
+        with pytest.warns(UserWarning, match="wandb is not installed"):
+            log = wandb_log_fn("my-magic-run", config={"lr": 1e-4})
+
+        assert callable(log)
+        assert log(0, 1.5) is None
+
+
 def test_wandb_log_fn_falls_back_when_init_fails():
     """If wandb.init raises (e.g. dead daemon, bad auth, network), the caller
     gets a no-op log_fn and a warning, not an exception. Without this, a
