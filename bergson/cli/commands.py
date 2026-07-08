@@ -28,7 +28,7 @@ from ..config.config import (
 from ..config.config_io import save_run_config
 from ..diagnose import DiagnoseConfig, diagnose
 from ..hessians.hessian_approximations import approximate_hessians
-from ..magic import MagicConfig, run_magic
+from ..magic import MagicConfig, evaluate_retrained, run_magic
 from ..process_grads import mix_autocorrelation_matrices
 from ..query.query_index import query
 from ..recall.recall import run_recall
@@ -257,7 +257,15 @@ class Validate(ValidationConfig):
     scores: str = ""
     """Path to saved attribution scores for validation."""
 
+    retrained_dir: str = ""
+    """Optional: evaluate on an existing run directory of
+    leave-k-out re-trained models written with
+    ``save_retrained_models=true``."""
+
     def execute(self):
         """Run the validation."""
         assert self.scores, "Path to attribution scores must be provided."
-        run_magic(self, score_path=self.scores)
+        if self.retrained_dir:
+            evaluate_retrained(self, self.retrained_dir, score_path=self.scores)
+        else:
+            run_magic(self, score_path=self.scores)

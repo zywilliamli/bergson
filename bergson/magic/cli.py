@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import shutil
@@ -21,7 +22,7 @@ from torch.distributed._functional_collectives import (
 from torch.distributed.tensor import init_device_mesh
 from torchopt.pytree import tree_iter
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils.logging import (
     disable_progress_bar as hf_disable_pbar,
 )
@@ -352,6 +353,19 @@ def worker(
             os.path.join(run_cfg.run_path, "optimizer.pt"),
         )
 
+    if getattr(run_cfg, "save_retrained_models", False) and global_rank == 0:
+        # Persist the fully-trained (no leave-out) model alongside the per-subset
+        # models, so a later evaluate_retrained run can measure the query
+        # baseline from the bank itself instead of a separate base_model_dir.
+        base_dir = os.path.join(run_cfg.run_path, "retrained", "base")
+        os.makedirs(base_dir, exist_ok=True)
+        with fwd_state.activate(model), torch.no_grad():
+            model.save_pretrained(base_dir, safe_serialization=True)
+        base_tokenizer = AutoTokenizer.from_pretrained(
+            run_cfg.tokenizer or run_cfg.model
+        )
+        base_tokenizer.save_pretrained(base_dir)
+
     # If no query dataset is provided, skip backward and validation entirely
     if query_dataset is None:
         return
@@ -639,6 +653,157 @@ def run_magic(run_cfg: TrainingConfig, *, score_path: str = ""):
         [train_ds, query_ds, train_n, query_n, run_cfg, score_path],
         run_cfg.distributed,
     )
+
+
+def evaluate_retrained(
+    run_cfg: ValidationConfig,
+    retrained_dir: str,
+    *,
+    score_path: str = "",
+):
+    """Evaluate a bank of pre-saved leave-k-out models on a query, no retraining.
+
+    Reads models written by an earlier run with
+    ``save_retrained_models=true`` and evaluates attribution scores. No training
+    happens so evaluation is cheap.
+    """
+    assert score_path, "evaluate_retrained requires precomputed --scores"
+    src = Path(retrained_dir)
+    models_root = src / "retrained"
+    subsets_path = src / "subsets.json"
+    if not subsets_path.exists():
+        raise FileNotFoundError(
+            f"{subsets_path} not found; retrained_dir must point at a run "
+            f"directory written with save_retrained_models=true"
+        )
+
+    run_path = Path(run_cfg.run_path)
+    run_path.mkdir(parents=True, exist_ok=True)
+    save_run_config(run_cfg, run_path)
+
+    # Row i of subsets.json lists the doc ids left out of retrained/subset_i, so
+    # scores[subsets[i]] is the summed attribution of exactly what model i drops.
+    with open(subsets_path) as f:
+        subset_lists = json.load(f)
+    subsets = [torch.tensor(s, dtype=torch.long) for s in subset_lists]
+
+    # Load per-query attribution scores (mirrors run_magic's score loading).
+    if os.path.isdir(score_path):
+        scores = torch.from_numpy(load_scores(Path(score_path))[:])
+        score_cfg = load_subconfig(score_path, "score_cfg", ScoreConfig)
+        if score_cfg is not None and score_cfg.higher_is_better:
+            scores = -scores
+    else:
+        scores = torch.load(score_path, map_location="cpu")
+    assert (
+        scores.ndim == 1 or scores.shape[1] == 1
+    ), "evaluate_retrained expects per-doc (1D) scores"
+    scores = scores.flatten()
+
+    max_idx = max((int(s.max()) for s in subsets if len(s)), default=-1)
+    if max_idx >= len(scores):
+        raise ValueError(
+            f"subsets.json references doc id {max_idx} but scores has only "
+            f"{len(scores)} entries -- the query must be scored against the same "
+            f"training set and seed used to build the retrained bank"
+        )
+
+    # Build the query stream on a single device (no distributed training here).
+    device = get_device(0)
+    query_ds, query_n = setup_data_pipeline(run_cfg, run_cfg.query)
+    query_ds, query_n, q_pad, q_weight_pad = pad_dataset_to_batch_size(
+        query_ds, run_cfg.batch_size, query_n, "Query", 0
+    )
+    if len(query_ds) < run_cfg.batch_size:
+        raise ValueError(
+            f"Query dataset has {len(query_ds)} examples, fewer than "
+            f"batch_size={run_cfg.batch_size}. Use a larger query split or "
+            f"smaller batch_size."
+        )
+    query_stream = DataStream(
+        query_ds,
+        run_cfg.batch_size,
+        device=device,
+        input_key=run_cfg.query.prompt_column,
+        weight_shape=(query_n,),
+    )
+    if q_pad:
+        query_stream.weights.data[-q_weight_pad:] = 0.0
+
+    hf_disable_pbar()
+    hf_set_verbosity_error()
+
+    def query_loss(model: torch.nn.Module) -> float:
+        """Mean query loss for an already-loaded model."""
+        model.eval()
+        total = torch.tensor(0.0, device=device)
+        with torch.no_grad():
+            for batch in query_stream:
+                del batch["example_weight"]
+                total += model(**batch).loss.detach() / len(query_stream)
+        return float(total)
+
+    # The bank's no-leave-out model (retrained/base) gives the query baseline;
+    # absent it, baseline stays 0 (correlation-safe).
+    base_dir = models_root / "base"
+    baseline = 0.0
+    if base_dir.exists():
+        base = AutoModelForCausalLM.from_pretrained(
+            base_dir, dtype=torch.float32, attn_implementation="eager"
+        ).to(device)
+        baseline = query_loss(base)
+        del base
+        print(f"Baseline query loss (no leave-out) from {base_dir}: {baseline}")
+
+    csv_path = os.path.join(run_cfg.run_path, "validation.csv")
+    val_csv_writer = CSVWriter(csv_path, columns=["subset", "diff", "score_sum"])
+
+    diffs: list[float] = []
+    score_sums: list[float] = []
+    pbar = tqdm(range(len(subsets)), desc="Evaluating")
+    for i in pbar:
+        model_dir = models_root / f"subset_{i}"
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, dtype=torch.float32, attn_implementation="eager"
+        ).to(device)
+        loss = query_loss(model)
+        del model
+
+        diff = baseline - loss
+        score_sum = scores[subsets[i]].sum().item()
+        val_csv_writer.writerow(i, diff, score_sum)
+
+        diffs.append(diff)
+        score_sums.append(score_sum)
+        if len(diffs) >= 2:
+            sp = spearmanr(diffs, score_sums)
+            pe = pearsonr(diffs, score_sums)
+            pbar.set_postfix({"rho": sp.statistic, "r": pe.statistic})
+
+    val_csv_writer.close()
+    print(f"Saved validation data to {csv_path}")
+
+    sp = spearmanr(diffs, score_sums)
+    pe = pearsonr(diffs, score_sums)
+    print(
+        f"Spearman: {sp.statistic:.4f} (p={sp.pvalue:.2e})  "
+        f"Pearson: {pe.statistic:.4f} (p={pe.pvalue:.2e})"
+    )
+    summary_csv_writer = CSVWriter(
+        os.path.join(run_cfg.run_path, "summary.csv"),
+        columns=[
+            "spearman_corr",
+            "spearman_p",
+            "pearson_corr",
+            "pearson_p",
+            "N",
+            "baseline_loss",
+        ],
+    )
+    summary_csv_writer.writerow(
+        sp.statistic, sp.pvalue, pe.statistic, pe.pvalue, len(subsets), baseline
+    )
+    summary_csv_writer.close()
 
 
 def main():
