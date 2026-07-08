@@ -1,7 +1,6 @@
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -13,9 +12,7 @@ from torch import Tensor
 from bergson.builder import Builder
 from bergson.collector.collector import HookCollectorBase
 from bergson.config import IndexConfig, PreprocessConfig
-from bergson.process_autocorrelation import process_autocorrelation_matrices
 from bergson.score.scorer import Scorer
-from bergson.utils.projection import make_global_projector
 from bergson.utils.utils import get_gradient_dtype
 
 
@@ -47,9 +44,10 @@ class GradientCollector(HookCollectorBase):
     scorer: Scorer | None = None
     """Optional scorer for computing scores instead of building an index."""
 
-    global_projector: Any = None
-    """Lazily-built TRAK projector used when
-    ``processor.projection_target == 'global'``."""
+    skip_index: bool = False
+    """Collect gradients into ``mod_grads`` without writing an on-disk index
+    (e.g. batch-size probing or gradient inspection). No effect when a
+    ``scorer`` is set, since scoring already skips the index."""
 
     def setup(self) -> None:
         """
@@ -80,7 +78,7 @@ class GradientCollector(HookCollectorBase):
         )
 
         # Compute whether we need to save the index
-        self.save_index = self.scorer is None and not self.cfg.skip_index
+        self.save_index = self.scorer is None and not self.skip_index
 
         if self.save_index:
             grad_sizes = {name: math.prod(s) for name, s in self.shapes().items()}
@@ -97,23 +95,27 @@ class GradientCollector(HookCollectorBase):
 
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
-        """Compute per-sample gradient, accumulate autocorrelation matrix, and store."""
+        """Compute the per-sample gradient and store it for the index."""
         name: str = module._name  # type: ignore[assignment]
         P = self._compute_gradient(module, g)
 
         global_proj = self.processor.projection_target == "global"
 
-        # Collect per-module hessians when projection target is per_module
-        if not self.cfg.skip_hessians and not global_proj:
-            P = P.float()
-            if name in self.processor.hessians:
-                self.processor.hessians[name].addmm_(P.mT, P)
-            else:
-                self.processor.hessians[name] = P.mT @ P
-
         if global_proj:
-            # Keep on-device until the global projection runs in process_batch.
-            self.mod_grads[name] = P
+            assert self.processor.projection_dim is not None
+            R = self.projection(
+                name,
+                self.processor.projection_dim,
+                P.shape[1],
+                "single",
+                P.device,
+                P.dtype,
+            )
+            projected = P @ R.T  # [N, proj_dim]
+            if "gradients" in self.mod_grads:
+                self.mod_grads["gradients"].add_(projected)
+            else:
+                self.mod_grads["gradients"] = projected
         elif self.save_index and self.preprocess_cfg.aggregation == "none":
             # Asynchronously move the gradient to CPU and convert to the final
             # dtype
@@ -123,66 +125,15 @@ class GradientCollector(HookCollectorBase):
         else:
             self.mod_grads[name] = P.to(dtype=self.save_dtype)
 
-    def global_project(self) -> None:
-        """Concatenate per-module per-example gradients and project.
-        Sets ``self.mod_grads`` to ``{"gradients": projected}``.
-
-        Projects in row-chunks. A naive ``flat = torch.cat(..., dim=1)`` of
-        all module gradients can need tens of GiB contiguous on rank 0 when
-        the bin-packer assigns many short examples to a single batch (e.g.
-        flan_v2 with token_batch_size=2048 packs ~80 rows of ~525 MB each).
-        The projector is per-row, so chunking is exact; chunk size is sized
-        to a fixed GPU-byte budget.
-        """
-        # backward_hook fires in reverse forward order, so insertion order in
-        # mod_grads is deterministic for a given model.
-        parts = list(self.mod_grads.values())
-        n_rows = parts[0].shape[0]
-        total_grad_dim: int = sum(int(math.prod(P.shape[1:])) for P in parts)
-
-        if self.global_projector is None:
-            assert self.processor.projection_dim is not None
-            self.global_projector = make_global_projector(
-                grad_dim=total_grad_dim,
-                proj_dim=self.processor.projection_dim,
-                device=parts[0].device,
-                dtype=parts[0].dtype,
-                projection_type=self.processor.projection_type,
-            )
-
-        # Cap chunk_flat at ~4 GiB per chunk to leave headroom for fast_jl's
-        # internal scratch buffers alongside the per-module tensors that stay
-        # alive until the loop exits.
-        bytes_per_row = total_grad_dim * parts[0].element_size()
-        chunk_rows = max(1, (4 * 1024**3) // max(bytes_per_row, 1))
-        chunk_rows = min(chunk_rows, n_rows)
-
-        chunks_cpu: list[torch.Tensor] = []
-        for start in range(0, n_rows, chunk_rows):
-            end = min(start + chunk_rows, n_rows)
-            chunk_flat = torch.cat(
-                [P[start:end].reshape(end - start, -1) for P in parts], dim=1
-            )
-            chunk_projected = self.global_projector.project(chunk_flat, model_id=0)
-            chunks_cpu.append(
-                chunk_projected.to(
-                    device="cpu", dtype=self.save_dtype, non_blocking=True
-                )
-            )
-            del chunk_flat, chunk_projected
-
-        # Free per-module GPU tensors now that all chunks are projected.
-        self.mod_grads = {}
-
-        self.mod_grads = {"gradients": torch.cat(chunks_cpu, dim=0)}
-
     def process_batch(self, indices: list[int], **kwargs):
         """Process collected gradients for a batch and update losses."""
         losses = kwargs.get("losses")
         assert losses is not None, "losses must be provided in kwargs"
 
         if self.processor.projection_target == "global":
-            self.global_project()
+            self.mod_grads["gradients"] = self.mod_grads["gradients"].to(
+                device="cpu", dtype=self.save_dtype, non_blocking=True
+            )
 
         if self.builder:
             self.builder(indices, self.mod_grads)
@@ -200,16 +151,6 @@ class GradientCollector(HookCollectorBase):
         ), "cfg is required for GradientCollector"  # pleasing type checker
         if dist.is_initialized():
             dist.reduce(self.per_doc_losses, dst=0)
-
-        grad_sizes = {name: math.prod(s) for name, s in self.shapes().items()}
-        if self.processor.hessians:
-            process_autocorrelation_matrices(
-                self.processor,
-                self.processor.hessians,
-                len(self.data),
-                grad_sizes,
-                self.rank,
-            )
 
         if self.builder:
             self.builder.teardown()
@@ -246,8 +187,7 @@ class TraceCollector(HookCollectorBase):
     Collects gradient traces for influence function computation.
 
     Accumulates per-sample gradients across batches in memory (as lists per module).
-    Optionally applies preconditioning using eigendecomposition of the gradient
-    covariance. Designed for query-time gradient collection rather than index building.
+    Designed for query-time gradient collection rather than index building.
     """
 
     mod_grads: dict = field(default_factory=lambda: defaultdict(list))
@@ -266,7 +206,7 @@ class TraceCollector(HookCollectorBase):
 
     @HookCollectorBase.split_attention_heads
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
-        """Compute per-sample gradient, optionally precondition, and store."""
+        """Compute and store the per-sample gradient."""
         name: str = module._name  # type: ignore[assignment]
         P = self._compute_gradient(module, g)
 

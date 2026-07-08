@@ -1,4 +1,3 @@
-import csv
 import os
 import random
 import shutil
@@ -22,10 +21,22 @@ from torch.distributed._functional_collectives import (
 from torch.distributed.tensor import init_device_mesh
 from torchopt.pytree import tree_iter
 from tqdm import tqdm
+from transformers import AutoTokenizer
+from transformers.utils.logging import (
+    disable_progress_bar as hf_disable_pbar,
+)
+from transformers.utils.logging import (
+    set_verbosity_error as hf_set_verbosity_error,
+)
 
-from ..config import ScoreConfig, TrainingConfig, ValidationConfig
+from ..config.config import ScoreConfig, TrainingConfig, ValidationConfig
+from ..config.config_io import load_subconfig, save_run_config
 from ..data import load_scores
 from ..distributed import grad_tree, launch_distributed_run
+from ..utils.csv_writer import CSVWriter
+from ..utils.load_from_optimizer import (
+    save_second_moments_as_optimizer_pt,
+)
 from ..utils.logging import wandb_log_fn
 from ..utils.utils import get_device, get_device_index
 from ..utils.worker_utils import (
@@ -52,12 +63,18 @@ def compute_query_gradients(
     Iterates over the query stream, computing per-batch parameter gradients
     and reducing them (mean or sum) into a single gradient dict.
     """
+    denom = len(query_stream)
     grad_accum: dict[str, torch.Tensor] | None = None
     loss_accum = 0.0
-    denom = len(query_stream) * (dist.get_world_size() if dist.is_initialized() else 1)
+
+    if dist.is_initialized():
+        denom *= dist.get_world_size()
+        main = dist.get_rank() == 0
+    else:
+        main = True
 
     with fwd_state.activate(model) as params:
-        for batch in tqdm(query_stream, desc="Query"):
+        for batch in tqdm(query_stream, desc="Query", disable=not main):
             del batch["example_weight"]
             loss = model(**batch).loss
             grads = grad_tree(loss, params)
@@ -81,15 +98,15 @@ def compute_query_gradients(
     if dist.is_initialized():
         if not fsdp:
             grad_accum = {
-                k: differentiable_all_reduce(
-                    g,
-                    "sum",
-                    dist.distributed_c10d._get_default_group(),
+                k: wait_tensor(
+                    differentiable_all_reduce(
+                        g,
+                        "sum",
+                        dist.distributed_c10d._get_default_group(),
+                    )
                 )
                 for k, g in grad_accum.items()
             }
-            for g in grad_accum.values():
-                wait_tensor(g)
 
         # Loss is never a DTensor
         dist.all_reduce(loss_accum)
@@ -97,35 +114,7 @@ def compute_query_gradients(
     return grad_accum, float(loss_accum)
 
 
-class CSVWriter:
-    """CSV writer that no-ops when disabled."""
-
-    def __init__(self, path: str, columns: list[str], enabled: bool = True):
-        self.path = path
-        if enabled:
-            self._file = open(path, "w", newline="")
-            self._writer = csv.writer(self._file)
-            self._writer.writerow(columns)
-        else:
-            self._file = None
-            self._writer = None
-
-    def writerow(self, *args):
-        if self._writer is None or self._file is None:
-            return
-        self._writer.writerow([*args])
-        self._file.flush()
-
-    def close(self):
-        if self._file is not None:
-            self._file.close()
-
-
-def prepare_trainer(
-    cfg: TrainingConfig,
-    rank: int,
-    schedule: Callable,
-):
+def prepare_trainer(cfg: TrainingConfig, rank: int, schedule: Callable):
     """Prepare the model, optimizer, and trainer for training."""
     model, target_modules = setup_model_and_peft(
         cfg,
@@ -279,6 +268,11 @@ def worker(
 ):
     torch.cuda.set_device(get_device_index(rank))
 
+    # For each non-main local rank, suppress HF info and warning messages
+    if rank != 0:
+        hf_disable_pbar()
+        hf_set_verbosity_error()
+
     if world_size > 1:
         addr = os.environ.get("MASTER_ADDR", "localhost")
         port = os.environ.get("MASTER_PORT", "29500")
@@ -335,20 +329,10 @@ def worker(
         dist.barrier()
 
     schedule = run_cfg.lr_schedule.get_schedule(len(stream))
-    trainer, fwd_state, model = prepare_trainer(
-        run_cfg,
-        rank,
-        schedule,
-    )
+    trainer, fwd_state, model = prepare_trainer(run_cfg, rank, schedule)
 
     ckpts_path = os.path.join(run_cfg.run_path, "checkpoints")
-    path0 = os.path.join(ckpts_path, "state0.pt")
-
-    resume = run_cfg.resume and os.path.exists(path0)
-
-    save_fut = None
-    if not resume:
-        save_fut = fwd_state.save(path0)
+    resume = run_cfg.resume
 
     fwd_state = trainer.train(
         fwd_state,
@@ -361,9 +345,12 @@ def worker(
         resume=resume,
         fsdp=run_cfg.fsdp,
     )
-
-    if save_fut is not None:
-        save_fut.result()  # ensure state0 is saved before validation loads it
+    if getattr(run_cfg, "save_optimizer_state", False) and global_rank == 0:
+        save_second_moments_as_optimizer_pt(
+            model,  # type: ignore[reportArgumentType]
+            fwd_state.opt_state,
+            os.path.join(run_cfg.run_path, "optimizer.pt"),
+        )
 
     # If no query dataset is provided, skip backward and validation entirely
     if query_dataset is None:
@@ -424,6 +411,7 @@ def worker(
             stream,
             bwd_state,
             fwd_state,
+            cleanup=run_cfg.cleanup_ckpts,
             debug=run_cfg.debug,
             inplace=True,
             fsdp=run_cfg.fsdp,
@@ -452,8 +440,8 @@ def worker(
             print(f"Saved attribution scores to {score_path}")
     elif os.path.isdir(score_path):
         scores = torch.from_numpy(load_scores(Path(score_path))[:])
-        cfg_path = Path(score_path) / "score_config.yaml"
-        if cfg_path.exists() and ScoreConfig.load(cfg_path).higher_is_better:
+        score_cfg = load_subconfig(score_path, "score_cfg", ScoreConfig)
+        if score_cfg is not None and score_cfg.higher_is_better:
             scores = -scores
     else:
         scores = torch.load(score_path, map_location="cpu")
@@ -471,6 +459,9 @@ def worker(
 
     stream.requires_grad = False
 
+    if getattr(run_cfg, "skip_validation", False):
+        return
+
     # Validate attribution scores via leave-subset-out retraining
     diffs = []
     score_sums = []
@@ -485,20 +476,30 @@ def worker(
 
     if run_cfg.subset_strategy == "random":
         rng = torch.Generator().manual_seed(run_cfg.seed)
-        perm = valid_indices[torch.randperm(len(valid_indices), generator=rng)]
-    elif run_cfg.subset_strategy == "sorted":
+        if run_cfg.subset_fraction > 0:
+            # Draw potentially overlapping samples
+            subset_size = max(1, round(run_cfg.subset_fraction * len(valid_indices)))
 
-        perm = valid_indices[scores[valid_indices].argsort()]
+            subsets = [
+                valid_indices[
+                    torch.randperm(len(valid_indices), generator=rng)[:subset_size]
+                ]
+                for _ in range(run_cfg.num_subsets)
+            ]
+        else:
+            # Draw non-overlapping samples
+            perm = valid_indices[torch.randperm(len(valid_indices), generator=rng)]
+
+            # Shuffle the order of the subsets so that the estimate of
+            # correlation on the progress bar is unbiased. This does not change
+            # the final correlation since all subsets are eventually evaluated,
+            # but prevents the early subsets from being biased towards higher
+            # or lower scores.
+            subsets = list(perm.chunk(run_cfg.num_subsets))
+            rng = random.Random(run_cfg.seed)
+            rng.shuffle(subsets)
     else:
-        raise ValueError(f"Unsupported subset strategy: {run_cfg.subset_strategy}")
-
-    # Shuffle the order of the subsets so that the estimate of correlation on the
-    # progress bar is unbiased. This does not change the final correlation since all
-    # subsets are eventually evaluated, but prevents the early subsets from being
-    # biased towards higher or lower scores.
-    subsets = list(perm.chunk(run_cfg.num_subsets))
-    rng = random.Random(run_cfg.seed)
-    rng.shuffle(subsets)
+        raise ValueError(f"Unknown subset strategy: {run_cfg.subset_strategy}")
 
     csv_path = os.path.join(run_cfg.run_path, "validation.csv")
     val_csv_writer = CSVWriter(
@@ -507,9 +508,21 @@ def worker(
         enabled=global_rank == 0,
     )
 
+    # Disable annoying repetitive model loading messages, even on rank 0
+    hf_disable_pbar()
+    hf_set_verbosity_error()
+
+    # Optionally persist each retrained model for later attribution queries.
+    save_models = getattr(run_cfg, "save_retrained_models", False)
+    retrained_tokenizer = None
+    if save_models and global_rank == 0:
+        retrained_tokenizer = AutoTokenizer.from_pretrained(
+            run_cfg.tokenizer or run_cfg.model
+        )
+
     pbar = tqdm(subsets, desc="Validating", disable=global_rank != 0)
     for i, subset in enumerate(pbar):
-        fwd_state.load(path0)
+        trainer, fwd_state, model = prepare_trainer(run_cfg, rank, schedule)
         fwd_state.detach_()
 
         stream.weights.fill_(1.0)
@@ -522,6 +535,14 @@ def worker(
 
         for x in stream:
             fwd_state = trainer.step(fwd_state, x, inplace=True, fsdp=run_cfg.fsdp)
+
+        if save_models and global_rank == 0:
+            out_dir = os.path.join(run_cfg.run_path, "retrained", f"subset_{i}")
+            os.makedirs(out_dir, exist_ok=True)
+            with fwd_state.activate(model), torch.no_grad():
+                model.save_pretrained(out_dir, safe_serialization=True)
+            if retrained_tokenizer is not None:
+                retrained_tokenizer.save_pretrained(out_dir)
 
         with fwd_state.activate(model), torch.no_grad():
             loss = torch.tensor(0.0, device=stream.weights.device)
@@ -588,7 +609,7 @@ def run_magic(run_cfg: TrainingConfig, *, score_path: str = ""):
                 )
 
         run_path.mkdir(parents=True, exist_ok=True)
-        run_cfg.save_yaml(run_path / "run_config.yaml")
+        save_run_config(run_cfg, run_path)
 
     # HF datasets caches are not safe for concurrent writers, so the main node
     # must finish populating the cache before others read from it.

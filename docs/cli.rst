@@ -112,3 +112,24 @@ runs hessian fitting, build, and score as a single pipeline (see :doc:`trackstar
        --query.dataset NeelNanda/pile-10k \
        --query.truncation \
        --projection_dim 16
+
+.. autoclass:: bergson.__main__.Recall
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+``recall`` evaluates attribution scores by synthetic factual recall: a model is
+trained on generated fact *statements* and queried with the matching
+*questions*; scores from ``score`` are ranked per question and reported as MRR
+and Recall@k against the gold (entailing) statements. Datasets are generated
+once per ``(num_people, seed)`` and cached (e.g.
+``data/statements_1000p_seed0.hf``). See
+``examples/pipelines/recall_synthetic.yaml`` for the full pipeline.
+
+**Example:**
+
+.. code-block:: bash
+
+   bergson recall runs/my-recall \
+       --scores runs/my-scores \
+       --num_people 1000

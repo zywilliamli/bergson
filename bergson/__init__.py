@@ -1,4 +1,4 @@
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 
 import logging
 
@@ -7,7 +7,7 @@ from .collection import collect_gradients
 from .collector.collector import CollectorComputer
 from .collector.gradient_collectors import GradientCollector
 from .collector.in_memory_collector import InMemoryCollector
-from .config import (
+from .config.config import (
     AttentionConfig,
     DataConfig,
     IndexConfig,

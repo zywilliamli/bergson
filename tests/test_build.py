@@ -1,4 +1,3 @@
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -12,51 +11,11 @@ from bergson.data import load_gradients
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_build_e2e(tmp_path: Path):
-    result = subprocess.run(
-        [
-            "python",
-            "-m",
-            "bergson",
-            "build",
-            "test_e2e",
-            "--model",
-            "EleutherAI/pythia-14m",
-            "--dataset",
-            "NeelNanda/pile-10k",
-            "--split",
-            "train[:100]",
-            "--truncation",
-            "--projection_dim",
-            "4",
-            "--token_batch_size",
-            "1024",
-            "--precision",
-            "bf16",
-        ],
-        cwd=tmp_path,
-        capture_output=True,  # Add this
-        text=True,  # Add this to get strings instead of bytes
-    )
-
-    assert "Error" not in result.stderr, f"Error found in stderr:\n{result.stderr}"
-
-    processor = GradientProcessor.load(tmp_path / "test_e2e")
-
-    assert processor.hessians is not None
-    assert processor.hessians_eigen is not None
-
-    assert len(processor.hessians) > 0
-    assert len(processor.hessians_eigen) > 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_build_consistency(tmp_path: Path, model, dataset):
     model = model.float()
 
     cfg = IndexConfig(
         run_path=str(tmp_path),
-        skip_hessians=True,
         token_batch_size=1024,
         loss_reduction="mean",
     )
@@ -128,9 +87,6 @@ def test_conv1d_build(tmp_path: Path, dataset):
 
     cfg = IndexConfig(
         run_path=str(tmp_path),
-        # This build hangs in pytest with hessians enabled.
-        # It works when run directly so it may be a pytest issue.
-        skip_hessians=True,
         # GPT-2 model_max_length is 1024
         token_batch_size=1024,
     )

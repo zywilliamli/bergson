@@ -199,3 +199,5 @@ zeki_requirements.txt
 *package.json
 david_wips/
 test_files/
+scripts/
+logs/

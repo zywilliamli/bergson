@@ -12,7 +12,7 @@ from torch import Tensor, nn
 
 from bergson.builder import Builder
 from bergson.collector.collector import HookCollectorBase
-from bergson.config import IndexConfig, PreprocessConfig
+from bergson.config.config import IndexConfig, PreprocessConfig
 from bergson.process_autocorrelation import (
     process_autocorrelation_matrices,
 )
@@ -39,6 +39,9 @@ class InMemoryCollector(HookCollectorBase):
 
     cfg: IndexConfig
     """Configuration for gradient collection."""
+
+    skip_hessians: bool = True
+    """Whether to skip estimating autocorrelation hessian statistics."""
 
     mod_grads: dict = dc_field(default_factory=dict)
     """Temporary per-batch gradients keyed by module name."""
@@ -138,7 +141,7 @@ class InMemoryCollector(HookCollectorBase):
         name: str = module._name  # type: ignore[assignment]
         P = self._compute_gradient(module, g)
 
-        if not self.cfg.skip_hessians:
+        if not self.skip_hessians:
             P = P.float()
             if name in self.processor.hessians:
                 self.processor.hessians[name].addmm_(P.mT, P)

@@ -8,6 +8,8 @@ from typing import Literal
 import torch
 from simple_parsing import Serializable, field
 
+from ..hessians.inversion import Inversion
+
 
 @dataclass
 class DataConfig(Serializable):
@@ -62,6 +64,28 @@ class DataConfig(Serializable):
                 raise ValueError(
                     "chunk_length and format_template cannot both be specified"
                 )
+
+
+@dataclass
+class InversionConfig(Serializable):
+    inversion: Inversion = "damped_inverse"
+    """Eigenvalue function used to invert a Hessian with regularization.
+    Setting ``c = damping_factor`` and ``λ`` for an eigenvalue:
+
+    - "damped_inverse" (default): ``1 / (λ + c·mean(λ))`` — uniform Tikhonov
+      damping.
+    - "factored_tikhonov": damped inverse with the damping split across the
+      activation (A) and gradient (G) Kronecker factors via the Martens &
+      Grosse trace ratio ``π = sqrt(mean(λ_A) / mean(λ_G))``. Factored EKFAC
+      only; falls back to ``damped_inverse`` for the dense autocorrelation
+      Hessian, which has no Kronecker structure.
+    - "pseudoinverse": ``1/λ`` where ``λ > c·mean(λ)``, else ``0`` (truncated
+      Moore-Penrose pseudoinverse).
+    - "tikhonov_filtered": ``λ / (λ² + α²)`` with ``α = c·mean(λ)`` — the
+      Tikhonov filter factor / ridge solution ``(H² + α²I)⁻¹H``."""
+
+    damping_factor: float = 0.1
+    """Damping / truncation strength, relative to the mean eigenvalue."""
 
 
 @dataclass
@@ -305,11 +329,19 @@ class TrainingConfig(AttributionConfig, Serializable):
     """Beta2 for AdamW optimizer."""
 
     eps_root: float = 1e-8
-    """Epsilon root for AdamW optimizer."""
+    """Epsilon root for AdamW optimizer.
+
+    Note for TrackStar attribution: Adam normalization with a non-zero
+    eps_root is untested. We recommend setting it to zero."""
 
     optimizer: Literal["adamw", "muon", "sgd"] = "adamw"
     """Optimizer to use for the training steps. Muon is an efficient
     optimizer that can reduce memory usage and speed up training."""
+
+    save_optimizer_state: bool = False
+    """After training, export the optimizer's second moments to
+    ``<run_path>/optimizer.pt`` for use as an attribution normalizer.
+    AdamW only."""
 
     weight_decay: float = 0.01
     """Weight decay coefficient for AdamW and Muon."""
@@ -340,13 +372,74 @@ class ValidationConfig(TrainingConfig, ABC):
     num_subsets: int = 100
     """Number of leave-k-out subsets for Spearman correlation."""
 
-    subset_strategy: Literal["random", "sorted"] = "sorted"
+    subset_strategy: Literal["random"] = "random"
     """Strategy for selecting leave-k-out subsets for validation."""
 
     exclude_zero_scores: bool = False
     """When True, drop doc_ids with score == 0 from the validation
     permutation. These scores may be produced by items with fewer than
     2 tokens."""
+
+    save_retrained_models: bool = False
+    """When True, save each leave-k-out retrained model (HF format, weights +
+    tokenizer) to ``<run_path>/retrained/subset_<i>/`` so it can be reused for
+    later attribution queries without retraining. ~0.5 GB per subset for GPT-2."""
+
+    subset_fraction: float = 0.0
+    """When > 0, each of the ``num_subsets`` leave-k-out subsets is an
+    independent draw (without replacement within a subset, overlapping across
+    subsets) of ``round(subset_fraction * pool)`` docs from the validation
+    pool — e.g. 0.05 drops 5 percent of the data per subset."""
+
+
+@dataclass
+class RecallDataConfig(Serializable):
+    """Identity of the cached synthetic-facts datasets used by ``recall``.
+
+    Datasets are generated once per ``(num_people, seed, single_paraphrase)``
+    and cached under ``data_dir`` with size-keyed names, e.g.
+    ``statements_1000p_seed0.hf`` / ``questions_1000p_seed0.hf``, so runs are
+    reproducible and datasets of different sizes coexist."""
+
+    num_people: int = 1000
+    """Number of synthetic people to generate facts for. Capped at the size
+    of the first-name list (~9333 with the stock ``names/`` files)."""
+
+    seed: int = 0
+    """Seed for profile generation. Part of the dataset identity."""
+
+    single_paraphrase: bool = False
+    """Keep only one statement per person and field, so each question has
+    exactly one gold document. By default every paraphrase template is kept
+    and retrieving any of them counts as a hit."""
+
+    data_dir: str = "data"
+    """Directory containing the ``names/`` and ``templates/`` source lists,
+    and where the generated ``*.hf`` datasets are cached."""
+
+
+@dataclass
+class RecallConfig(Serializable):
+    """Config for evaluating attribution scores by synthetic factual recall."""
+
+    run_path: str = field(positional=True)
+    """Directory to save results."""
+
+    scores: str = ""
+    """Path to a directory written by ``score`` containing ``scores.bin``
+    and ``info.json`` with one score column per question."""
+
+    data: RecallDataConfig = field(default_factory=RecallDataConfig)
+    """Identity of the synthetic facts datasets that were trained on and
+    scored. Statement/question paths are derived from this so they cannot
+    drift from what was scored."""
+
+    k: int = 10
+    """Cutoff for Recall@k."""
+
+    higher_is_better: bool = True
+    """True when a higher score means a stronger proponent of the query
+    (e.g. influence functions). False for unrolled differentiation."""
 
 
 @dataclass
@@ -381,8 +474,8 @@ class IndexConfig(AttributionConfig, Serializable):
 
     projection_target: Literal["per_module", "global"] = "per_module"
     """Projection target. ``per_module`` does a double-sided random projection of
-    each module gradient. ``global`` flattens the per-example gradient across
-    all tracked modules and projects that to ``projection_dim``."""
+    each module gradient. ``global`` projects each module's flattened gradient with
+    an independent right-side matrix and sums into one vector per example."""
 
     token_batch_size: int = 2048
     """Batch size in tokens for building the index."""
@@ -394,24 +487,14 @@ class IndexConfig(AttributionConfig, Serializable):
     """Whether to automatically determine the optimal token batch size.
     Experimental feature only enabled for `build`."""
 
-    processor_path: str = ""
-    """Path to a precomputed processor."""
-
     optimizer_state: str = ""
     """Source for optimizer second moments used to normalize gradients.
     Either a local path (a checkpoint directory containing ``optimizer.pt``,
     or a path to an optimizer state file directly) or a Hugging Face URI
-    ``hf://<repo>[@<revision>][/<path>]``."""
+    ``hf://<repo>[@<revision>][/<path>]``.
 
-    skip_hessians: bool = False
-    """Whether to skip estimating hessian statistics"""
-
-    skip_index: bool = False
-    """Whether to skip building the gradient index."""
-
-    stats_sample_size: int | None = 10_000
-    """Number of examples to use for estimating the autocorrelation Hessian.
-    This feature is experimental and may be removed."""
+    Note: Untested with the AdamW eps_root in the bergson trainer -
+    consider setting this to 0 when using optimizer normalization."""
 
     loss_fn: Literal["ce", "kl"] = "ce"
     """Loss function to use."""
@@ -516,6 +599,18 @@ class QueryConfig(Serializable):
     unit_norm: bool = True
     """Whether to unit normalize the query."""
 
+    hessian_path: str | None = None
+    """Path to a Hessian to precondition the gradients with. Two-sided
+    preconditioning (H^(-1/2) applied to query and index) will be used
+    if ``unit_norm`` is enabled."""
+
+    ev_correction: bool = False
+    """Use the corrected eigenvalues of a factored Hessian at ``hessian_path``
+    (requires it to have been fit with ``HessianConfig.ev_correction=True``)."""
+
+    inversion_cfg: InversionConfig = field(default_factory=InversionConfig)
+    """How to invert the Hessian at ``hessian_path``."""
+
     device_map_auto: bool = False
     """Load the model onto multiple devices if necessary."""
 
@@ -543,6 +638,9 @@ class PreprocessConfig(Serializable):
 
     hessian_path: str | None = None
     """Path to a precomputed gradient processor. Set to apply Hessian approx."""
+
+    inversion_cfg: InversionConfig = field(default_factory=InversionConfig)
+    """How to invert the (dense autocorrelation) Hessian at ``hessian_path``."""
 
     aggregation: Literal["mean", "sum", "none"] = "none"
     """Method for aggregating the gradients. In score, only query
@@ -617,7 +715,7 @@ class ApproxUnrollingConfig(Serializable):
 class HessianConfig(Serializable):
     """Config for reducing the gradients."""
 
-    method: Literal["kfac", "tkfac", "shampoo", "autocorrelation"] = "autocorrelation"
+    method: Literal["kfac", "tkfac", "shampoo", "autocorrelation"]
     """Method for approximating the Hessian."""
 
     ev_correction: bool = False
@@ -638,8 +736,8 @@ class HessianPipelineConfig:
     query: DataConfig = field(default_factory=DataConfig)
     """Query dataset specification."""
 
-    lambda_damp_factor: float = 0.1
-    """Damping factor for EKFAC eigenvalue correction."""
+    inversion_cfg: InversionConfig = field(default_factory=InversionConfig)
+    """How to invert the fitted EKFAC Hessian when applying it to the query."""
 
     resume: bool = False
     """Skip pipeline steps whose output directory already exists."""
@@ -686,9 +784,10 @@ class TrackstarConfig:
     index hessians intersect at this component. Typical value is
     ~1000 out of ~65K total components."""
 
-    num_stats_sample_hessian: bool = True
-    """Whether to use num_stats_sample items or the full dataset to
-    compute hessians."""
+    stats_sample_size: int | None = 10_000
+    """Number of examples to use for estimating the autocorrelation Hessian
+    in the trackstar pipeline's hessian-fitting steps. Set to None to use
+    the full dataset."""
 
     resume: bool = False
     """Skip pipeline steps whose output directory already exists."""

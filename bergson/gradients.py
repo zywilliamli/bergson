@@ -1,4 +1,3 @@
-import json
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -6,6 +5,7 @@ from typing import Literal, Mapping
 
 import torch
 import torch.nn as nn
+import yaml
 from torch import Tensor
 from transformers.pytorch_utils import Conv1D as HFConv1D
 
@@ -117,8 +117,9 @@ class GradientProcessor:
     projection_target: Literal["per_module", "global"] = "per_module"
     """
     Projection target. ``per_module`` does a double-sided random projection of each
-    module's gradient independently. ``global`` flattens the per-example gradient
-    across all tracked modules and projects it once.
+    module's gradient independently. ``global`` does an independent
+    single-sided right projection of each module's flattened gradient then sums the
+    results, producing one ``[proj_dim]`` vector per example.
     """
 
     include_bias: bool = False
@@ -126,7 +127,7 @@ class GradientProcessor:
 
     def __post_init__(self):
         self._projection_matrices: dict[
-            tuple[str, Literal["left", "right"], torch.device], Tensor
+            tuple[str, Literal["left", "right", "single"], torch.device], Tensor
         ] = {}
 
     @classmethod
@@ -154,9 +155,8 @@ class GradientProcessor:
         if not hess_eigen_path.exists():
             hess_eigen_path = path / "preconditioners_eigen.pth"
 
-        # Load configuration
         with cfg_path.open("r") as f:
-            cfg = json.load(f)
+            cfg = yaml.safe_load(f)
 
         # Backward compatibility
         if "projection_type" not in cfg:
@@ -222,7 +222,7 @@ class GradientProcessor:
         del cfg["hessians"]
         del cfg["hessians_eigen"]
         with cfg_path.open("w") as f:
-            json.dump(cfg, f, indent=2)
+            yaml.safe_dump(cfg, f, sort_keys=False)
 
         # Save normalizers
         norm_state = {

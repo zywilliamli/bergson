@@ -243,7 +243,6 @@ def test_token_build_e2e(tmp_path: Path, model, dataset):
     model = model.float()
     cfg = IndexConfig(
         run_path=str(tmp_path),
-        skip_hessians=True,
         token_batch_size=1024,
         attribute_tokens=True,
     )
@@ -298,7 +297,6 @@ def test_token_build_with_labels(tmp_path: Path, model):
 
     cfg = IndexConfig(
         run_path=str(tmp_path),
-        skip_hessians=True,
         token_batch_size=1024,
         attribute_tokens=True,
     )
@@ -361,10 +359,8 @@ def test_token_score_e2e(tmp_path: Path, model, dataset):
 
     cfg = IndexConfig(
         run_path=str(tmp_path / "run"),
-        skip_hessians=True,
         token_batch_size=1024,
         attribute_tokens=True,
-        skip_index=True,
     )
 
     collect_gradients(
@@ -408,7 +404,6 @@ def test_token_build_adam_e2e(tmp_path: Path, model, dataset):
 
     cfg = IndexConfig(
         run_path=str(tmp_path),
-        skip_hessians=True,
         token_batch_size=1024,
         attribute_tokens=True,
     )
@@ -474,11 +469,9 @@ def _collect_in_memory(
     """Run InMemoryCollector and return the collector for inspection."""
     cfg = IndexConfig(
         run_path=run_path,
-        skip_hessians=True,
         token_batch_size=1024,
         attribute_tokens=attribute_tokens,
         loss_reduction="sum",
-        skip_index=True,
         include_bias=include_bias,
     )
     cfg.partial_run_path.mkdir(parents=True, exist_ok=True)
