@@ -493,7 +493,7 @@ class IndexConfig(AttributionConfig, Serializable):
     or a path to an optimizer state file directly) or a Hugging Face URI
     ``hf://<repo>[@<revision>][/<path>]``.
 
-    Note: Untested with the AdamW eps_root in the bergson trainer -  
+    Note: Untested with the AdamW eps_root in the bergson trainer -
     consider setting this to 0 when using optimizer normalization."""
 
     loss_fn: Literal["ce", "kl"] = "ce"
