@@ -30,6 +30,13 @@ steps:
           - EleutherAI/pythia-14m
           - EleutherAI/pythia-14m
         segments: 3
+        # Per-segment average LR and optimizer step count (one entry per
+        # segment). Required here because the checkpoint names are HF ids, not
+        # `.../checkpoint-<N>` dirs, so the step counts can't be inferred from
+        # names. For a real run over `checkpoint-<N>` snapshots these may be
+        # omitted and are inferred from the training run's log_history.json.
+        lr_list: [1.0e-5, 1.0e-5, 1.0e-5]
+        step_size_list: [1, 1, 1]
         query:
           dataset: NeelNanda/pile-10k
           split: train[:8]

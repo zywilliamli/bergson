@@ -646,12 +646,12 @@ class ScoreConfig(Serializable):
 class ApproxUnrollingConfig(Serializable):
     """Config for approximate unrolling of the influence function."""
 
-    checkpoints: list[int | str] = field(default_factory=list)
-    """List of training checkpoints (by step or path) to use for approximating"""
+    checkpoints: list[str] = field(default_factory=list)
+    """List of training checkpoint paths (HF model ids or local dirs) to use for
+    approximating."""
 
     model_path: str | None = None
-    """Path to the model used for the training checkpoints. Required if checkpoint
-    paths are integers."""
+    """Path to the model used for the training checkpoints."""
 
     segments: int = 3
     """Number of segments to split the training trajectory into for approximation.
