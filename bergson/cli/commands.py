@@ -40,8 +40,8 @@ from ..utils.worker_utils import validate_run_path
 class ApproxUnrolling(Serializable):
     """Run the SOURCE (approximate unrolling) training-data attribution pipeline.
 
-    Currently only step 1 (per-checkpoint Hessian precompute) is wired up;
-    later steps land incrementally. See
+    Runs from per-checkpoint Hessian precompute through per-segment scoring and
+    aggregation into ``<run>/scores.npy``. See
     :mod:`bergson.approx_unrolling.pipeline` for the step list.
     """
 

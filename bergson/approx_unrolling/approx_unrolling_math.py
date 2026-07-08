@@ -24,6 +24,29 @@ from bergson.hessians.apply_hessian import EkfacApplicator, EkfacConfig
 from bergson.score.score import score_dataset
 
 
+def _checkpoint_step(p: str) -> int:
+    """Extract the training step index for a checkpoint.
+
+    Accepts a path whose final component is a ``checkpoint-<N>`` directory
+    (what HF Trainer writes natively) or a bare ``<N>`` step directory.
+    """
+    # TODO: Inferring the step from a checkpoint name via regex is brittle.
+    # For now, we raise an error
+    name = Path(p).name
+    m = re.match(r"checkpoint-(\d+)$", name)
+    if m:
+        return int(m.group(1))
+    if name.isdigit():
+        return int(name)
+    raise ValueError(
+        f"Cannot infer a training step from checkpoint {p!r}: expected a path "
+        "ending in 'checkpoint-<N>' or a bare '<N>' step directory. Set both "
+        "`lr_list` and `step_size_list` on ApproxUnrollingConfig to specify "
+        "the per-segment learning rate and step counts explicitly instead of "
+        "inferring them from checkpoint names."
+    )
+
+
 def compute_lr_times_steps_per_segment(
     approx_unrolling_cfg: ApproxUnrollingConfig,
 ) -> list[float]:
@@ -34,12 +57,8 @@ def compute_lr_times_steps_per_segment(
     if cfg.lr_list and cfg.step_size_list:
         return [lr * k for lr, k in zip(cfg.lr_list, cfg.step_size_list)]
 
-    # TODO: parsing 'checkpoint-N' from dir name is fragile.
     per_segment = len(cfg.checkpoints) // L
-    ckpt_steps = [
-        int(re.match(r"checkpoint-(\d+)$", Path(str(p)).name).group(1))  # type: ignore
-        for p in cfg.checkpoints
-    ]
+    ckpt_steps = [_checkpoint_step(p) for p in cfg.checkpoints]
     boundaries = [0] + [ckpt_steps[(l + 1) * per_segment - 1] for l in range(L)]
     # Prefer log_history.json if dumped at the parent dir; otherwise pull
     # log_history out of the final checkpoint's trainer_state.json (what HF
