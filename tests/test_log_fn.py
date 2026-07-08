@@ -33,8 +33,9 @@ def test_log_fn_called_each_step(model, dataset):
         assert isinstance(loss, float)
 
 
-def test_wandb_log_fn_calls_wandb():
+def test_wandb_log_fn_calls_wandb(monkeypatch):
     """wandb_log_fn initializes wandb and logs correctly."""
+    monkeypatch.delenv("WANDB_MODE", raising=False)
     mock_wandb = MagicMock()
     mock_wandb.run = None
     with patch.dict("sys.modules", {"wandb": mock_wandb}):
@@ -48,8 +49,9 @@ def test_wandb_log_fn_calls_wandb():
         mock_wandb.log.assert_called_once_with({"train/loss": 0.123}, step=5)
 
 
-def test_wandb_log_fn_reuses_existing_run():
+def test_wandb_log_fn_reuses_existing_run(monkeypatch):
     """wandb_log_fn doesn't call init if a run already exists."""
+    monkeypatch.delenv("WANDB_MODE", raising=False)
     mock_wandb = MagicMock()
     mock_wandb.run = MagicMock()  # pretend a run exists
     with patch.dict("sys.modules", {"wandb": mock_wandb}):
@@ -91,11 +93,12 @@ def test_wandb_log_fn_noop_when_wandb_missing(monkeypatch):
         assert log(0, 1.5) is None
 
 
-def test_wandb_log_fn_falls_back_when_init_fails():
+def test_wandb_log_fn_falls_back_when_init_fails(monkeypatch):
     """If wandb.init raises (e.g. dead daemon, bad auth, network), the caller
     gets a no-op log_fn and a warning, not an exception. Without this, a
     rank-0 wandb hang/failure deadlocks the rest of the world on the next
     distributed collective."""
+    monkeypatch.delenv("WANDB_MODE", raising=False)
     mock_wandb = MagicMock()
     mock_wandb.run = None
     mock_wandb.init.side_effect = TimeoutError("wandb-service did not respond")
