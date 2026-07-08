@@ -8,6 +8,7 @@ from ..config.config import (
     TrackstarConfig,
 )
 from ..config.config_io import save_run_config
+from ..distributed import parent_barrier
 from ..hessians.hessian_approximations import approximate_hessians
 from ..process_grads import mix_autocorrelation_matrices
 from ..score.score import score_dataset
@@ -85,23 +86,39 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
         approximate_hessians(query_hess_cfg, hess_cfg)
 
     # Step 3: Mix query and value hessians
+    #
+    # Unlike the other steps, mixing is plain launcher-level work with no
+    # distributed launch, so it has no implicit cross-node barrier. The
+    # query/value hessians are finalized by a single ``shutil.move`` on global
+    # rank 0 (node 0) with no barrier afterward, so running the mix on every
+    # node races node 0's move + Lustre metadata propagation and non-rank-0
+    # nodes crash with "No hessian_cfg recorded at '.../query_hessian'". Run
+    # the mix only on node 0 (which performed the moves and therefore sees the
+    # inputs), then barrier so the other nodes wait for mixed_hessian to be
+    # written before Step 4's build reads it.
     print("Step 3/5: Mixing hessians...")
     if not _step_complete(mixed_hess_path, resume):
-        save_run_config(
-            Mix(
+        if index_cfg.distributed._node_rank == 0:
+            save_run_config(
+                Mix(
+                    query_path=query_hess_path,
+                    index_path=value_hess_path,
+                    output_path=mixed_hess_path,
+                    target_downweight_components=(
+                        trackstar_cfg.target_downweight_components
+                    ),
+                ),
+                mixed_hess_path,
+            )
+            mix_autocorrelation_matrices(
                 query_path=query_hess_path,
                 index_path=value_hess_path,
                 output_path=mixed_hess_path,
-                target_downweight_components=trackstar_cfg.target_downweight_components,
-            ),
-            mixed_hess_path,
-        )
-        mix_autocorrelation_matrices(
-            query_path=query_hess_path,
-            index_path=value_hess_path,
-            output_path=mixed_hess_path,
-            target_downweight_components=trackstar_cfg.target_downweight_components,
-        )
+                target_downweight_components=(
+                    trackstar_cfg.target_downweight_components
+                ),
+            )
+    parent_barrier(index_cfg.distributed)
 
     # The mixed hessian is set here but only applied during step 4. if the
     # user is aggregating the query dataset (preprocess_cfg.aggregation != "none").

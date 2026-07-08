@@ -377,6 +377,11 @@ class ValidationConfig(TrainingConfig, ABC):
     permutation. These scores may be produced by items with fewer than
     2 tokens."""
 
+    subset_fraction: float = 0.0
+    """When > 0, each of the ``num_subsets`` leave-k-out subsets is an
+    independent draw (without replacement within a subset, overlapping across
+    subsets) of ``round(subset_fraction * pool)`` docs from the validation
+    pool — e.g. 0.05 drops 5% of the data per subset."""
 
 @dataclass
 class RecallDataConfig(Serializable):
