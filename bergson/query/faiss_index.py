@@ -120,44 +120,45 @@ def _require_faiss() -> ModuleType:
     return faiss_module
 
 
-def index_to_device(index: Index, device: str) -> Index:
+def index_to_gpu(index: Index, device: str) -> Index:
     """
-    Move a FAISS index between CPU and GPU devices, optionally sharding.
+    Move a CPU FAISS index onto one or more GPUs, sharding across them.
+
+    The reverse direction (GPU->CPU) is intentionally not handled here: FAISS's
+    ``index_gpu_to_cpu`` clones the index, which raises ``RuntimeError: clone not
+    supported ...`` for a CPU index backed by ``OnDiskInvertedLists`` (any IVF/ANN
+    index mmap'd from disk). GPU->CPU is done explicitly at the one call site that
+    owns a genuinely GPU-resident index (see ``create_index``).
 
     Parameters
     ----------
     index : Index
-        Existing FAISS index instance.
+        Existing CPU FAISS index instance.
     device : str
-        Destination device string, e.g. ``\"cpu\"``, ``\"cuda\"``, or ``\"cuda:1\"``.
+        Destination device string, e.g. ``\"cuda\"`` or ``\"cuda:1\"``. ``\"cpu\"`` is a
+        no-op (the index is returned unchanged).
     """
     faiss = _require_faiss()
 
-    if device != "cpu":
-        gpus = (
-            list(range(torch.cuda.device_count()))
-            if device == "cuda"
-            else [int(device.split(":")[1])]
-        )
+    if device == "cpu":
+        return index
 
-        try:
-            options = faiss.GpuMultipleClonerOptions()
-        except AttributeError as e:
-            raise ImportError(
-                "Faiss not found, you may have faiss-cpu installed instead "
-                "of faiss-gpu with `pip install faiss-gpu-cu12`..."
-            ) from e
+    gpus = (
+        list(range(torch.cuda.device_count()))
+        if device == "cuda"
+        else [int(device.split(":")[1])]
+    )
 
-        options.shard = True
-        return faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
+    try:
+        options = faiss.GpuMultipleClonerOptions()
+    except AttributeError as e:
+        raise ImportError(
+            "Faiss not found, you may have faiss-cpu installed instead "
+            "of faiss-gpu with `pip install faiss-gpu-cu12`..."
+        ) from e
 
-    # Destination is CPU. The index read from disk (or built on CPU) is already a
-    # CPU index, so this is a no-op. We must NOT call `index_gpu_to_cpu` here: it
-    # clones the index, which raises `RuntimeError: clone not supported ...` for
-    # CPU indices backed by `OnDiskInvertedLists` (i.e. any IVF/ANN index mmap'd
-    # from disk). Genuine GPU-to-CPU moves are handled explicitly at the call
-    # site that owns a GPU index (see `create_index`).
-    return index
+    options.shard = True
+    return faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
 
 
 class FaissIndex:
@@ -198,8 +199,8 @@ class FaissIndex:
                 str(shard_path),
                 faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY,
             )
-            if not mmap_index:
-                shard = index_to_device(shard, device)
+            if not mmap_index and device != "cpu":
+                shard = index_to_gpu(shard, device)
 
             shards.append(shard)
 
@@ -276,7 +277,7 @@ class FaissIndex:
                 faiss_cfg.index_factory,
                 faiss.METRIC_INNER_PRODUCT,
             )
-            index = index_to_device(index, device)
+            index = index_to_gpu(index, device)
             if faiss_cfg.max_train_examples is not None:
                 train_examples = min(faiss_cfg.max_train_examples, grads_chunk.shape[0])
             else:
@@ -288,7 +289,8 @@ class FaissIndex:
 
             # Bring the freshly built index back to CPU before serialization.
             # Only a genuinely GPU-resident index needs conversion; a CPU build
-            # is already on CPU (and `index_to_device` no longer clones it).
+            # is already on CPU. GPU->CPU lives here (not in `index_to_gpu`)
+            # because only this call site ever owns a real GPU index.
             if device != "cpu":
                 index = faiss.index_gpu_to_cpu(index)
             faiss.write_index(index, str(shard_path))

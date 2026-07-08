@@ -523,11 +523,7 @@ class QueryConfig(Serializable):
     """Whether to use FAISS for the query."""
 
     faiss_cfg: FaissConfig = field(default_factory=FaissConfig)
-    """FAISS index configuration, used only when ``faiss=True``. Exposes the
-    index-factory string (e.g. ``--faiss_cfg.index_factory IVF1024,SQfp16`` for
-    ANN), ``--faiss_cfg.mmap_index`` for on-disk querying, ``--faiss_cfg.nprobe``,
-    ``--faiss_cfg.num_shards``, etc. The defaults reproduce the previous
-    behaviour (an exact ``Flat`` index queried in memory)."""
+    """FAISS index configuration, used only when ``faiss=True``."""
 
     top_k: int = 5
     """Number of top (and bottom) results to return per query."""

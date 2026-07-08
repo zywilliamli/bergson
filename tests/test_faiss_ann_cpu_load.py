@@ -1,11 +1,12 @@
 """Regression test for the FAISS ANN off-the-shelf breakage.
 
 `FaissIndex.__init__` reads each on-disk shard with ``IO_FLAG_MMAP`` (a CPU index).
-When ``mmap_index=False`` (the shipped default), it then calls
-``index_to_device(shard, "cpu")``. That helper used to *unconditionally* call
-``faiss.index_gpu_to_cpu`` on the already-CPU index, which clones it and raises
+When ``mmap_index=False`` (the shipped default) and ``device="cpu"``, the loader
+used to call ``index_to_device(shard, "cpu")``, which *unconditionally* ran
+``faiss.index_gpu_to_cpu`` on the already-CPU index, cloning it and raising
 ``RuntimeError: clone not supported ... OnDiskInvertedLists`` for any IVF/ANN index
-mmap'd from disk. Only an exact ``Flat`` index survived.
+mmap'd from disk. Only an exact ``Flat`` index survived. The CPU->GPU helper is now
+``index_to_gpu`` and is skipped entirely when ``device="cpu"``.
 
 These tests build tiny on-disk indices with ``device="cpu"`` and confirm the CPU
 load path (``mmap_index=False``) no longer raises and returns usable neighbours for
@@ -147,7 +148,7 @@ def test_exact_flat_cpu_load_still_works(tmp_path: Path):
 
 @requires_faiss
 def test_ann_ivf_mmap_index_true_still_works(tmp_path: Path):
-    """The mmap_index=True path (skips index_to_device) must be unaffected."""
+    """The mmap_index=True path (skips index_to_gpu) must be unaffected."""
     n, dim = 256, 16
     data = _write_gradient_store(tmp_path / "grads", n, dim)
     query = data[:2].copy()
