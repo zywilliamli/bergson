@@ -1,4 +1,3 @@
-import csv
 import os
 import random
 import shutil
@@ -33,6 +32,10 @@ from ..config.config import ScoreConfig, TrainingConfig, ValidationConfig
 from ..config.config_io import load_subconfig, save_run_config
 from ..data import load_scores
 from ..distributed import grad_tree, launch_distributed_run
+from ..utils.csv_writer import CSVWriter
+from ..utils.load_from_optimizer import (
+    save_second_moments_as_optimizer_pt,
+)
 from ..utils.logging import wandb_log_fn
 from ..utils.utils import get_device, get_device_index
 from ..utils.worker_utils import (
@@ -108,30 +111,6 @@ def compute_query_gradients(
         dist.all_reduce(loss_accum)
 
     return grad_accum, float(loss_accum)
-
-
-class CSVWriter:
-    """CSV writer that no-ops when disabled."""
-
-    def __init__(self, path: str, columns: list[str], enabled: bool = True):
-        self.path = path
-        if enabled:
-            self._file = open(path, "w", newline="")
-            self._writer = csv.writer(self._file)
-            self._writer.writerow(columns)
-        else:
-            self._file = None
-            self._writer = None
-
-    def writerow(self, *args):
-        if self._writer is None or self._file is None:
-            return
-        self._writer.writerow([*args])
-        self._file.flush()
-
-    def close(self):
-        if self._file is not None:
-            self._file.close()
 
 
 def prepare_trainer(cfg: TrainingConfig, rank: int, schedule: Callable):
@@ -365,6 +344,12 @@ def worker(
         resume=resume,
         fsdp=run_cfg.fsdp,
     )
+    if getattr(run_cfg, "save_optimizer_state", False) and global_rank == 0:
+        save_second_moments_as_optimizer_pt(
+            model,  # type: ignore[reportArgumentType]
+            fwd_state.opt_state,
+            os.path.join(run_cfg.run_path, "optimizer.pt"),
+        )
 
     # If no query dataset is provided, skip backward and validation entirely
     if query_dataset is None:

@@ -7,7 +7,12 @@ from huggingface_hub.utils import parse_hf_uri
 from peft import PeftModel, get_peft_model_state_dict
 from transformers import PreTrainedModel
 
-from bergson.gradients import AdafactorNormalizer, AdamNormalizer, Normalizer
+from bergson.gradients import (
+    AdafactorNormalizer,
+    AdamNormalizer,
+    LayerAdapter,
+    Normalizer,
+)
 
 
 def load_optimizer(optimizer_state: str) -> dict:
@@ -89,6 +94,45 @@ def get_unfactored_second_moment(state: dict) -> torch.Tensor:
     return state["__bnb_optimizer_quant_state__"]["state2"]
 
 
+def _base_model_prefix(model) -> str:
+    """Return the dotted path of ``model.base_model`` within ``model`` (with a
+    trailing dot), or ``""`` if the base model is the model itself.
+
+    Collection builds its collector from ``model.base_model``, so module names
+    seen during collection are relative to it (GPT-2: ``h.0.attn.c_attn``, not
+    ``transformer.h.0.attn.c_attn``). Normalizer keys must match.
+    """
+    base = getattr(model, "base_model", model)
+    if base is model:
+        return ""
+    for name, module in model.named_modules():
+        if module is base:
+            return f"{name}." if name else ""
+    return ""
+
+
+def _orient_weight_second_moment(exp_avg_sq, model, layer_name):
+    """Return ``exp_avg_sq`` in the collector's ``[out, in]`` orientation.
+
+    The optimizer stores the second moment in the parameter's own layout, which
+    is ``[out, in]`` for ``nn.Linear`` but ``[in, out]`` for HF ``Conv1D`` (GPT-2
+    attn/mlp). The collector always feeds ``AdamNormalizer`` a ``[out, in]``
+    gradient, so a Conv1D moment must be transposed or the divide broadcasts
+    against the wrong axis. Orient by matching the module's out/in sizes.
+    """
+    try:
+        module = model.get_submodule(layer_name)
+        o = getattr(module, LayerAdapter.out_attr(module))
+        i = getattr(module, LayerAdapter.in_attr(module))
+    except (AttributeError, ValueError):
+        return exp_avg_sq  # unknown module; leave as-is
+    if tuple(exp_avg_sq.shape) == (o, i):
+        return exp_avg_sq
+    if tuple(exp_avg_sq.shape) == (i, o):
+        return exp_avg_sq.T.contiguous()
+    return exp_avg_sq
+
+
 def get_normalizers(
     optimizer_state,
     target_param_index_to_name,
@@ -96,6 +140,9 @@ def get_normalizers(
     adapter_suffix,
     include_bias,
     device,
+    base_prefix="",
+    model=None,
+    eps_root=0.0,
 ):
     normalizers: dict[str, Normalizer] = {}
     for param_idx, state in optimizer_state["state"].items():
@@ -108,7 +155,14 @@ def get_normalizers(
             continue
 
         layer_name = param_name.removesuffix(".weight")
-        module_name = layer_name.removeprefix("base_model.") + adapter_suffix
+        # Normalizers are looked up during collection by the module's name
+        # *relative to ``model.base_model``* (see bergson/collection.py, which
+        # builds the collector from ``model.base_model``). The optimizer state,
+        # however, is keyed off the full model's parameter names, so strip the
+        # base-model prefix (e.g. "transformer." for GPT-2) or the lookup silently
+        # misses and no normalization is applied.
+        module_name = layer_name.removeprefix("base_model.").removeprefix(base_prefix)
+        module_name = module_name + adapter_suffix
 
         if target_modules is not None and module_name not in target_modules:
             continue
@@ -130,6 +184,8 @@ def get_normalizers(
             exp_avg_sq = get_unfactored_second_moment(state)
             if exp_avg_sq.ndim != 2:
                 continue
+            if model is not None:
+                exp_avg_sq = _orient_weight_second_moment(exp_avg_sq, model, layer_name)
             normalizers[module_name] = AdamNormalizer(
                 weight_avg_sq=exp_avg_sq.to(device),
                 bias_avg_sq=bias_on_device,
@@ -182,6 +238,7 @@ def load_from_optimizer(
     # The optimizer state is keyed by position in the trainable parameter list.
     # For PEFT checkpoints, only include PEFT params.
     adapter_suffix = ""
+    base_prefix = ""
     if isinstance(model, PeftModel):
         st = get_peft_model_state_dict(model)
         params_for_index = list(st.items())
@@ -194,6 +251,9 @@ def load_from_optimizer(
             adapter_suffix = "." + adapters[0]
     else:
         params_for_index = list(model.named_parameters())
+        # Collection runs on ``model.base_model``, so normalizer keys must be
+        # relative to it (e.g. drop GPT-2's "transformer." prefix).
+        base_prefix = _base_model_prefix(model)
 
     target_param_index_to_name: dict[int, str] = {}
     for idx, (name, _param) in enumerate(params_for_index):
@@ -208,6 +268,8 @@ def load_from_optimizer(
         adapter_suffix,
         include_bias,
         device,
+        base_prefix,
+        model,
     )
     assert normalizers, (
         f"No optimizer second moments found in '{optimizer_state}'. "
@@ -220,6 +282,78 @@ def load_from_optimizer(
         f"from '{optimizer_state}'"
     )
     return normalizers
+
+
+def save_second_moments_as_optimizer_pt(
+    model: PreTrainedModel | PeftModel,
+    opt_state,
+    path: str | Path,
+) -> int:
+    """Export a torchopt AdamW ``opt_state`` to a PyTorch ``optimizer.pt``.
+
+    Writes ``{"state": {idx: {"exp_avg_sq": nu}}, "param_groups": [...]}`` where
+    ``idx`` indexes ``model.named_parameters()`` (deduplicated) exactly as
+    :func:`load_from_optimizer` reads it, so the file round-trips into
+    attribution normalizers.
+
+    The mapping is done **by name**, not by position, because torchopt stores
+    ``nu`` as a flat list in optree's sorted-key order of the params dict passed
+    to ``optimizer.init`` -- which is neither insertion order nor
+    ``named_parameters()`` order, and differs in length from the deduplicated
+    ``named_parameters()`` when weights are tied (e.g. GPT-2 ``lm_head``/``wte``).
+    Zipping the wrong orders is the classic module-name mismatch, so we align
+    strictly by name and assert per-tensor shape agreement.
+
+    Returns the number of weight second moments written.
+    """
+    # Must mirror Trainer.initialize: name-keyed, duplicates kept, trainable only.
+    params = {
+        k: v
+        for k, v in model.named_parameters(remove_duplicate=False)
+        if v.requires_grad
+    }
+    # optree flattens a dict by sorted keys; torchopt's nu list follows that.
+    ordered_names = sorted(params)
+
+    adam_state = next((s for s in opt_state if hasattr(s, "nu")), None)
+    if adam_state is None:
+        raise ValueError(
+            "opt_state has no second-moment (`nu`) field; "
+            "save_optimizer_state supports AdamW optimizers only."
+        )
+    nu = list(adam_state.nu)
+    assert len(nu) == len(ordered_names), (
+        f"nu has {len(nu)} entries but the trainable params dict has "
+        f"{len(ordered_names)}; ordering assumptions are violated."
+    )
+
+    def _to_cpu(t):
+        t = t.full_tensor() if hasattr(t, "full_tensor") else t
+        return t.detach().to("cpu")
+
+    name_to_nu = {}
+    for name, moment in zip(ordered_names, nu):
+        if moment is None:  # e.g. Muon leaves 2D params without a second moment
+            continue
+        assert tuple(moment.shape) == tuple(params[name].shape), (
+            f"second-moment shape {tuple(moment.shape)} != param shape "
+            f"{tuple(params[name].shape)} for '{name}' -- nu/name misalignment."
+        )
+        name_to_nu[name] = _to_cpu(moment)
+
+    state: dict[int, dict] = {}
+    param_ids: list[int] = []
+    for idx, (name, _param) in enumerate(model.named_parameters()):
+        if name in name_to_nu:
+            state[idx] = {"exp_avg_sq": name_to_nu[name]}
+            param_ids.append(idx)
+
+    optimizer_pt = {"state": state, "param_groups": [{"params": param_ids}]}
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(optimizer_pt, path)
+    print(f"Saved {len(state)} optimizer second moments to '{path}'")
+    return len(state)
 
 
 def _get_bias_second_moment(
