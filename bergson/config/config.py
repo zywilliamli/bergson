@@ -381,7 +381,7 @@ class ValidationConfig(TrainingConfig, ABC):
     """When > 0, each of the ``num_subsets`` leave-k-out subsets is an
     independent draw (without replacement within a subset, overlapping across
     subsets) of ``round(subset_fraction * pool)`` docs from the validation
-    pool — e.g. 0.05 drops 5% of the data per subset."""
+    pool — e.g. 0.05 drops 5 percent of the data per subset."""
 
 
 @dataclass

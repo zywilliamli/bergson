@@ -494,6 +494,8 @@ def worker(
             subsets = list(perm.chunk(run_cfg.num_subsets))
             rng = random.Random(run_cfg.seed)
             rng.shuffle(subsets)
+    else:
+        raise ValueError(f"Unknown subset strategy: {run_cfg.subset_strategy}")
 
     csv_path = os.path.join(run_cfg.run_path, "validation.csv")
     val_csv_writer = CSVWriter(
