@@ -750,7 +750,9 @@ def evaluate_retrained(
     if base_dir.exists():
         base = AutoModelForCausalLM.from_pretrained(
             base_dir, dtype=torch.float32, attn_implementation="eager"
-        ).to(device)
+        ).to(
+            device  # type: ignore
+        )
         baseline = query_loss(base)
         del base
         print(f"Baseline query loss (no leave-out) from {base_dir}: {baseline}")
@@ -765,7 +767,9 @@ def evaluate_retrained(
         model_dir = models_root / f"subset_{i}"
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, dtype=torch.float32, attn_implementation="eager"
-        ).to(device)
+        ).to(
+            device  # type: ignore
+        )
         loss = query_loss(model)
         del model
 
