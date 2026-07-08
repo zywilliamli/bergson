@@ -21,6 +21,7 @@ from torch.distributed._functional_collectives import (
 from torch.distributed.tensor import init_device_mesh
 from torchopt.pytree import tree_iter
 from tqdm import tqdm
+from transformers import AutoTokenizer
 from transformers.utils.logging import (
     disable_progress_bar as hf_disable_pbar,
 )
@@ -458,6 +459,9 @@ def worker(
 
     stream.requires_grad = False
 
+    if getattr(run_cfg, "skip_validation", False):
+        return
+
     # Validate attribution scores via leave-subset-out retraining
     diffs = []
     score_sums = []
@@ -508,6 +512,14 @@ def worker(
     hf_disable_pbar()
     hf_set_verbosity_error()
 
+    # Optionally persist each retrained model for later attribution queries.
+    save_models = getattr(run_cfg, "save_retrained_models", False)
+    retrained_tokenizer = None
+    if save_models and global_rank == 0:
+        retrained_tokenizer = AutoTokenizer.from_pretrained(
+            run_cfg.tokenizer or run_cfg.model
+        )
+
     pbar = tqdm(subsets, desc="Validating", disable=global_rank != 0)
     for i, subset in enumerate(pbar):
         trainer, fwd_state, model = prepare_trainer(run_cfg, rank, schedule)
@@ -523,6 +535,14 @@ def worker(
 
         for x in stream:
             fwd_state = trainer.step(fwd_state, x, inplace=True, fsdp=run_cfg.fsdp)
+
+        if save_models and global_rank == 0:
+            out_dir = os.path.join(run_cfg.run_path, "retrained", f"subset_{i}")
+            os.makedirs(out_dir, exist_ok=True)
+            with fwd_state.activate(model), torch.no_grad():
+                model.save_pretrained(out_dir, safe_serialization=True)
+            if retrained_tokenizer is not None:
+                retrained_tokenizer.save_pretrained(out_dir)
 
         with fwd_state.activate(model), torch.no_grad():
             loss = torch.tensor(0.0, device=stream.weights.device)

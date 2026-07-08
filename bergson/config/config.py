@@ -329,7 +329,10 @@ class TrainingConfig(AttributionConfig, Serializable):
     """Beta2 for AdamW optimizer."""
 
     eps_root: float = 1e-8
-    """Epsilon root for AdamW optimizer."""
+    """Epsilon root for AdamW optimizer.
+
+    Note for TrackStar attribution: Adam normalization with a non-zero
+    eps_root is untested. We recommend setting it to zero."""
 
     optimizer: Literal["adamw", "muon", "sgd"] = "adamw"
     """Optimizer to use for the training steps. Muon is an efficient
@@ -376,6 +379,11 @@ class ValidationConfig(TrainingConfig, ABC):
     """When True, drop doc_ids with score == 0 from the validation
     permutation. These scores may be produced by items with fewer than
     2 tokens."""
+
+    save_retrained_models: bool = False
+    """When True, save each leave-k-out retrained model (HF format, weights +
+    tokenizer) to ``<run_path>/retrained/subset_<i>/`` so it can be reused for
+    later attribution queries without retraining. ~0.5 GB per subset for GPT-2."""
 
     subset_fraction: float = 0.0
     """When > 0, each of the ``num_subsets`` leave-k-out subsets is an
@@ -483,7 +491,10 @@ class IndexConfig(AttributionConfig, Serializable):
     """Source for optimizer second moments used to normalize gradients.
     Either a local path (a checkpoint directory containing ``optimizer.pt``,
     or a path to an optimizer state file directly) or a Hugging Face URI
-    ``hf://<repo>[@<revision>][/<path>]``."""
+    ``hf://<repo>[@<revision>][/<path>]``.
+
+    Note: Untested with the AdamW eps_root in the bergson trainer -
+    consider setting this to 0 when using optimizer normalization."""
 
     loss_fn: Literal["ce", "kl"] = "ce"
     """Loss function to use."""
