@@ -383,6 +383,7 @@ class ValidationConfig(TrainingConfig, ABC):
     subsets) of ``round(subset_fraction * pool)`` docs from the validation
     pool — e.g. 0.05 drops 5% of the data per subset."""
 
+
 @dataclass
 class RecallDataConfig(Serializable):
     """Identity of the cached synthetic-facts datasets used by ``recall``.

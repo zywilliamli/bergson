@@ -475,7 +475,7 @@ def worker(
         if run_cfg.subset_fraction > 0:
             # Draw potentially overlapping samples
             subset_size = max(1, round(run_cfg.subset_fraction * len(valid_indices)))
-            
+
             subsets = [
                 valid_indices[
                     torch.randperm(len(valid_indices), generator=rng)[:subset_size]
