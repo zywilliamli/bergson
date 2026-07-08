@@ -249,6 +249,24 @@ Not all models are affected — run `bergson test_model_configuration` before en
 
 See `benchmarks/` for scripts to reproduce and generate benchmarks on your own hardware.
 
+# Known limitations
+
+These are known issues we have not yet addressed. They affect specific model families or deployment scales, and are documented here so you can plan around them.
+
+## MoE fused-parameter experts are not attributed
+
+Bergson collects gradients by hooking supported layer modules — `nn.Linear`, HF `Conv1D`, and `nn.Conv{1,2,3}d` (`LayerAdapter.supported_modules` in `bergson/gradients.py:238`). The module walk only attaches hooks to instances of these types (`bergson/collector/collector.py:154-155`).
+
+In modern MoE models (e.g. gpt-oss, Mixtral, Qwen-MoE, OLMoE as implemented in `transformers` 5.x), the experts and router are not sub-modules of a supported type. Instead they are fused bare `nn.Parameter`s on custom modules — for example `GptOssExperts.gate_up_proj` / `GptOssExperts.down_proj` and `GptOssTopKRouter.weight`. Because these are raw parameters rather than `nn.Linear` layers, they are silently skipped. As a result only attention projections and `lm_head` are tracked, which is roughly 1-2% of an MoE model's parameters.
+
+Recommendation: attribute dense models, or track only the attention subspace, until a parameter-level adapter for fused experts is added. Note that legacy MoE layouts that implement each expert as a separate `nn.Linear` are fully tracked.
+
+## Large-model FSDP load replicates the model in host RAM
+
+Under FSDP, the load path sets `device_map="cpu"` per rank (`bergson/utils/worker_utils.py:166`). This means every rank materializes a full, dequantized copy of the model in host RAM before sharding. For very large models, or quantized models that are dequantized on load (e.g. MXFP4 to bf16), this can exhaust host memory even when GPU VRAM is sufficient — host RAM, not VRAM, becomes the bottleneck.
+
+The standard mitigation, planned as future work, is a meta-device / rank-0 load combined with FSDP `sync_module_states`, so that only one full copy (or none, on non-zero ranks) is materialized on the host before sharding.
+
 # Development
 
 ```bash
