@@ -32,3 +32,7 @@ class MagicConfig(ValidationConfig):
 
     per_token: bool = False
     """Whether to compute attribution scores per token (instead of per sequence)."""
+
+    skip_validation: bool = False
+    """Stop after computing and saving attribution scores, before the
+    leave-k-out retraining loop. Useful for score-only MAGIC runs."""
