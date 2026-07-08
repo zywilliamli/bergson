@@ -8,6 +8,7 @@ from ..config.config import (
     TrackstarConfig,
 )
 from ..config.config_io import save_run_config
+from ..distributed import parent_barrier
 from ..hessians.hessian_approximations import approximate_hessians
 from ..process_grads import mix_autocorrelation_matrices
 from ..score.score import score_dataset
@@ -87,21 +88,27 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
     # Step 3: Mix query and value hessians
     print("Step 3/5: Mixing hessians...")
     if not _step_complete(mixed_hess_path, resume):
-        save_run_config(
-            Mix(
+        if index_cfg.distributed._node_rank == 0:
+            save_run_config(
+                Mix(
+                    query_path=query_hess_path,
+                    index_path=value_hess_path,
+                    output_path=mixed_hess_path,
+                    target_downweight_components=(
+                        trackstar_cfg.target_downweight_components
+                    ),
+                ),
+                mixed_hess_path,
+            )
+            mix_autocorrelation_matrices(
                 query_path=query_hess_path,
                 index_path=value_hess_path,
                 output_path=mixed_hess_path,
-                target_downweight_components=trackstar_cfg.target_downweight_components,
-            ),
-            mixed_hess_path,
-        )
-        mix_autocorrelation_matrices(
-            query_path=query_hess_path,
-            index_path=value_hess_path,
-            output_path=mixed_hess_path,
-            target_downweight_components=trackstar_cfg.target_downweight_components,
-        )
+                target_downweight_components=(
+                    trackstar_cfg.target_downweight_components
+                ),
+            )
+    parent_barrier(index_cfg.distributed)
 
     # The mixed hessian is set here but only applied during step 4. if the
     # user is aggregating the query dataset (preprocess_cfg.aggregation != "none").

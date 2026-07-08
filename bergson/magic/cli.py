@@ -472,20 +472,30 @@ def worker(
 
     if run_cfg.subset_strategy == "random":
         rng = torch.Generator().manual_seed(run_cfg.seed)
-        perm = valid_indices[torch.randperm(len(valid_indices), generator=rng)]
-    elif run_cfg.subset_strategy == "sorted":
+        if run_cfg.subset_fraction > 0:
+            # Draw potentially overlapping samples
+            subset_size = max(1, round(run_cfg.subset_fraction * len(valid_indices)))
 
-        perm = valid_indices[scores[valid_indices].argsort()]
+            subsets = [
+                valid_indices[
+                    torch.randperm(len(valid_indices), generator=rng)[:subset_size]
+                ]
+                for _ in range(run_cfg.num_subsets)
+            ]
+        else:
+            # Draw non-overlapping samples
+            perm = valid_indices[torch.randperm(len(valid_indices), generator=rng)]
+
+            # Shuffle the order of the subsets so that the estimate of
+            # correlation on the progress bar is unbiased. This does not change
+            # the final correlation since all subsets are eventually evaluated,
+            # but prevents the early subsets from being biased towards higher
+            # or lower scores.
+            subsets = list(perm.chunk(run_cfg.num_subsets))
+            rng = random.Random(run_cfg.seed)
+            rng.shuffle(subsets)
     else:
-        raise ValueError(f"Unsupported subset strategy: {run_cfg.subset_strategy}")
-
-    # Shuffle the order of the subsets so that the estimate of correlation on the
-    # progress bar is unbiased. This does not change the final correlation since all
-    # subsets are eventually evaluated, but prevents the early subsets from being
-    # biased towards higher or lower scores.
-    subsets = list(perm.chunk(run_cfg.num_subsets))
-    rng = random.Random(run_cfg.seed)
-    rng.shuffle(subsets)
+        raise ValueError(f"Unknown subset strategy: {run_cfg.subset_strategy}")
 
     csv_path = os.path.join(run_cfg.run_path, "validation.csv")
     val_csv_writer = CSVWriter(
