@@ -24,9 +24,6 @@ def wandb_log_fn(
 
     def _noop(step: int, loss: float) -> None: ...
 
-    # Honor an explicit opt-out: skip the import entirely so a missing wandb
-    # cannot crash the run. "offline" still writes local runs, so wandb is
-    # required for it and it is intentionally not treated as a no-op here.
     if os.environ.get("WANDB_MODE", "").strip().lower() == "disabled":
         return _noop
 
