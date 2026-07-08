@@ -28,12 +28,13 @@ from ..config.config import (
 from ..config.config_io import save_run_config
 from ..diagnose import DiagnoseConfig, diagnose
 from ..hessians.hessian_approximations import approximate_hessians
-from ..magic import MagicConfig, evaluate_retrained, run_magic
+from ..magic import MagicConfig, run_magic
 from ..process_grads import mix_autocorrelation_matrices
 from ..query.query_index import query
 from ..recall.recall import run_recall
 from ..score.score import score_dataset
 from ..utils.worker_utils import validate_run_path
+from ..validate import evaluate_retrained
 
 
 @dataclass

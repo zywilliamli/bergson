@@ -21,15 +21,21 @@ from torch.distributed._functional_collectives import (
 from torch.distributed._functional_collectives import (
     wait_tensor,
 )
+from torch.distributed.tensor import init_device_mesh
 from torchopt.pytree import tree_flatten_with_path, tree_iter, tree_map
 from torchopt.typing import GradientTransformation, OptState
 from tqdm.auto import tqdm
 
+from ..config.config import TrainingConfig
 from ..data import sorted_checkpoints
 from ..distributed import grad_tree
+from ..utils.utils import get_device
+from ..utils.worker_utils import setup_model_and_peft
 from .config import MagicSaveMode
 from .data_stream import DataStream
-from .fsdp import shallow_copy
+from .dtensor_patch import apply_dtensor_patch
+from .fsdp import shallow_copy, simple_fsdp
+from .optim import muon
 from .rtl_tqdm import RtlTqdm
 from .swap import swap_parameters
 
@@ -752,3 +758,61 @@ class Trainer:
 
         main_pbar.close()
         return bwd_state
+
+
+def prepare_trainer(cfg: TrainingConfig, rank: int, schedule: Callable):
+    """Prepare the model, optimizer, and trainer for training."""
+    model, target_modules = setup_model_and_peft(
+        cfg,
+        attn_implementation="eager",
+        apply_fsdp=False,
+    )
+    model.to(get_device(rank))  # type: ignore[reportArgumentType]
+
+    if target_modules:
+        # Only train the PEFT adapter parameters
+        model.requires_grad_(False)
+        for name in target_modules:
+            module = model.get_submodule(name)
+            module.requires_grad_(True)
+    else:
+        model.requires_grad_(True)
+
+    if cfg.grad_checkpointing:
+        model.gradient_checkpointing_enable(  # type: ignore[attr-defined]
+            gradient_checkpointing_kwargs=dict(use_reentrant=False),
+        )
+
+    if cfg.fsdp and dist.is_initialized():
+        apply_dtensor_patch()
+        mesh = init_device_mesh("cuda", (dist.get_world_size(),))
+        with mesh:
+            model = simple_fsdp(model)
+
+    match cfg.optimizer:
+        case "adamw":
+            opt = torchopt.adamw(
+                schedule,
+                betas=(cfg.adam_beta1, cfg.adam_beta2),
+                eps_root=cfg.eps_root,
+                weight_decay=cfg.weight_decay,
+            )
+        case "muon":
+            opt = muon(
+                schedule,
+                momentum=cfg.adam_beta1,
+                adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
+                adamw_eps_root=cfg.eps_root,
+                weight_decay=cfg.weight_decay,
+            )
+        case "sgd":
+            opt = torchopt.sgd(
+                schedule,
+                momentum=cfg.adam_beta1,
+                weight_decay=cfg.weight_decay,
+            )
+        case other:
+            raise ValueError(f"Unsupported optimizer: {other}")
+
+    trainer, fwd_state = Trainer.initialize(model, opt)
+    return trainer, fwd_state, model

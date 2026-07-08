@@ -109,7 +109,8 @@ def _train_and_query_loss(
     indices into ``stream.weights.view(-1)`` — same lookup downstream
     consumers do against the saved file.
     """
-    from bergson.magic.cli import attach_doc_ids_if_missing, pad_dataset_to_batch_size
+    from bergson.magic.cli import attach_doc_ids_if_missing
+    from bergson.magic.data_stream import pad_dataset_to_batch_size
 
     ds = attach_doc_ids_if_missing(dataset)
     if shuffle_seed is not None:
@@ -277,7 +278,8 @@ def _run_magic_cli(
     Returns (scores, doc_ids). doc_ids is None for per-doc runs (scores are
     already indexed by doc id and need no auxiliary lookup).
     """
-    from bergson.magic.cli import attach_doc_ids_if_missing, pad_dataset_to_batch_size
+    from bergson.magic.cli import attach_doc_ids_if_missing
+    from bergson.magic.data_stream import pad_dataset_to_batch_size
 
     ds = attach_doc_ids_if_missing(dataset)
     if shuffle_seed is not None:

@@ -1,4 +1,4 @@
-# Single-step MAGIC attribution example (GPT-2 / WikiText-2, multi-node).
+# Single-step MAGIC attribution example (GPT-2 / WikiText, multi-node).
 
 # Run with `bergson examples/magic/gpt2_wikitext.yaml`
 
@@ -10,15 +10,13 @@ steps:
       cleanup_ckpts: false
 
       data:
-        dataset: Salesforce/wikitext
-        subset: wikitext-2-raw-v1
+        dataset: EleutherAI/bergson-wikitext-512-chunks
         split: "train"
         chunk_length: 512
 
       query:
-        dataset: Salesforce/wikitext
-        subset: wikitext-2-raw-v1
-        split: "test[3:4]"
+        dataset: EleutherAI/bergson-wikitext-512-chunks
+        split: "test[0:1]"
         chunk_length: 0
 
       distributed:
@@ -26,7 +24,7 @@ steps:
         nnode: 4
 
       batch_size: 256
-      num_epochs: 2
+      num_epochs: 4
       lr_schedule:
         lr_scheduler_type: polynomial
         lr: 0.0008
@@ -36,3 +34,7 @@ steps:
 
       subset_strategy: random
       wandb_project: magic
+      num_subsets: 400
+      subset_fraction: 0.01
+      save_optimizer_state: True
+      save_retrained_models: True

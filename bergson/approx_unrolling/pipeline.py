@@ -184,7 +184,9 @@ def approx_unrolling_pipeline(
         query_cfg.data = approx_unrolling_cfg.query
         query_cfg.run_path = str(query_path)
         query_cfg.projection_dim = 0
-        query_preprocess_cfg = PreprocessConfig(aggregation="mean")
+        query_preprocess_cfg = PreprocessConfig(
+            aggregation=approx_unrolling_cfg.query_aggregation
+        )
         save_run_config(
             Build(query_cfg, query_preprocess_cfg),
             query_cfg.partial_run_path,
