@@ -86,16 +86,6 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
         approximate_hessians(query_hess_cfg, hess_cfg)
 
     # Step 3: Mix query and value hessians
-    #
-    # Unlike the other steps, mixing is plain launcher-level work with no
-    # distributed launch, so it has no implicit cross-node barrier. The
-    # query/value hessians are finalized by a single ``shutil.move`` on global
-    # rank 0 (node 0) with no barrier afterward, so running the mix on every
-    # node races node 0's move + Lustre metadata propagation and non-rank-0
-    # nodes crash with "No hessian_cfg recorded at '.../query_hessian'". Run
-    # the mix only on node 0 (which performed the moves and therefore sees the
-    # inputs), then barrier so the other nodes wait for mixed_hessian to be
-    # written before Step 4's build reads it.
     print("Step 3/5: Mixing hessians...")
     if not _step_complete(mixed_hess_path, resume):
         if index_cfg.distributed._node_rank == 0:
