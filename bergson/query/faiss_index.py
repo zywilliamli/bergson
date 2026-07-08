@@ -151,7 +151,13 @@ def index_to_device(index: Index, device: str) -> Index:
         options.shard = True
         return faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
 
-    return faiss.index_gpu_to_cpu(index)
+    # Destination is CPU. The index read from disk (or built on CPU) is already a
+    # CPU index, so this is a no-op. We must NOT call `index_gpu_to_cpu` here: it
+    # clones the index, which raises `RuntimeError: clone not supported ...` for
+    # CPU indices backed by `OnDiskInvertedLists` (i.e. any IVF/ANN index mmap'd
+    # from disk). Genuine GPU-to-CPU moves are handled explicitly at the call
+    # site that owns a GPU index (see `create_index`).
+    return index
 
 
 class FaissIndex:
@@ -280,7 +286,11 @@ class FaissIndex:
 
             del grads_chunk
 
-            index = index_to_device(index, "cpu")
+            # Bring the freshly built index back to CPU before serialization.
+            # Only a genuinely GPU-resident index needs conversion; a CPU build
+            # is already on CPU (and `index_to_device` no longer clones it).
+            if device != "cpu":
+                index = faiss.index_gpu_to_cpu(index)
             faiss.write_index(index, str(shard_path))
 
         ordered_modules = []

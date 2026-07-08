@@ -6,7 +6,7 @@ from typing import Any, Callable, Generator
 
 from transformers import AutoTokenizer
 
-from bergson import Attributor, FaissConfig
+from bergson import Attributor
 from bergson.config import IndexConfig, QueryConfig
 from bergson.data import load_data_string
 from bergson.utils.utils import setup_reproducibility
@@ -85,7 +85,7 @@ def query(
         index_cfg.data.data_kwargs,
     )
 
-    faiss_cfg = FaissConfig() if query_cfg.faiss else None
+    faiss_cfg = query_cfg.faiss_cfg if query_cfg.faiss else None
     attr = Attributor(Path(query_cfg.index), device="cuda", faiss_cfg=faiss_cfg)
 
     # Get the device of the first model parameter for multi-GPU setups
