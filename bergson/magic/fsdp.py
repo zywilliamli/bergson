@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import TypeVar
 
 import torch
 from torch.distributed.tensor import (
@@ -46,7 +47,10 @@ class ReplicateComputation(torch.nn.Module):
         )
 
 
-def simple_fsdp(model: torch.nn.Module) -> torch.nn.Module:
+ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
+
+
+def simple_fsdp(model: ModuleT) -> ModuleT:
     """SimpleFSDP: Simpler Fully Sharded Data Parallel with torch.compile"""
     # For each unique parameter, construct a list of the places in the model where it
     # appears. This is a bit wonky, but it is the best way to handle tied weights.
