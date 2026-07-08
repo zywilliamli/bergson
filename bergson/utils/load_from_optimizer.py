@@ -142,7 +142,6 @@ def get_normalizers(
     device,
     base_prefix="",
     model=None,
-    eps_root=0.0,
 ):
     normalizers: dict[str, Normalizer] = {}
     for param_idx, state in optimizer_state["state"].items():

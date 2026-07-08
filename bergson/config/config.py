@@ -329,7 +329,10 @@ class TrainingConfig(AttributionConfig, Serializable):
     """Beta2 for AdamW optimizer."""
 
     eps_root: float = 1e-8
-    """Epsilon root for AdamW optimizer."""
+    """Epsilon root for AdamW optimizer.
+
+    Note for TrackStar attribution: Adam normalization with a non-zero
+    eps_root is untested. We recommend setting it to zero."""
 
     optimizer: Literal["adamw", "muon", "sgd"] = "adamw"
     """Optimizer to use for the training steps. Muon is an efficient
@@ -377,11 +380,35 @@ class ValidationConfig(TrainingConfig, ABC):
     permutation. These scores may be produced by items with fewer than
     2 tokens."""
 
+    save_retrained_models: bool = False
+    """When True, save each leave-k-out retrained model (HF format, weights +
+    tokenizer) to ``<run_path>/retrained/subset_<i>/`` so it can be reused for
+    later attribution queries without retraining. ~0.5 GB per subset for GPT-2."""
+
+    query_splits: list[str] = field(default_factory=list)
+    """Evaluate several queries in one leave-k-out sweep. Each split (e.g.
+    "test[3:4]") gets its own query stream built from ``query`` with the split
+    overridden; every retrained subset records one loss diff per split
+    (``validation.csv`` columns ``diff_<split>``), per-split baselines go to
+    ``baselines.json``, and the doc-id subsets to ``subsets.json``. Requires
+    precomputed scores (validate-only); ``query.split`` is ignored."""
+
+    subsets_file: str = ""
+    """Path to a JSON list of doc-id lists specifying the leave-k-out subsets
+    explicitly. Used verbatim and in order, so each ``validation.csv`` row maps
+    back to a known doc set. Bypasses ``num_subsets``/``subset_strategy``/
+    ``exclude_zero_scores``."""
+
     subset_fraction: float = 0.0
     """When > 0, each of the ``num_subsets`` leave-k-out subsets is an
     independent draw (without replacement within a subset, overlapping across
     subsets) of ``round(subset_fraction * pool)`` docs from the validation
     pool — e.g. 0.05 drops 5 percent of the data per subset."""
+
+
+    skip_validation: bool = False
+    """Stop after computing and saving attribution scores, before the
+    leave-k-out retraining loop. Useful for score-only MAGIC runs."""
 
 
 @dataclass
@@ -483,7 +510,10 @@ class IndexConfig(AttributionConfig, Serializable):
     """Source for optimizer second moments used to normalize gradients.
     Either a local path (a checkpoint directory containing ``optimizer.pt``,
     or a path to an optimizer state file directly) or a Hugging Face URI
-    ``hf://<repo>[@<revision>][/<path>]``."""
+    ``hf://<repo>[@<revision>][/<path>]``.
+
+    Note: Untested with the AdamW eps_root in the bergson trainer -  
+    consider setting this to 0 when using optimizer normalization."""
 
     loss_fn: Literal["ce", "kl"] = "ce"
     """Loss function to use."""
