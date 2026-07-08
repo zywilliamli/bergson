@@ -18,7 +18,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 from bergson.config import FaissConfig
 from bergson.query.faiss_index import FaissIndex
@@ -79,9 +78,7 @@ def _build_and_load(
     mmap_index: bool,
     query: np.ndarray,
 ):
-    cfg = FaissConfig(
-        index_factory=index_factory, mmap_index=mmap_index, num_shards=1
-    )
+    cfg = FaissConfig(index_factory=index_factory, mmap_index=mmap_index, num_shards=1)
     # unit_norm=True stores cosine-normalized gradients; with the inner-product
     # metric the self-match then has cosine 1.0, so a query row's own index is
     # deterministically its top neighbour (independent of vector magnitudes).
