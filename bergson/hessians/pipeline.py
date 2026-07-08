@@ -71,8 +71,9 @@ def hessian_pipeline(
 
     durations: dict[str, float] = {}
 
-    # ── Step 1: Build mean query gradient ─────────────────────────────────
-    print("Step 1/4: Building mean query gradient...")
+    # ── Step 1: Build query gradient(s) ───────────────────────────────────
+    aggregation = hessian_pipeline_cfg.query_aggregation
+    print(f"Step 1/4: Building query gradient(s) (aggregation={aggregation})...")
     if not _step_complete(query_path, resume):
         with _timed("step1_build_query", durations):
             query_cfg = deepcopy(index_cfg)
@@ -81,7 +82,7 @@ def hessian_pipeline(
             query_cfg.projection_dim = 0
             _validate(query_cfg)
 
-            query_preprocess_cfg = PreprocessConfig(aggregation="mean")
+            query_preprocess_cfg = PreprocessConfig(aggregation=aggregation)
             save_run_config(
                 Build(query_cfg, query_preprocess_cfg),
                 query_cfg.partial_run_path,

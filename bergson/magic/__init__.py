@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .cli import MagicConfig as MagicConfig
-    from .cli import evaluate_retrained as evaluate_retrained
     from .cli import run_magic as run_magic
     from .data_stream import DataStream as DataStream
     from .dtensor_patch import apply_dtensor_patch as apply_dtensor_patch
@@ -16,17 +15,20 @@ if TYPE_CHECKING:
     from .trainer import (
         TrainerState as TrainerState,
     )
+    from .trainer import (
+        prepare_trainer as prepare_trainer,
+    )
 
 _module_map = {
     "MagicConfig": ".cli",
     "run_magic": ".cli",
-    "evaluate_retrained": ".cli",
     "DataStream": ".data_stream",
     "apply_dtensor_patch": ".dtensor_patch",
     "muon": ".optim",
     "BackwardState": ".trainer",
     "Trainer": ".trainer",
     "TrainerState": ".trainer",
+    "prepare_trainer": ".trainer",
 }
 
 

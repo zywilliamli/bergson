@@ -237,9 +237,12 @@ def score_per_segment_and_aggregate(
         score_dataset(seg_index_cfg, score_cfg, seg_preprocess_cfg)
         score_dirs.append(scores_dir)
 
-    total = load_scores(score_dirs[0]).get(slice(None), 0)
+    total = load_scores(score_dirs[0])[:]
     for scores_dir in score_dirs[1:]:
-        total = total + load_scores(scores_dir).get(slice(None), 0)
+        total = total + load_scores(scores_dir)[:]
+    # Make single-query runs 1D.
+    if total.ndim == 2 and total.shape[1] == 1:
+        total = total[:, 0]
     out_path = base_run / "scores.npy"
     np.save(out_path, total)
     return out_path

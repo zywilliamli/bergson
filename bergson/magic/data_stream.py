@@ -5,6 +5,63 @@ from datasets import Dataset
 from ..data import pad_and_tensor
 
 
+def pad_dataset_to_batch_size(
+    dataset: Dataset,
+    batch_size: int,
+    num_docs: int,
+    label: str,
+    global_rank: int,
+) -> tuple[Dataset, int, int, int]:
+    """Pad dataset to be divisible by batch_size by repeating the last example.
+
+    Returns (padded_dataset, num_docs, pad_count, weight_pad_count).
+
+    `pad_count` is the number of rows appended to the dataset (0 if unchanged).
+    `weight_pad_count` is the number of trailing entries of a *1D* per-doc
+    weight tensor that should be zeroed to silence the pad rows' training
+    contribution.
+
+    - If the dataset has a "doc_ids" column, `.select(total - 1, ...)` copies
+      the last doc's doc_ids into every pad row. Zeroing the last `pad_count`
+      entries of a weights-indexed-by-doc_id tensor would silence real docs,
+      so we instead route pad rows to a fresh synthetic doc id (=num_docs),
+      bump num_docs by 1, and set `weight_pad_count = 1`.
+    - Otherwise rows are self-identified docs: num_docs becomes the padded
+      length and `weight_pad_count = pad_count` zeros the pad rows directly.
+
+    In per-token (2D) mode callers should zero `weights[-pad_count:]` instead
+    — `weight_pad_count` applies only to 1D per-doc weights.
+    """
+    remainder = len(dataset) % batch_size
+    if not remainder:
+        return dataset, num_docs, 0, 0
+
+    pad_count = batch_size - remainder
+    total = len(dataset)
+    pad_indices = list(range(total)) + [total - 1] * pad_count
+    dataset = dataset.select(pad_indices)
+
+    if "doc_ids" in dataset.column_names:
+        synthetic_doc_id = num_docs
+        new_doc_ids = [
+            row if i < total else [synthetic_doc_id] * len(row)
+            for i, row in enumerate(dataset["doc_ids"])
+        ]
+        dataset = dataset.remove_columns("doc_ids").add_column("doc_ids", new_doc_ids)
+        num_docs += 1
+        weight_pad_count = 1
+    else:
+        num_docs = len(dataset)
+        weight_pad_count = pad_count
+
+    if global_rank == 0:
+        print(
+            f"{label}: padded {pad_count}/{total} examples "
+            f"(weight=0) to fill last batch"
+        )
+    return dataset, num_docs, pad_count, weight_pad_count
+
+
 class DataStream:
     def __init__(
         self,
@@ -38,16 +95,19 @@ class DataStream:
     def requires_grad(self, value: bool):
         self.weights.requires_grad = value
 
-    def __getitem__(self, i: int) -> dict:
-        if i < 0 or i >= len(self):
-            raise IndexError("DataStream index out of range")
-
+    def batch_rows(self, i: int) -> list[int]:
+        """The current rank's dataset row indices for batch ``i``."""
         rng = range(
             i * self.batch_size,
             min((i + 1) * self.batch_size, len(self.dataset)),
         )
-        indices = list(rng)[self.rank :: self.world_size]
+        return list(rng)[self.rank :: self.world_size]
 
+    def __getitem__(self, i: int) -> dict:
+        if i < 0 or i >= len(self):
+            raise IndexError("DataStream index out of range")
+
+        indices = self.batch_rows(i)
         batch = self.dataset[indices]
         x, y, valid_mask = pad_and_tensor(
             batch["input_ids"],

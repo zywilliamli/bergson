@@ -669,7 +669,11 @@ class ApproxUnrollingConfig(Serializable):
     empty, inferred from per-checkpoint step counts."""
 
     query: DataConfig = field(default_factory=DataConfig)
-    """Query dataset spec; mean gradient at the final checkpoint."""
+    """Query dataset spec; gradients computed at the final checkpoint."""
+
+    query_aggregation: Literal["mean", "sum", "none"] = "mean"
+    """How to aggregate the query gradients. "none" produces one
+    score column per query."""
 
 
 @dataclass
@@ -732,6 +736,10 @@ class HessianPipelineConfig:
 
     query: DataConfig = field(default_factory=DataConfig)
     """Query dataset specification."""
+
+    query_aggregation: Literal["mean", "sum", "none"] = "mean"
+    """How to aggregate the query gradients. "none" produces
+    one score column per query."""
 
     inversion_cfg: InversionConfig = field(default_factory=InversionConfig)
     """How to invert the fitted EKFAC Hessian when applying it to the query."""
