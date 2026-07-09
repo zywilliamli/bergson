@@ -1,6 +1,105 @@
 # CHANGELOG
 
 
+## v0.10.1 (2026-07-09)
+
+### Bug Fixes
+
+- Load mmap'd FAISS ANN indices on CPU without crashing
+  ([`12e54ac`](https://github.com/EleutherAI/bergson/commit/12e54acdf8345405c06a16c5a4d52be7903642a7))
+
+`index_to_device(index, "cpu")` unconditionally called `faiss.index_gpu_to_cpu`, which clones the
+  index and raises `RuntimeError: clone not supported ... OnDiskInvertedLists` for any IVF/ANN index
+  mmap'd from disk (the shipped `mmap_index=False` default). Only exact `Flat` survived. The CPU
+  branch is now a no-op; the GPU->CPU conversion after a GPU build is done explicitly in
+  `create_index` only when `device != "cpu"`.
+
+Also expose the FAISS index config on the `query` CLI (nested `QueryConfig.faiss_cfg`) so ANN /
+  `mmap_index=True` is actually reachable, and add a regression test for the on-disk ANN CPU load
+  path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_012NMtUnc12k72cAXd4uRMzN
+
+### Documentation
+
+- Drop redundant inline comments at index_to_device call sites
+  ([`2ebc293`](https://github.com/EleutherAI/bergson/commit/2ebc293fb936f88c4ec7987f354df5fc7685a2d4))
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01EeaHeis3YkmXwc5emPJnXo
+
+- Trim index_to_device docstring
+  ([`5ecc0b0`](https://github.com/EleutherAI/bergson/commit/5ecc0b0f6b3531688ee060453ed258bab7f996eb))
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01EeaHeis3YkmXwc5emPJnXo
+
+### Refactoring
+
+- Keep symmetric index_to_device, fix the bug at the __init__ call site
+  ([`50345cf`](https://github.com/EleutherAI/bergson/commit/50345cf6d09ce87fac16224ba4242b479d7c264c))
+
+Revert the index_to_gpu rename. index_to_device stays a symmetric CPU<->GPU move; the actual bug was
+  only that `FaissIndex.__init__` routed an already-CPU mmap'd shard through it with `"cpu"`,
+  hitting the `index_gpu_to_cpu` clone that crashes on OnDiskInvertedLists. The loader now guards
+  `device != "cpu"` so an already-CPU shard is never moved, and `create_index` uses the same helper
+  for its genuine GPU->CPU conversion (also guarded). No behavioural change on any tested path; the
+  crash stays fixed.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01EeaHeis3YkmXwc5emPJnXo
+
+- Make index_to_device self-guarding (no-op when already on target)
+  ([`fc43de6`](https://github.com/EleutherAI/bergson/commit/fc43de6aa02c345f0aed41459eec48f99b5a6501))
+
+Rather than requiring call sites to know "don't ask for cpu if it's already cpu", `index_to_device`
+  now detects GPU residency (`_is_gpu_resident`: a direct GpuIndex, or the IndexShards/IndexReplicas
+  container a multi-GPU move returns) and treats a CPU->CPU request as a no-op, returning the index
+  unchanged instead of cloning via `index_gpu_to_cpu` (which crashes on mmap'd OnDiskInvertedLists).
+  Both call sites (`FaissIndex.__init__`, `create_index`) drop their `device != "cpu"` guards and
+  just call the helper.
+
+Adds unit tests for the guard: it no-ops on an in-memory CPU index and on the mmap'd OnDisk index
+  that used to crash (asserting the raw `index_gpu_to_cpu` still raises, so the regression case is
+  real).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01EeaHeis3YkmXwc5emPJnXo
+
+- Rename index_to_device -> index_to_gpu, drop dead CPU branch
+  ([`080bbf0`](https://github.com/EleutherAI/bergson/commit/080bbf0380e5f77ab9b62a1c5cc859a935b32e45))
+
+The CPU destination in `index_to_device` was only ever a no-op after the prior fix:
+  `FaissIndex.__init__` reads shards from disk (already CPU) and only ever needs to push *up* to a
+  GPU, and the one genuine GPU->CPU move lives in `create_index`. Rename to `index_to_gpu` (no-op on
+  "cpu") and guard the loader call with `device != "cpu"` so the direction is explicit and the
+  OnDiskInvertedLists clone trap cannot be reintroduced. Also trims a verbose config docstring.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01EeaHeis3YkmXwc5emPJnXo
+
+### Testing
+
+- Cover the index_to_device op path, not just the no-op
+  ([`64484d8`](https://github.com/EleutherAI/bergson/commit/64484d8e2968ad8eb7847ef35b32fa7b2ce50ba2))
+
+Add a test that a GPU-resident index is actually converted (not returned as-is): an `IndexShards`
+  container is what a multi-GPU move returns and what `_is_gpu_resident` flags for conversion, so
+  bringing it to CPU must yield a new, non-container, still-searchable index. Complements the two
+  no-op tests.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01EeaHeis3YkmXwc5emPJnXo
+
+
 ## v0.10.0 (2026-06-05)
 
 ### Features
