@@ -773,13 +773,10 @@ class CollectorComputer:
                 )
                 total_processed += valid_mask.sum()
 
-                # ``valid_mask`` marks completion positions (labels[t+1] != -100)
-                # and drives the loss-scoped consumers (Hessian factors, MAGIC).
-                # Per-token gradient rows, however, cover EVERY real position:
-                # g_t is nonzero at prompt positions too (completion losses
-                # backprop through them via attention), so storing all positions
-                # makes the per-token rows sum to the per-document gradient. Only
-                # right-padding and the final position (predicts nothing) drop out.
+                # Per-token rows span every real position (g_t is nonzero at
+                # prompt positions too), so they sum to the per-doc gradient.
+                # valid_mask is left completion-only for the KFAC/Shampoo Hessian
+                # collectors that also run through this loop.
                 if self.collector.attribute_tokens:
                     lengths = torch.tensor(
                         [len(ids) for ids in batch["input_ids"]],
