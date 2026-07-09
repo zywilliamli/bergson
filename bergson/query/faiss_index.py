@@ -210,8 +210,6 @@ class FaissIndex:
                 str(shard_path),
                 faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY,
             )
-            # Shards are read as CPU indices; move to the query device when
-            # in-memory. `index_to_device` no-ops when `device` is already CPU.
             if not mmap_index:
                 shard = index_to_device(shard, device)
 
@@ -300,8 +298,6 @@ class FaissIndex:
 
             del grads_chunk
 
-            # Bring the index back to CPU before serialization (a no-op for a CPU
-            # build; converts a GPU-built index).
             index = index_to_device(index, "cpu")
             faiss.write_index(index, str(shard_path))
 
