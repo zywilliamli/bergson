@@ -218,6 +218,7 @@ def worker(
         log_fn=log_fn,
         resume=resume,
         fsdp=run_cfg.fsdp,
+        max_grad_norm=run_cfg.max_grad_norm,
     )
     if getattr(run_cfg, "save_optimizer_state", False) and global_rank == 0:
         save_second_moments_as_optimizer_pt(
@@ -306,6 +307,7 @@ def worker(
             resume=run_cfg.resume,
             save_every=run_cfg.backward_save_every,
             save_mode=run_cfg.save_mode,
+            max_grad_norm=run_cfg.max_grad_norm,
         )
         if world_size > 1:
             dist.all_reduce(bwd_state.weight_grads, op=dist.ReduceOp.SUM)

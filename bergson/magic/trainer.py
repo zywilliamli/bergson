@@ -21,7 +21,7 @@ from torch.distributed._functional_collectives import (
 from torch.distributed._functional_collectives import (
     wait_tensor,
 )
-from torch.distributed.tensor import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, init_device_mesh
 from torchopt.pytree import tree_flatten_with_path, tree_iter, tree_map
 from torchopt.typing import GradientTransformation, OptState
 from tqdm.auto import tqdm
@@ -270,7 +270,11 @@ class Trainer:
         state = TrainerState(params, opt_state, buffers)
         return cls(model, optimizer), state
 
-    def __init__(self, model: nn.Module, optimizer: GradientTransformation):
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: GradientTransformation,
+    ):
         # Move only trainable parameters to the meta device, leaving frozen params
         # on device so they don't need to be managed by TrainerState.
         for mod in model.modules():
@@ -291,6 +295,7 @@ class Trainer:
         inplace: bool = False,
         trace: bool = False,
         fsdp: bool = False,
+        max_grad_norm: float | None = None,
     ) -> TrainerState:
         """Perform a single training step on `state`, returning the new state.
 
@@ -308,6 +313,9 @@ class Trainer:
                 training is being used, the trainer will perform its own all-reduce of
                 gradients. If True, the trainer will assume that FSDP is handling
                 gradient synchronization, and will not perform any all-reduces itself.
+            max_grad_norm: Clip gradients to this global norm before the optimizer step,
+                matching HuggingFace Trainer's ``max_grad_norm``. ``None`` or ``0``
+                disables clipping.
         """
         torch.random.set_rng_state(state.cpu_rng_state)
 
@@ -349,6 +357,29 @@ class Trainer:
             else:
                 for g in grads.values():
                     dist.all_reduce(g, op=dist.ReduceOp.AVG)
+
+        # Clip by global norm over all params and ranks/FSDP shards.
+        if max_grad_norm:
+            # cast: sum()'s int start value widens the type to `Tensor | int`.
+            sq_norm = cast(torch.Tensor, sum(g.pow(2).sum() for g in grads.values()))
+            if fsdp:
+                # Sharded grads give a partial sum; redistribute (autograd-aware) to
+                # sum across the mesh. DDP grads are already all-reduced above.
+                assert isinstance(
+                    sq_norm, DTensor
+                ), "fsdp=True but grads aren't DTensors"
+                sq_norm = sq_norm.redistribute(placements=[Replicate()])
+            else:
+                assert not isinstance(
+                    sq_norm, DTensor
+                ), "DTensor grads require fsdp=True"
+            coef = (max_grad_norm / (sq_norm.sqrt() + 1e-6)).clamp(max=1.0)
+            if trace:
+                # Out-of-place to keep the clip in the autograd graph.
+                grads = {k: g * coef for k, g in grads.items()}
+            else:
+                for g in grads.values():
+                    g.mul_(coef)
 
         updates, new_state = self.optimizer.update(
             grads, state.opt_state, inplace=inplace, params=state.params
@@ -401,6 +432,7 @@ class Trainer:
         log_fn: Callable[[int, float], None] | None = None,
         resume: bool = False,
         fsdp: bool = False,
+        max_grad_norm: float | None = None,
     ) -> TrainerState:
         """Train the model on the given data stream, starting from the given state.
 
@@ -422,6 +454,8 @@ class Trainer:
                 loading the most recent checkpoint from `save_dir`.
             fsdp: Flag to pass to `Trainer.step`, indicating whether the model is
                 wrapped with FSDP.
+            max_grad_norm: Clip gradients to this global norm before each optimizer
+                step. Passed through to `Trainer.step`.
 
         Returns:
             The final trainer state after training.
@@ -478,7 +512,14 @@ class Trainer:
                         raise ValueError(f"Unsupported save mode: {other}")
 
             x = data[i]
-            state = self.step(state, x, inplace=inplace, trace=trace, fsdp=fsdp)
+            state = self.step(
+                state,
+                x,
+                inplace=inplace,
+                trace=trace,
+                fsdp=fsdp,
+                max_grad_norm=max_grad_norm,
+            )
 
             if log_fn is not None:
                 log_fn(i, self._last_loss)
@@ -549,6 +590,7 @@ class Trainer:
         resume: bool = False,
         save_every: int = 0,
         save_mode: MagicSaveMode = "sqrt",
+        max_grad_norm: float | None = None,
     ) -> BackwardState:
         """Run a backward pass through the training trajectory saved at `ckpt_dir`.
 
@@ -577,6 +619,10 @@ class Trainer:
             save_mode: The save mode that was used during the forward trajectory, which
                 determines how checkpoints are spaced and thus how the backward pass
                 should step forward through the trajectory when replaying.
+            max_grad_norm: Clip gradients to this global norm before each optimizer
+                step when replaying the forward trajectory. Must match the value used
+                during the forward pass for the replay to be faithful. Passed through
+                to `Trainer.step`.
 
         Returns:
             The final backward state after processing the entire trajectory.
@@ -663,6 +709,7 @@ class Trainer:
                     inplace=inplace,
                     trace=False,
                     fsdp=fsdp,
+                    max_grad_norm=max_grad_norm,
                 )
                 idx += 1
                 sub_pbar.update()
@@ -709,6 +756,7 @@ class Trainer:
                 data[fwd_state.batch_index],
                 trace=True,
                 fsdp=fsdp,
+                max_grad_norm=max_grad_norm,
             )
             main_pbar.update()
 
