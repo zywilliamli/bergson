@@ -6,7 +6,7 @@ from typing import Any, Callable, Generator
 
 from transformers import AutoTokenizer
 
-from bergson import Attributor, FaissConfig
+from bergson import Attributor
 from bergson.config.config import IndexConfig, QueryConfig
 from bergson.config.config_io import CONFIG_FILENAME, load_subconfig
 from bergson.data import load_data_string
@@ -91,7 +91,7 @@ def query(
         index_cfg.data.data_kwargs,
     )
 
-    faiss_cfg = FaissConfig() if query_cfg.faiss else None
+    faiss_cfg = query_cfg.faiss_cfg if query_cfg.faiss else None
     attr = Attributor(
         Path(query_cfg.index),
         device="cuda",

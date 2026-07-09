@@ -547,6 +547,42 @@ class IndexConfig(AttributionConfig, Serializable):
 
 
 @dataclass
+class FaissConfig:
+    """Configuration for FAISS index."""
+
+    index_factory: str = "Flat"
+    """
+    The [FAISS index factory string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
+
+    Common FAISS factory strings:
+        - "IVF1,SQfp16": exact nearest neighbors with brute force search and fp16.
+            Valid for CPU or memmapped indices.
+        - "IVF1024,SQfp16": approximate nearest neighbors with 1024 cluster centers
+            and fp16. Fast approximate queries are produced at the cost of a slower
+            initial index build.
+        - "PQ6720": nearest neighbors with vector product quantization to 6720 elements.
+            Reduces memory usage at the cost of accuracy.
+    """
+
+    mmap_index: bool = False
+    """Whether to query the gradients on-disk."""
+
+    max_train_examples: int | None = None
+    """The maximum number of examples to train the index on.
+        If `None`, all examples will be used."""
+
+    batch_size: int = 1024
+    """The batch size for pre-processing gradients."""
+
+    num_shards: int = 1
+    """The number of shards to build for an index.
+        Using more shards reduces peak RAM usage."""
+
+    nprobe: int = 10
+    """The number of FAISS vector clusters to search if using ANN."""
+
+
+@dataclass
 class QueryConfig(Serializable):
     """Config for querying an existing gradient index."""
 
@@ -580,6 +616,9 @@ class QueryConfig(Serializable):
 
     faiss: bool = False
     """Whether to use FAISS for the query."""
+
+    faiss_cfg: FaissConfig = field(default_factory=FaissConfig)
+    """FAISS index configuration, used only when ``faiss=True``."""
 
     top_k: int = 5
     """Number of top (and bottom) results to return per query."""
@@ -692,42 +731,6 @@ class HessianConfig(Serializable):
     use_dataset_labels: bool = False
     """Whether to use dataset labels for Hessian (empirical Fisher) approximation.
     If false, the model predictions will be used."""
-
-
-@dataclass
-class FaissConfig:
-    """Configuration for FAISS index."""
-
-    index_factory: str = "Flat"
-    """
-    The [FAISS index factory string](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index).
-
-    Common FAISS factory strings:
-        - "IVF1,SQfp16": exact nearest neighbors with brute force search and fp16.
-            Valid for CPU or memmapped indices.
-        - "IVF1024,SQfp16": approximate nearest neighbors with 1024 cluster centers
-            and fp16. Fast approximate queries are produced at the cost of a slower
-            initial index build.
-        - "PQ6720": nearest neighbors with vector product quantization to 6720 elements.
-            Reduces memory usage at the cost of accuracy.
-    """
-
-    mmap_index: bool = False
-    """Whether to query the gradients on-disk."""
-
-    max_train_examples: int | None = None
-    """The maximum number of examples to train the index on.
-        If `None`, all examples will be used."""
-
-    batch_size: int = 1024
-    """The batch size for pre-processing gradients."""
-
-    num_shards: int = 1
-    """The number of shards to build for an index.
-        Using more shards reduces peak RAM usage."""
-
-    nprobe: int = 10
-    """The number of FAISS vector clusters to search if using ANN."""
 
 
 @dataclass

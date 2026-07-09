@@ -120,9 +120,26 @@ def _require_faiss() -> ModuleType:
     return faiss_module
 
 
+def _is_gpu_resident(index: Index) -> bool:
+    """
+    Whether a FAISS index actually lives on a GPU.
+
+    Covers both a direct ``GpuIndex`` and the CPU-side ``IndexShards`` /
+    ``IndexReplicas`` container that ``index_cpu_to_gpus_list`` returns for a
+    multi-GPU move (its sub-indices are on the GPU). Such containers only ever
+    originate from that call in this codebase, so treating them as GPU-resident is
+    safe.
+    """
+    faiss = _require_faiss()
+    return isinstance(index, faiss.GpuIndex) or isinstance(
+        index, (faiss.IndexReplicas, faiss.IndexShards)
+    )
+
+
 def index_to_device(index: Index, device: str) -> Index:
     """
-    Move a FAISS index between CPU and GPU devices, optionally sharding.
+    Move a FAISS index onto ``device``, returning it unchanged if it is already
+    there.
 
     Parameters
     ----------
@@ -151,7 +168,8 @@ def index_to_device(index: Index, device: str) -> Index:
         options.shard = True
         return faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
 
-    return faiss.index_gpu_to_cpu(index)
+    # Destination is CPU: only convert an index that is genuinely on a GPU.
+    return faiss.index_gpu_to_cpu(index) if _is_gpu_resident(index) else index
 
 
 class FaissIndex:
