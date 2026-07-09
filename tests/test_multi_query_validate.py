@@ -84,3 +84,70 @@ def test_load_attribution_scores_npy_and_pt(tmp_path):
     torch.save(torch.zeros(5, 2), pt_path)
     scores, multi_query = load_attribution_scores(str(pt_path))
     assert not multi_query
+
+
+def test_weighted_ce_sum_of_means_reduction():
+    """sum_of_means = per-sample token-mean, summed over batch (no /B) —
+    the MAGIC/metagradients convention (arXiv 2503.13751 App. D)."""
+    import torch.nn.functional as F2
+
+    from bergson.utils.math import weighted_causal_lm_ce
+
+    torch.manual_seed(0)
+    B, T, V = 4, 6, 11
+    logits = torch.randn(B, T, V)
+    labels = torch.randint(0, V, (B, T))
+    labels[2, 4:] = -100  # ragged row
+    w = torch.tensor([1.0, 0.0, 1.0, 1.0])
+
+    tok = F2.cross_entropy(
+        logits[:, :-1].reshape(-1, V).float(),
+        labels[:, 1:].reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(B, T - 1)
+    counts = (labels[:, 1:] != -100).sum(1).clamp(min=1).float()
+
+    ss = weighted_causal_lm_ce(
+        logits, labels, example_weight=w, reduction="sum_of_means"
+    )
+    torch.testing.assert_close(ss, ((tok * w[:, None]).sum(1) / counts).sum())
+
+    # Default mean reduction path is unchanged.
+    tm = weighted_causal_lm_ce(logits, labels, example_weight=w)
+    torch.testing.assert_close(tm, (tok * w[:, None]).sum() / (T - 1))
+
+
+def test_metasmoothness_score():
+    """Def. 2 of arXiv 2503.13751: weighted sign agreement of consecutive
+    finite differences."""
+    from bergson.magic.metasmoothness import metasmoothness_score
+
+    torch.manual_seed(0)
+    theta0 = torch.randn(1000)
+    direction = torch.randn(1000)
+
+    # Perfectly linear response -> score 1.
+    score = metasmoothness_score(theta0, theta0 + direction, theta0 + 2 * direction)
+    assert abs(score - 1.0) < 1e-5
+
+    # Second step exactly reverses the first -> score -1.
+    score = metasmoothness_score(theta0, theta0 + direction, theta0 - direction)
+    assert abs(score + 1.0) < 1e-5
+
+    # Independent random increments: Def. 2's movement weighting
+    # (d = |theta_2h - theta_0|) up-weights coordinates where the increments
+    # constructively interfere, so independent noise scores ~+0.45, not 0.
+    r1, r2 = torch.randn(1000), torch.randn(1000)
+    score = metasmoothness_score(theta0, theta0 + r1, theta0 + r1 + r2)
+    assert 0.3 < score < 0.6
+
+    # Mean-reverting second step (theta_2h drawn around theta0, not theta_h)
+    # anti-correlates the increments: the metric flags it as non-smooth.
+    score = metasmoothness_score(
+        theta0, theta0 + torch.randn(1000), theta0 + torch.randn(1000)
+    )
+    assert score < -0.1
+
+    # Zero movement -> defined as perfectly smooth.
+    assert metasmoothness_score(theta0, theta0, theta0) == 1.0

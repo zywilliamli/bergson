@@ -334,6 +334,17 @@ class TrainingConfig(AttributionConfig, Serializable):
     Note for TrackStar attribution: Adam normalization with a non-zero
     eps_root is untested. We recommend setting it to zero."""
 
+    adam_eps: float = 1e-8
+    """Epsilon (outside the square root) for AdamW. MAGIC
+    uses 1e-6."""
+
+    loss_reduction: Literal["mean", "sum_of_means"] = "mean"
+    """How the per-token training losses are reduced to a scalar.
+    "mean" (default): mean over all valid tokens in the batch (standard).
+    "sum_of_means": mean over each sample's tokens,
+    then summed over the batch with no batch-size division — sensitive
+    MAGIC/metagradients design choice (arXiv 2503.13751 App. D)."""
+
     optimizer: Literal["adamw", "muon", "sgd"] = "adamw"
     """Optimizer to use for the training steps. Muon is an efficient
     optimizer that can reduce memory usage and speed up training."""
@@ -358,6 +369,23 @@ class TrainingConfig(AttributionConfig, Serializable):
 
     wandb_project: str = ""
     """Weights & Biases project name. If set, logs training loss to W&B."""
+
+
+@dataclass
+class MetasmoothnessConfig(TrainingConfig):
+    """Config for empirical metasmoothness (arXiv 2503.13751, Def. 2).
+
+    Trains three models with data weights ``1``, ``1 + h*v`` and ``1 + 2h*v``
+    (``v ~ N(0, I)`` over docs) and scores the movement-weighted sign
+    agreement of consecutive finite-difference derivatives in parameter
+    space. Costs three trainings; no retraining bank. The metagradients
+    authors select eps_root and lr by maximizing this metric."""
+
+    h: float = 0.1
+    """Finite-difference step size for the data-weight perturbation."""
+
+    direction_seed: int = 0
+    """Seed for the random perturbation direction ``v``."""
 
 
 @dataclass
