@@ -141,11 +141,6 @@ def index_to_device(index: Index, device: str) -> Index:
     Move a FAISS index onto ``device``, returning it unchanged if it is already
     there.
 
-    Moving an already-CPU index to CPU is a no-op: we must NOT blindly call
-    ``index_gpu_to_cpu`` on it, because that clones the index and raises
-    ``RuntimeError: clone not supported ...`` for a CPU index backed by
-    ``OnDiskInvertedLists`` (any IVF/ANN index mmap'd from disk).
-
     Parameters
     ----------
     index : Index
