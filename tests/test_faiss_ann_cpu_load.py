@@ -194,6 +194,40 @@ def test_index_to_device_cpu_is_noop_on_mmapd_ondisk_index(tmp_path: Path):
 
 
 @requires_faiss
+def test_index_to_device_cpu_converts_a_gpu_resident_index():
+    """When the index needs moving, `index_to_device` actually converts it.
+
+    A CPU-only faiss build can't allocate a real ``GpuIndex``, but an
+    ``IndexShards`` container is exactly what a multi-GPU move returns and what
+    ``_is_gpu_resident`` classifies as needing conversion. Bringing it to CPU must
+    return a *new*, non-container, still-searchable index -- i.e. an op, not a
+    no-op.
+    """
+    import faiss  # type: ignore[import]
+
+    d, n = 8, 6
+    vecs = np.random.default_rng(0).standard_normal((n, d)).astype("float32")
+
+    shards = faiss.IndexShards(d)
+    sub = faiss.IndexFlat(d, faiss.METRIC_INNER_PRODUCT)
+    sub.add(vecs)
+    shards.add_shard(sub)
+
+    assert _is_gpu_resident(shards)
+
+    out = index_to_device(shards, "cpu")
+
+    # A real conversion happened: a new object that is no longer a container.
+    assert out is not shards
+    assert not _is_gpu_resident(out)
+    assert out.ntotal == n
+    # ...and the converted index still searches.
+    _, indices = out.search(vecs[:1], 1)
+    assert indices.shape == (1, 1)
+    assert 0 <= indices[0, 0] < n
+
+
+@requires_faiss
 def test_ann_ivf_mmap_index_true_still_works(tmp_path: Path):
     """The mmap_index=True path (skips index_to_device) must be unaffected."""
     n, dim = 256, 16
