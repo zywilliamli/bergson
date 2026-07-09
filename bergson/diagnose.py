@@ -14,7 +14,8 @@ from datasets import load_dataset
 from simple_parsing import field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from bergson.data import pad_and_tensor
+from bergson.config import DataConfig
+from bergson.data import pad_and_tensor, tokenize
 
 
 @dataclass
@@ -201,13 +202,13 @@ def _print_results(results, threshold):
 
 
 def diagnose_special_tokens(model_name: str):
-    """Check for special token duplication in the two-step chat template pattern.
+    """Check that ``tokenize()`` emits special tokens correctly for a model.
 
-    Simulates what bergson's tokenize() does: apply_chat_template(tokenize=False)
-    then tokenizer(string). Tests both with and without add_special_tokens to
-    detect double BOS/EOS issues.
+    Tokenizes a sample conversation with ``tokenize()`` and compares the result
+    against ``apply_chat_template(tokenize=True)``, the tokenization the model
+    expects. Flags duplicated (double BOS) or missing special tokens.
 
-    Returns True if all checks pass, False if issues were found.
+    Returns True if the check passes, False otherwise.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     bos_id = tokenizer.bos_token_id
@@ -225,136 +226,81 @@ def diagnose_special_tokens(model_name: str):
         {"role": "assistant", "content": "Hi there"},
     ]
 
+    # The tokenization the model expects; also probes for a chat template.
     try:
-        template_str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+        ground_truth = list(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=True,
+            )["input_ids"]
         )
     except Exception:
         print("\n  No chat template found — special token check not applicable.")
         return True
 
-    # Two-step tokenization (what bergson does)
-    ids_with_special = tokenizer(template_str, add_special_tokens=True)["input_ids"]
-    ids_no_special = tokenizer(template_str, add_special_tokens=False)["input_ids"]
+    # What tokenize() produces for the same conversation.
+    try:
+        result = tokenize(
+            {"conversation": [messages]},
+            args=DataConfig(conversation_column="conversation"),
+            tokenizer=tokenizer,
+        )
+    except Exception as e:
+        print(f"\n  FAIL: bergson tokenize() raised {type(e).__name__}: {e}")
+        return False
+    actual = list(result["input_ids"][0])
 
-    # One-step reference
-    ids_direct = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False
-    )
-
-    all_pass = True
-
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False)
     print("\n  Template string (first 200 chars):")
-    print(f"    {template_str[:200]!r}")
+    print(f"    {rendered[:200]!r}")
 
-    # Check BOS
-    if bos_id is not None:
-        bos_count_with = sum(1 for t in ids_with_special[:3] if t == bos_id)
-        bos_count_no = sum(1 for t in ids_no_special[:3] if t == bos_id)
-        bos_count_direct = sum(1 for t in ids_direct[:3] if t == bos_id)
-
-        print(f"\n  BOS token (id={bos_id}) in first 3 tokens:")
-        print(f"    apply_chat_template(tokenize=True):           {bos_count_direct}x")
+    if actual == ground_truth:
         print(
-            f"    two-step + add_special_tokens=True:            {bos_count_with}x"
-            f"{'  <<< DOUBLE BOS' if bos_count_with > 1 else ''}"
+            "\n  PASS: bergson tokenize() matches"
+            " apply_chat_template(tokenize=True)."
         )
-        missing_bos = bos_count_no == 0 and bos_count_direct > 0
+        return True
+
+    print(
+        "\n  FAIL: bergson tokenize() does not match"
+        " apply_chat_template(tokenize=True)."
+    )
+    print(f"    bergson length: {len(actual)}, expected: {len(ground_truth)}")
+
+    # Explain the failure in the usual BOS/EOS terms.
+    seen: set[int] = set()
+    for name, tid in (("BOS", bos_id), ("EOS", eos_id)):
+        if tid is None or tid in seen:
+            continue
+        seen.add(tid)
+        n_actual = actual.count(tid)
+        n_expected = ground_truth.count(tid)
+        if n_actual == n_expected:
+            continue
+        kind = "DUPLICATED" if n_actual > n_expected else "MISSING"
         print(
-            f"    two-step + add_special_tokens=False (bergson): {bos_count_no}x"
-            f"{'  <<< MISSING BOS' if missing_bos else ''}"
+            f"    <<< {kind} {name} (id={tid}): bergson has {n_actual},"
+            f" expected {n_expected}"
         )
 
-        if bos_count_with > 1:
-            print(
-                "\n  WARNING: add_special_tokens=True causes double BOS."
-                " bergson uses add_special_tokens=False to avoid this."
-            )
-
-        # The bergson path (add_special_tokens=False) should match the direct path
-        if bos_count_no == 0 and bos_count_direct > 0:
-            print(
-                "\n  FAIL: Chat template does not include BOS, but the model"
-                " expects one. add_special_tokens=False will produce"
-                " sequences missing BOS."
-            )
-            all_pass = False
-        elif bos_count_no != bos_count_direct:
-            print(
-                f"\n  FAIL: BOS count mismatch between direct ({bos_count_direct})"
-                f" and two-step ({bos_count_no})."
-            )
-            all_pass = False
-
-    # Check EOS duplication (less common but possible)
-    if eos_id is not None and eos_id != bos_id:
-        eos_count_with = sum(1 for t in ids_with_special if t == eos_id)
-        eos_count_no = sum(1 for t in ids_no_special if t == eos_id)
-        eos_count_direct = sum(1 for t in ids_direct if t == eos_id)
-
-        if eos_count_with != eos_count_direct:
-            print(
-                f"\n  WARNING: EOS count differs — direct: {eos_count_direct},"
-                f" two-step+special: {eos_count_with}"
-            )
-
-        if eos_count_no != eos_count_direct:
-            print(
-                f"\n  WARNING: EOS count differs — direct: {eos_count_direct},"
-                f" two-step+no_special (bergson): {eos_count_no}"
-            )
-
-    # Overall sequence comparison: check bergson default (add_special_tokens=False)
-    # first, then fall back to add_special_tokens=True if needed.
-    if ids_no_special == ids_direct:
+    min_len = min(len(actual), len(ground_truth))
+    first_diff = next(
+        (i for i in range(min_len) if actual[i] != ground_truth[i]),
+        min_len,
+    )
+    print(f"    First divergence at position {first_diff}:")
+    if first_diff < min_len:
         print(
-            "\n  PASS: two-step (add_special_tokens=False)"
-            " matches direct tokenization"
-        )
-    elif ids_with_special == ids_direct:
-        print(
-            "\n  FAIL: add_special_tokens=False does NOT match,"
-            " but add_special_tokens=True does."
+            f"      bergson[{first_diff}]  = {actual[first_diff]}"
+            f" ({tokenizer.decode([actual[first_diff]])!r})"
         )
         print(
-            "  This model's chat template does not include all special"
-            " tokens in the rendered string."
+            f"      expected[{first_diff}] = {ground_truth[first_diff]}"
+            f" ({tokenizer.decode([ground_truth[first_diff]])!r})"
         )
-        print(
-            "  To use this model with bergson chat tokenization, the"
-            " DataConfig or tokenize() call needs add_special_tokens=True."
-        )
-        all_pass = False
-    else:
-        # Neither matches — show where the default (False) diverges
-        min_len = min(len(ids_no_special), len(ids_direct))
-        first_diff = next(
-            (i for i in range(min_len) if ids_no_special[i] != ids_direct[i]),
-            min_len,
-        )
-        print(
-            "\n  FAIL: Neither add_special_tokens setting matches"
-            " direct tokenization."
-        )
-        print(
-            f"  Sequences diverge at position {first_diff}"
-            f" (lengths: bergson={len(ids_no_special)},"
-            f" direct={len(ids_direct)})"
-        )
-        if first_diff < min_len:
-            print(
-                f"    bergson[{first_diff}] ="
-                f" {ids_no_special[first_diff]}"
-                f" ({tokenizer.decode([ids_no_special[first_diff]])!r})"
-            )
-            print(
-                f"    direct[{first_diff}]  ="
-                f" {ids_direct[first_diff]}"
-                f" ({tokenizer.decode([ids_direct[first_diff]])!r})"
-            )
-        all_pass = False
-
-    return all_pass
+    return False
 
 
 def diagnose(diagnose_cfg: DiagnoseConfig):
