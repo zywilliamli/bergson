@@ -262,6 +262,14 @@ Not all models are affected — run `bergson test_model_configuration` before en
 
 See `benchmarks/` for scripts to reproduce and generate benchmarks on your own hardware.
 
+# Known limitations
+
+## MoE fused-parameter experts are not attributed
+
+Bergson only tracks `nn.Linear`, HF `Conv1D`, and `nn.Conv{1,2,3}d` modules. In modern MoE models (e.g. gpt-oss, Mixtral, Qwen-MoE, OLMoE in `transformers` 5.x), the experts and router are fused bare `nn.Parameter`s rather than `nn.Linear` layers, so they are silently skipped — only attention projections and `lm_head` are tracked (~1-2% of the model's parameters).
+
+Legacy MoE layouts that implement each expert as a separate `nn.Linear` are fully tracked.
+
 # Development
 
 ```bash
