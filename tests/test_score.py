@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 from ml_dtypes import bfloat16
+from safetensors.torch import save_file
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from bergson.cli.commands import Build
@@ -15,12 +16,22 @@ from bergson.collection import collect_gradients
 from bergson.collector.collector import CollectorComputer
 from bergson.collector.gradient_collectors import GradientCollector
 from bergson.collector.in_memory_collector import InMemoryCollector
-from bergson.config import IndexConfig, PreprocessConfig, ScoreConfig
+from bergson.config import (
+    IndexConfig,
+    InversionConfig,
+    PreprocessConfig,
+    ScoreConfig,
+)
 from bergson.config.config_io import save_run_config
 from bergson.data import create_index
 from bergson.gradients import GradientProcessor
-from bergson.hessians.preconditioner import DensePreconditioner, load_preconditioner
-from bergson.score.score import _make_split_hessian, create_scorer
+from bergson.hessians.preconditioner import (
+    DensePreconditioner,
+    FactoredPreconditioner,
+    load_preconditioner,
+)
+from bergson.hessians.sharded_computation import shard_bounds
+from bergson.score.score import _make_split_hessian, create_scorer, score_dataset
 from bergson.score.score_writer import (
     InMemorySequenceScoreWriter,
     MemmapSequenceScoreWriter,
@@ -499,3 +510,184 @@ def test_precondition_at_build_not_double_applied(tmp_path: Path, model, dataset
     assert torch.allclose(
         from_build, from_score, atol=1e-3, rtol=1e-3
     ), "build-time vs score-time preconditioning differ — query was applied twice"
+
+
+def _write_factored_hessian(
+    path: Path, modules: dict[str, tuple[int, int]], num_shards: int = 1, seed: int = 0
+) -> None:
+    """Write a synthetic factored (EKFAC) Hessian to ``path``.
+
+    Mirrors the on-disk layout of :mod:`bergson.hessians.eigenvectors` that
+    :class:`FactoredPreconditioner` reads: ``eigen_activation_sharded`` (Q_A
+    ``[I, I]``), ``eigen_gradient_sharded`` (Q_G ``[O, O]``), and
+    ``eigenvalue_sharded`` (λ grid ``[O, I]``), plus the ``factor_eig_a``/
+    ``factor_eig_g`` vectors used by factored-Tikhonov.
+    """
+    g = torch.Generator().manual_seed(seed)
+    subdirs = [
+        "eigen_activation_sharded",
+        "eigen_gradient_sharded",
+        "eigenvalue_sharded",
+        "factor_eig_a",
+        "factor_eig_g",
+    ]
+    per_shard: dict[str, list[dict[str, torch.Tensor]]] = {
+        sub: [{} for _ in range(num_shards)] for sub in subdirs
+    }
+    for name, (o, i) in modules.items():
+        q_a = torch.randn(i, i, generator=g)
+        q_g = torch.randn(o, o, generator=g)
+        lam_a = torch.rand(i, generator=g) + 0.1
+        lam_g = torch.rand(o, generator=g) + 0.1
+        grid = torch.outer(lam_g, lam_a)  # [O, I]
+        for r in range(num_shards):
+            ia, ib = shard_bounds(i, r, num_shards)
+            oa, ob = shard_bounds(o, r, num_shards)
+            per_shard["eigen_activation_sharded"][r][name] = q_a[ia:ib].contiguous()
+            per_shard["eigen_gradient_sharded"][r][name] = q_g[oa:ob].contiguous()
+            per_shard["eigenvalue_sharded"][r][name] = grid[oa:ob].contiguous()
+            per_shard["factor_eig_g"][r][name] = lam_g[oa:ob].contiguous()
+            per_shard["factor_eig_a"][r][name] = lam_a.contiguous()  # replicated
+
+    for sub, shards in per_shard.items():
+        d = path / sub
+        d.mkdir(parents=True, exist_ok=True)
+        for r in range(num_shards):
+            save_file(shards[r], str(d / f"shard_{r}.safetensors"))
+
+
+def _write_query_index(
+    path: Path,
+    grads: dict[str, torch.Tensor],
+    preprocess_cfg: PreprocessConfig,
+    num_grads: int,
+) -> Path:
+    """Write a query gradient index (+ its preprocess_cfg) the way reduce would."""
+    path.mkdir(parents=True, exist_ok=True)
+    grad_sizes = {name: g.shape[1] for name, g in grads.items()}
+    index = create_index(
+        path, num_grads=num_grads, grad_sizes=grad_sizes, dtype=np.float32
+    )
+    for name in grad_sizes:
+        index[name][:] = grads[name].numpy()
+    index.flush()
+    # Persist preprocess_cfg like the CLI does, so get_query_grads can tell
+    # whether the query was already preconditioned upstream (e.g. at reduce).
+    save_run_config(Build(IndexConfig(run_path=str(path)), preprocess_cfg), path)
+    return path
+
+
+def test_score_factored_hessian_query_preconditioning(tmp_path: Path, dataset):
+    """A factored (EKFAC) hessian preconditions the query in create_scorer, once.
+
+    Preconditioning recorded at reduce time (query's saved preprocess_cfg carries
+    a hessian_path) and preconditioning applied at score time must yield identical
+    query gradients — and both must differ from the raw query.
+    """
+    device = torch.device("cpu")
+    dtype = torch.float32
+    modules = {"mod_a": (4, 6), "mod_b": (5, 3)}  # (O, I)
+    grad_sizes = {m: o * i for m, (o, i) in modules.items()}
+    num_q = 3
+
+    hessian_path = str(tmp_path / "hessian")
+    _write_factored_hessian(Path(hessian_path), modules)
+
+    rng = torch.Generator().manual_seed(0)
+    raw = {m: torch.randn(num_q, s, generator=rng) for m, s in grad_sizes.items()}
+
+    # One-sided H^-1 applied to the query, as a reduce step would have written.
+    pre = FactoredPreconditioner.from_path(
+        hessian_path, inversion_cfg=InversionConfig(), power=-1.0, device="cpu"
+    )
+    precond = pre.apply({k: v.clone() for k, v in raw.items()})
+
+    q_precond = _write_query_index(
+        tmp_path / "q_precond",
+        precond,
+        PreprocessConfig(hessian_path=hessian_path),
+        num_q,
+    )
+    q_raw = _write_query_index(tmp_path / "q_raw", raw, PreprocessConfig(), num_q)
+
+    def scored_query_grads(query_path: Path, tag: str, score_hessian) -> torch.Tensor:
+        scorer = create_scorer(
+            path=tmp_path / f"scores_{tag}",
+            data=dataset,
+            score_cfg=ScoreConfig(query_path=str(query_path)),
+            preprocess_cfg=PreprocessConfig(hessian_path=score_hessian),
+            device=device,
+            dtype=dtype,
+        )
+        return scorer.query_grads_t
+
+    from_reduce = scored_query_grads(q_precond, "precond", hessian_path)
+    from_score = scored_query_grads(q_raw, "raw", hessian_path)
+    no_precond = scored_query_grads(q_raw, "vanilla", None)
+
+    assert not torch.allclose(
+        from_score, no_precond, atol=1e-4
+    ), "factored preconditioning is a no-op here; the equality check is vacuous"
+    assert torch.allclose(
+        from_reduce, from_score, atol=1e-4, rtol=1e-4
+    ), "reduce-time vs score-time factored preconditioning differ"
+
+
+def test_score_factored_hessian_index_transform(tmp_path: Path, dataset):
+    """In split mode a factored hessian yields the H^-1/2 index transform.
+
+    ``create_scorer`` must route the index-side transform through the factored
+    ``apply`` (not identity, not the dense matmul path).
+    """
+    device = torch.device("cpu")
+    dtype = torch.float32
+    modules = {"mod_a": (4, 6), "mod_b": (5, 3)}
+    grad_sizes = {m: o * i for m, (o, i) in modules.items()}
+    num_q = 3
+
+    hessian_path = str(tmp_path / "hessian")
+    _write_factored_hessian(Path(hessian_path), modules)
+
+    rng = torch.Generator().manual_seed(1)
+    raw = {m: torch.randn(num_q, s, generator=rng) for m, s in grad_sizes.items()}
+    q_raw = _write_query_index(tmp_path / "q_raw", raw, PreprocessConfig(), num_q)
+
+    scorer = create_scorer(
+        path=tmp_path / "scores",
+        data=dataset,
+        score_cfg=ScoreConfig(query_path=str(q_raw)),
+        preprocess_cfg=PreprocessConfig(hessian_path=hessian_path, unit_normalize=True),
+        device=device,
+        dtype=dtype,
+    )
+
+    # Reference: the split factor H^-1/2 applied directly.
+    half = FactoredPreconditioner.from_path(
+        hessian_path, inversion_cfg=InversionConfig(), power=-0.5, device="cpu"
+    )
+    batch = {m: torch.randn(2, s, generator=rng) for m, s in grad_sizes.items()}
+    got = scorer.index_transform({k: v.clone() for k, v in batch.items()})
+    ref = half.apply({k: v.clone() for k, v in batch.items()})
+
+    for m in grad_sizes:
+        assert torch.allclose(
+            got[m].cpu(), ref[m].cpu(), atol=1e-5
+        ), f"factored index transform disagrees with H^-1/2 on {m}"
+    assert not torch.allclose(
+        got["mod_a"].cpu(), batch["mod_a"], atol=1e-4
+    ), "index transform is the identity — factored branch was not selected"
+
+
+def test_score_factored_hessian_rejects_projection(tmp_path: Path):
+    """Scoring a projected index against a factored hessian fails fast."""
+    modules = {"mod_a": (4, 6)}
+    hessian_path = str(tmp_path / "hessian")
+    _write_factored_hessian(Path(hessian_path), modules)
+
+    index_cfg = IndexConfig(run_path=str(tmp_path / "out"), projection_dim=16)
+    with pytest.raises(ValueError, match="projection_dim=0"):
+        score_dataset(
+            index_cfg,
+            ScoreConfig(query_path=str(tmp_path / "q")),
+            PreprocessConfig(hessian_path=hessian_path),
+        )

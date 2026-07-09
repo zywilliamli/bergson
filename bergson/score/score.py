@@ -22,7 +22,11 @@ from bergson.distributed import (
     launch_distributed_run,
     parent_barrier,
 )
-from bergson.hessians.preconditioner import DensePreconditioner, load_preconditioner
+from bergson.hessians.preconditioner import (
+    DensePreconditioner,
+    is_factored_hessian,
+    load_preconditioner,
+)
 from bergson.process_grads import normalize_and_aggregate_grads
 from bergson.score.score_writer import (
     MemmapSequenceScoreWriter,
@@ -95,6 +99,11 @@ def get_query_grads(
     return grads, preprocess_cfg
 
 
+def _identity(grads: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """No-op index transform used when no split preconditioning is applied."""
+    return grads
+
+
 def _make_split_hessian(
     hessians: dict[str, torch.Tensor],
     modules: list[str],
@@ -145,36 +154,31 @@ def create_scorer(
     """
     query_grads, query_preprocess_cfg = get_query_grads(score_cfg)
 
-    # Load hessian: H^(-1/2) for split, H^(-1) for one-sided. Score only supports the
-    # inverse Gram preconditioner.
+    # Load hessian: H^(-1/2) for split, H^(-1) for one-sided.
     preconditioner = load_preconditioner(
         preprocess_cfg.hessian_path,
         inversion_cfg=preprocess_cfg.inversion_cfg,
         power=-0.5 if preprocess_cfg.unit_normalize else -1.0,
         device=device,
     )
-    hessians = (
-        preconditioner.h_inv if isinstance(preconditioner, DensePreconditioner) else {}
-    )
 
-    # Maybe precondition query grads if it hasn't already been applied, e.g.
-    # during reduce.
-    if isinstance(preconditioner, DensePreconditioner) and not bool(
-        query_preprocess_cfg.hessian_path
-    ):
+    # Precondition the query once here, unless it was already applied upstream
+    # (e.g. during reduce, recorded in the query's saved preprocess_cfg).
+    if preconditioner is not None and not bool(query_preprocess_cfg.hessian_path):
         query_grads = preconditioner.apply(query_grads)
 
-    # Build index_transform for split (two-sided) preconditioning
-    index_transform = (
-        _make_split_hessian(
-            hessians,
-            score_cfg.modules,
-            device,
-            dtype,
+    # In split (two-sided) mode both sides get H^(-1/2); build a per-batch
+    # transform applying it to the index gradients as they stream in. The dense
+    # case uses a batched matmul over the per-module ``h_inv`` matrices; the
+    # factored case reuses ``apply`` (rotate / scale / rotate back per batch).
+    if preconditioner is None or not preprocess_cfg.unit_normalize:
+        index_transform = _identity
+    elif isinstance(preconditioner, DensePreconditioner):
+        index_transform = _make_split_hessian(
+            preconditioner.h_inv, score_cfg.modules, device, dtype
         )
-        if hessians and preprocess_cfg.unit_normalize
-        else lambda x: x
-    )
+    else:
+        index_transform = preconditioner.apply
 
     # Maybe apply aggregation if it hasn't already been applied.
     normalize_aggregated_grad = (
@@ -370,6 +374,20 @@ def score_dataset(
     preprocess_cfg : PreprocessConfig
         Preprocessing configuration for gradient normalization/preconditioning.
     """
+    # A factored (EKFAC) preconditioner needs full, unprojected gradients.
+    if (
+        preprocess_cfg.hessian_path
+        and index_cfg.projection_dim != 0
+        and is_factored_hessian(preprocess_cfg.hessian_path)
+    ):
+        raise ValueError(
+            f"Scoring with a factored (EKFAC) hessian at "
+            f"{preprocess_cfg.hessian_path} requires projection_dim=0, but "
+            f"index_cfg.projection_dim={index_cfg.projection_dim}. Rebuild the "
+            f"index and query with projection_dim=0, or use a dense "
+            f"(autocorrelation) hessian."
+        )
+
     index_cfg.partial_run_path.mkdir(parents=True, exist_ok=True)
 
     ds, _ = setup_data_pipeline(index_cfg)
