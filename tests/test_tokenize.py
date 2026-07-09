@@ -12,6 +12,15 @@ def tokenizer():
     return AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
 
 
+@pytest.fixture
+def llama3_tokenizer():
+    # Ungated mirror of Meta-Llama-3-8B-Instruct so no HF auth is needed. Its
+    # chat template renders <|begin_of_text|> AND its post-processor adds a BOS
+    # when add_special_tokens is left at the default True, which is exactly the
+    # double-BOS condition we regression-test below.
+    return AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3-8B-Instruct")
+
+
 def _make_batch(convos):
     """Wrap a list of conversations into a batch dict."""
     return {"conversation": convos}
@@ -210,3 +219,61 @@ def test_identical_assistant_turns(tokenizer):
 
     gap = [i for i in range(first_token, second_token) if labels[i] == -100]
     assert gap, "Expected -100 region between the two identical assistant turns"
+
+
+def test_no_double_bos_conversation(llama3_tokenizer):
+    """tokenize() must not duplicate the BOS the chat template already renders.
+
+    apply_chat_template renders the special tokens into the string, so the
+    subsequent re-tokenization must pass add_special_tokens=False. Regression
+    test for the double-BOS bug: with the buggy default the Llama 3 tokenizer
+    prepends a second <|begin_of_text|>.
+    """
+    tok = llama3_tokenizer
+    convo = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4"},
+    ]
+    cfg = DataConfig(conversation_column="conversation")
+    ids = tokenize(_make_batch([convo]), args=cfg, tokenizer=tok)["input_ids"][0]
+
+    # Exactly one BOS, and it must be the leading token.
+    assert list(ids).count(tok.bos_token_id) == 1
+    assert ids[0] == tok.bos_token_id
+
+    # Strongest invariant: the two-step tokenization must reproduce the ids you
+    # get from tokenizing the chat template directly.
+    ground_truth = tok.apply_chat_template(convo, tokenize=True, return_dict=True)
+    assert list(ids) == list(ground_truth["input_ids"])
+
+
+def test_no_double_bos_completion(llama3_tokenizer):
+    """Prompt-completion path must also avoid duplicating the BOS token."""
+    tok = llama3_tokenizer
+    batch = {"prompt": ["What is 2+2?"], "completion": ["4"]}
+    cfg = DataConfig(prompt_column="prompt", completion_column="completion")
+    ids = tokenize(batch, args=cfg, tokenizer=tok)["input_ids"][0]
+
+    assert list(ids).count(tok.bos_token_id) == 1
+    assert ids[0] == tok.bos_token_id
+
+
+def test_matches_direct_tokenization_no_special_bos(tokenizer):
+    """Tokenizers that don't inject a special BOS must be unaffected by the fix.
+
+    SmolLM2's chat template renders its markers itself and its tokenizer adds no
+    special BOS, so add_special_tokens=False must neither strip nor add anything.
+    Asserting equality with apply_chat_template(tokenize=True) guards against the
+    fix regressing into a *missing*-BOS bug for such models.
+    """
+    convo = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4"},
+        {"role": "user", "content": "And 3+3?"},
+        {"role": "assistant", "content": "6"},
+    ]
+    cfg = DataConfig(conversation_column="conversation")
+    ids = tokenize(_make_batch([convo]), args=cfg, tokenizer=tokenizer)["input_ids"][0]
+
+    ground_truth = tokenizer.apply_chat_template(convo, tokenize=True, return_dict=True)
+    assert list(ids) == list(ground_truth["input_ids"])
