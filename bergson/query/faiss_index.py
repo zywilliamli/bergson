@@ -120,15 +120,31 @@ def _require_faiss() -> ModuleType:
     return faiss_module
 
 
+def _is_gpu_resident(index: Index) -> bool:
+    """
+    Whether a FAISS index actually lives on a GPU.
+
+    Covers both a direct ``GpuIndex`` and the CPU-side ``IndexShards`` /
+    ``IndexReplicas`` container that ``index_cpu_to_gpus_list`` returns for a
+    multi-GPU move (its sub-indices are on the GPU). Such containers only ever
+    originate from that call in this codebase, so treating them as GPU-resident is
+    safe.
+    """
+    faiss = _require_faiss()
+    return isinstance(index, faiss.GpuIndex) or isinstance(
+        index, (faiss.IndexReplicas, faiss.IndexShards)
+    )
+
+
 def index_to_device(index: Index, device: str) -> Index:
     """
-    Move a FAISS index between CPU and GPU devices, optionally sharding.
+    Move a FAISS index onto ``device``, returning it unchanged if it is already
+    there.
 
-    Assumes the index actually needs to move: call it to put a CPU index onto a
-    GPU, or to bring a GPU index back to CPU. Do NOT call it with ``\"cpu\"`` on an
-    index that is already on CPU -- the CPU branch runs ``index_gpu_to_cpu``, which
-    clones the index and raises ``RuntimeError: clone not supported ...`` for a CPU
-    index backed by ``OnDiskInvertedLists`` (any IVF/ANN index mmap'd from disk).
+    Moving an already-CPU index to CPU is a no-op: we must NOT blindly call
+    ``index_gpu_to_cpu`` on it, because that clones the index and raises
+    ``RuntimeError: clone not supported ...`` for a CPU index backed by
+    ``OnDiskInvertedLists`` (any IVF/ANN index mmap'd from disk).
 
     Parameters
     ----------
@@ -157,7 +173,8 @@ def index_to_device(index: Index, device: str) -> Index:
         options.shard = True
         return faiss.index_cpu_to_gpus_list(index, options, gpus=gpus)
 
-    return faiss.index_gpu_to_cpu(index)
+    # Destination is CPU: only convert an index that is genuinely on a GPU.
+    return faiss.index_gpu_to_cpu(index) if _is_gpu_resident(index) else index
 
 
 class FaissIndex:
@@ -198,11 +215,9 @@ class FaissIndex:
                 str(shard_path),
                 faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY,
             )
-            # Freshly read shards are already CPU indices, so only move when we
-            # actually want them on a GPU. Routing an already-CPU shard through
-            # `index_to_device(..., "cpu")` here was the bug: it clones via
-            # `index_gpu_to_cpu` and crashes on mmap'd OnDisk IVF/ANN indices.
-            if not mmap_index and device != "cpu":
+            # Shards are read as CPU indices; move to the query device when
+            # in-memory. `index_to_device` no-ops when `device` is already CPU.
+            if not mmap_index:
                 shard = index_to_device(shard, device)
 
             shards.append(shard)
@@ -280,8 +295,7 @@ class FaissIndex:
                 faiss_cfg.index_factory,
                 faiss.METRIC_INNER_PRODUCT,
             )
-            if device != "cpu":
-                index = index_to_device(index, device)
+            index = index_to_device(index, device)
             if faiss_cfg.max_train_examples is not None:
                 train_examples = min(faiss_cfg.max_train_examples, grads_chunk.shape[0])
             else:
@@ -291,11 +305,9 @@ class FaissIndex:
 
             del grads_chunk
 
-            # Bring a GPU-built index back to CPU before serialization. A CPU
-            # build is already on CPU, so only convert when it actually lived on
-            # a GPU (calling index_to_device(..., "cpu") on a CPU index clones it).
-            if device != "cpu":
-                index = index_to_device(index, "cpu")
+            # Bring the index back to CPU before serialization (a no-op for a CPU
+            # build; converts a GPU-built index).
+            index = index_to_device(index, "cpu")
             faiss.write_index(index, str(shard_path))
 
         ordered_modules = []

@@ -2,16 +2,16 @@
 
 `FaissIndex.__init__` reads each on-disk shard with ``IO_FLAG_MMAP`` (a CPU index).
 When ``mmap_index=False`` (the shipped default) and ``device="cpu"``, the loader
-used to call ``index_to_device(shard, "cpu")``, which ran ``faiss.index_gpu_to_cpu``
+calls ``index_to_device(shard, "cpu")``. That used to run ``faiss.index_gpu_to_cpu``
 on the already-CPU index, cloning it and raising ``RuntimeError: clone not supported
 ... OnDiskInvertedLists`` for any IVF/ANN index mmap'd from disk. Only an exact
-``Flat`` index survived. The loader now skips the move entirely when
-``device="cpu"``, so an already-CPU shard is never routed through
-``index_to_device``.
+``Flat`` index survived. ``index_to_device`` now detects GPU residency and treats a
+CPU->CPU request as a no-op, so an already-CPU shard is returned unchanged.
 
-These tests build tiny on-disk indices with ``device="cpu"`` and confirm the CPU
-load path (``mmap_index=False``) no longer raises and returns usable neighbours for
-both an ANN (IVF) index and an exact ``Flat`` index. Adapted from the bug2 repro.
+The end-to-end tests build tiny on-disk indices with ``device="cpu"`` and confirm
+the CPU load path (``mmap_index=False``) no longer raises and returns usable
+neighbours for both an ANN (IVF) index and an exact ``Flat`` index. The unit tests
+exercise the ``index_to_device`` guard directly. Adapted from the bug2 repro.
 """
 
 import json
@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from bergson.config import FaissConfig
-from bergson.query.faiss_index import FaissIndex
+from bergson.query.faiss_index import FaissIndex, _is_gpu_resident, index_to_device
 
 
 def _has_faiss() -> bool:
@@ -142,6 +142,55 @@ def test_exact_flat_cpu_load_still_works(tmp_path: Path):
     assert indices[0, 0] == 0
     assert indices[1, 0] == 1
     assert (indices >= 0).all()
+
+
+@requires_faiss
+def test_index_to_device_cpu_is_noop_on_in_memory_cpu_index():
+    """`index_to_device(idx, "cpu")` returns an in-memory CPU index unchanged."""
+    import faiss  # type: ignore[import]
+
+    idx = faiss.index_factory(16, "IVF16,Flat", faiss.METRIC_INNER_PRODUCT)
+    assert not _is_gpu_resident(idx)
+
+    result = index_to_device(idx, "cpu")
+
+    # Same object, not a clone: proves we did not route it through
+    # `index_gpu_to_cpu` (which would return a fresh index).
+    assert result is idx
+
+
+@requires_faiss
+def test_index_to_device_cpu_is_noop_on_mmapd_ondisk_index(tmp_path: Path):
+    """The guard must no-op on the mmap'd OnDisk index that used to crash.
+
+    Reading an IVF shard with ``IO_FLAG_MMAP`` yields a CPU index backed by
+    ``OnDiskInvertedLists``. Calling ``faiss.index_gpu_to_cpu`` on it raises
+    ``clone not supported ... OnDiskInvertedLists`` -- we assert that raw failure
+    to prove the case is real, then assert ``index_to_device`` sidesteps it.
+    """
+    import faiss  # type: ignore[import]
+
+    n, dim = 256, 16
+    _write_gradient_store(tmp_path / "grads", n, dim)
+    FaissIndex.create_index(
+        gradients_path=tmp_path / "grads",
+        faiss_path=tmp_path / "faiss_ivf",
+        faiss_cfg=FaissConfig(index_factory="IVF16,Flat", num_shards=1),
+        device="cpu",
+        unit_norm=True,
+        hessians={},
+    )
+    (shard_path,) = (tmp_path / "faiss_ivf").glob("*.faiss")
+    shard = faiss.read_index(
+        str(shard_path), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY
+    )
+
+    assert not _is_gpu_resident(shard)
+    # The raw clone that the old code performed still fails on this index...
+    with pytest.raises(RuntimeError, match="clone not supported"):
+        faiss.index_gpu_to_cpu(shard)
+    # ...but the guarded helper returns it unchanged instead of cloning.
+    assert index_to_device(shard, "cpu") is shard
 
 
 @requires_faiss
