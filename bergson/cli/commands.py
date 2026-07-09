@@ -16,6 +16,7 @@ from ..config.config import (
     HessianConfig,
     HessianPipelineConfig,
     IndexConfig,
+    MetasmoothnessConfig,
     MixConfig,
     PreprocessConfig,
     QueryConfig,
@@ -29,6 +30,7 @@ from ..config.config_io import save_run_config
 from ..diagnose import DiagnoseConfig, diagnose
 from ..hessians.hessian_approximations import approximate_hessians
 from ..magic import MagicConfig, run_magic
+from ..magic.metasmoothness import run_metasmoothness
 from ..process_grads import mix_autocorrelation_matrices
 from ..query.query_index import query
 from ..recall.recall import run_recall
@@ -127,6 +129,16 @@ class Magic(MagicConfig):
     def execute(self):
         """Run MAGIC attribution."""
         run_magic(self)
+
+
+@dataclass
+class Metasmoothness(MetasmoothnessConfig):
+    """Estimate empirical metasmoothness (arXiv 2503.13751, Def. 2) of the
+    MAGIC training configuration via three perturbed-data-weight trainings."""
+
+    def execute(self):
+        save_run_config(self, self.run_path)
+        run_metasmoothness(self)
 
 
 @dataclass

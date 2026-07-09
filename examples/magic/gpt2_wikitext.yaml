@@ -18,8 +18,12 @@ steps:
       weight_decay: 1.0e-05
       # Inferred from DataComp-small
       adam_eps: 1.0e-06
-      # Inferred from metagradient descent paper
-      loss_reduction: sum_of_means
+      # The metagradients paper documents sum_of_means for Gemma-IFT, but the
+      # MAGIC paper's Fig. 5 GPT-2 panel shows 1%-drop retrains moving true
+      # loss by only ~0.006 — matching our mean-reduction banks (0.007-0.009)
+      # and excluding sum_of_means (0.2, nearly batch-size-invariant). See
+      # examples/magic/compare/EXPERIMENTS.md.
+      loss_reduction: mean
 
       data:
         dataset: EleutherAI/bergson-wikitext-512-chunks

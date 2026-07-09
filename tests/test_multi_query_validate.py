@@ -116,3 +116,38 @@ def test_weighted_ce_sum_of_means_reduction():
     # Default mean reduction path is unchanged.
     tm = weighted_causal_lm_ce(logits, labels, example_weight=w)
     torch.testing.assert_close(tm, (tok * w[:, None]).sum() / (T - 1))
+
+
+def test_metasmoothness_score():
+    """Def. 2 of arXiv 2503.13751: weighted sign agreement of consecutive
+    finite differences."""
+    from bergson.magic.metasmoothness import metasmoothness_score
+
+    torch.manual_seed(0)
+    theta0 = torch.randn(1000)
+    direction = torch.randn(1000)
+
+    # Perfectly linear response -> score 1.
+    score = metasmoothness_score(theta0, theta0 + direction, theta0 + 2 * direction)
+    assert abs(score - 1.0) < 1e-5
+
+    # Second step exactly reverses the first -> score -1.
+    score = metasmoothness_score(theta0, theta0 + direction, theta0 - direction)
+    assert abs(score + 1.0) < 1e-5
+
+    # Independent random increments: Def. 2's movement weighting
+    # (d = |theta_2h - theta_0|) up-weights coordinates where the increments
+    # constructively interfere, so independent noise scores ~+0.45, not 0.
+    r1, r2 = torch.randn(1000), torch.randn(1000)
+    score = metasmoothness_score(theta0, theta0 + r1, theta0 + r1 + r2)
+    assert 0.3 < score < 0.6
+
+    # Mean-reverting second step (theta_2h drawn around theta0, not theta_h)
+    # anti-correlates the increments: the metric flags it as non-smooth.
+    score = metasmoothness_score(
+        theta0, theta0 + torch.randn(1000), theta0 + torch.randn(1000)
+    )
+    assert score < -0.1
+
+    # Zero movement -> defined as perfectly smooth.
+    assert metasmoothness_score(theta0, theta0, theta0) == 1.0

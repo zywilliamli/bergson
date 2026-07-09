@@ -368,6 +368,23 @@ class TrainingConfig(AttributionConfig, Serializable):
 
 
 @dataclass
+class MetasmoothnessConfig(TrainingConfig):
+    """Config for empirical metasmoothness (arXiv 2503.13751, Def. 2).
+
+    Trains three models with data weights ``1``, ``1 + h*v`` and ``1 + 2h*v``
+    (``v ~ N(0, I)`` over docs) and scores the movement-weighted sign
+    agreement of consecutive finite-difference derivatives in parameter
+    space. Costs three trainings; no retraining bank. The metagradients
+    authors select eps_root and lr by maximizing this metric."""
+
+    h: float = 0.1
+    """Finite-difference step size for the data-weight perturbation."""
+
+    direction_seed: int = 0
+    """Seed for the random perturbation direction ``v``."""
+
+
+@dataclass
 class ValidationConfig(TrainingConfig, ABC):
     """Config for leave-k-out validation of attribution scores."""
 
