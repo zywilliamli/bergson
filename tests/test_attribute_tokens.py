@@ -872,12 +872,20 @@ def test_masked_prompt_token_grads_cover_all_positions(tmp_path, model):
     processor = GradientProcessor(projection_dim=None)  # raw grads, no projection
 
     seq_collector = _collect_in_memory(
-        model, masked, processor, target_modules,
-        attribute_tokens=False, run_path=str(tmp_path / "seq"),
+        model,
+        masked,
+        processor,
+        target_modules,
+        attribute_tokens=False,
+        run_path=str(tmp_path / "seq"),
     )
     tok_collector = _collect_in_memory(
-        model, masked, processor, target_modules,
-        attribute_tokens=True, run_path=str(tmp_path / "tok"),
+        model,
+        masked,
+        processor,
+        target_modules,
+        attribute_tokens=True,
+        run_path=str(tmp_path / "tok"),
     )
     offsets = tok_collector.builder.offsets
     names = sorted(seq_collector.gradients.keys())
@@ -948,13 +956,19 @@ def test_masked_prompt_token_grads_cover_all_positions(tmp_path, model):
 
             # doc/sequence gradient == true masked-loss gradient (incl. prompt)
             torch.testing.assert_close(
-                seq_grad, full.cpu(), atol=1e-3, rtol=1e-3,
+                seq_grad,
+                full.cpu(),
+                atol=1e-3,
+                rtol=1e-3,
                 msg=f"ex {ex} module {n}: per-doc grad must equal the autograd "
                 f"gradient of the masked loss (no separate gradient mask)",
             )
             # per-token rows now cover ALL positions, so they sum to the doc grad
             torch.testing.assert_close(
-                tok_sum, full.cpu(), atol=1e-3, rtol=1e-3,
+                tok_sum,
+                full.cpu(),
+                atol=1e-3,
+                rtol=1e-3,
                 msg=f"ex {ex} module {n}: per-token rows must sum to the per-doc "
                 f"gradient (all positions included)",
             )
