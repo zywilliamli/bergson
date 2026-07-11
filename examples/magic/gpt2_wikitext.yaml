@@ -21,8 +21,7 @@ steps:
       # The metagradients paper documents sum_of_means for Gemma-IFT, but the
       # MAGIC paper's Fig. 5 GPT-2 panel shows 1%-drop retrains moving true
       # loss by only ~0.006 — matching our mean-reduction banks (0.007-0.009)
-      # and excluding sum_of_means (0.2, nearly batch-size-invariant). See
-      # examples/magic/compare/EXPERIMENTS.md.
+      # and excluding sum_of_means (0.2, nearly batch-size-invariant).
       loss_reduction: mean
 
       data:
@@ -37,11 +36,11 @@ steps:
         chunk_length: 0
 
       distributed:
-        nproc_per_node: 4
-        nnode: 4
+        nproc_per_node: 8
+        nnode: 1
 
       # Original batch size lost
-      batch_size: 256
+      batch_size: 64
       num_epochs: 4
       lr_schedule:
         lr_scheduler_type: polynomial
