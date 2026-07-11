@@ -11,13 +11,12 @@ steps:
   - magic:
       run_path: runs/gpt2_wikitext
       model: gpt2
-      overwrite: false
+      overwrite: true
       cleanup_ckpts: false
-
-      # Inferred from MAGIC
-      weight_decay: 1.0e-05
-      # Inferred from DataComp-small
-      adam_eps: 1.0e-06
+      weight_decay: 0.01
+      adam_eps: 1.0e-8
+      # Chosen experimentally
+      eps_root: 1.0e-6
       # The metagradients paper documents sum_of_means for Gemma-IFT, but the
       # MAGIC paper's Fig. 5 GPT-2 panel shows 1%-drop retrains moving true
       # loss by only ~0.006 — matching our mean-reduction banks (0.007-0.009)
@@ -28,7 +27,6 @@ steps:
         dataset: EleutherAI/bergson-wikitext-512-chunks
         split: "train"
         chunk_length: 0
-        truncation: true
 
       query:
         dataset: EleutherAI/bergson-wikitext-512-chunks
@@ -49,9 +47,6 @@ steps:
         lr_end: 0.00008
         warmup_steps: 0.25
 
-      subset_strategy: random
       wandb_project: magic
-      num_subsets: 400
-      subset_fraction: 0.01
       save_optimizer_state: True
       save_retrained_models: True

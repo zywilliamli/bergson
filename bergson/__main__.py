@@ -74,7 +74,7 @@ def run_config(config_path: str, command_registry: dict[str, type]) -> None:
 
     for i, (cmd_name, cmd) in enumerate(steps, start=1):
         if multi:
-            print(f"\n[pipeline] step {i}/{len(steps)}: {cmd_name}")
+            print(f"\n[Pipeline] Step {i}/{len(steps)}: {cmd_name.title()}")
         cmd.execute()
 
 
