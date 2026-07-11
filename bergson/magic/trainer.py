@@ -15,12 +15,7 @@ import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor  # noqa: F401 — register DTensor for torch.load
 import torchopt
 from torch import nn
-from torch.distributed._functional_collectives import (
-    all_reduce as differentiable_all_reduce,
-)
-from torch.distributed._functional_collectives import (
-    wait_tensor,
-)
+from torch.distributed.nn.functional import all_reduce as differentiable_all_reduce
 from torch.distributed.tensor import DTensor, Replicate, init_device_mesh
 from torchopt.pytree import tree_flatten_with_path, tree_iter, tree_map
 from torchopt.typing import GradientTransformation, OptState
@@ -343,15 +338,15 @@ class Trainer:
 
         if dist.is_initialized() and not fsdp:
             if trace:
-                # Use differentiable all_reduce to preserve autograd graph
+                # torch.distributed.nn's all_reduce is autograd-aware: its
+                # backward all-reduces the incoming gradient, so the VJP keeps
+                # the cross-rank curvature terms of the metagradient. Every
+                # rank seeds the backward with the full (replicated) query
+                # gradient, which makes each rank's weight grads world_size
+                # times the true metagradient; `backward` divides that out.
                 grads = {
-                    k: wait_tensor(
-                        differentiable_all_reduce(
-                            g / dist.get_world_size(),
-                            "sum",
-                            dist.distributed_c10d._get_default_group(),
-                        )
-                    )
+                    k: cast(torch.Tensor, differentiable_all_reduce(g))
+                    / dist.get_world_size()
                     for k, g in grads.items()
                 }
             else:
@@ -799,6 +794,14 @@ class Trainer:
 
         for fut in save_futures:
             fut.result()
+
+        # Each rank backpropagates the full replicated query gradient, and the
+        # autograd-aware all_reduce in `step` sums the adjoints across ranks in
+        # its backward, so every rank's weight grads are world_size times the
+        # true metagradient. Divide once here; resume checkpoints store the
+        # unscaled accumulator, so this stays correct across interruptions.
+        if dist.is_initialized() and not fsdp:
+            bwd_state.weight_grads /= dist.get_world_size()
 
         # Clean up backward state file on successful completion
         if os.path.exists(bwd_ckpt_path):

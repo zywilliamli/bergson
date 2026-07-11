@@ -53,18 +53,20 @@ def _make_dataset():
     )
 
 
-def _run_magic(model, dataset, device="cpu", ckpt_dir=None):
+def _run_magic(model, dataset, device="cpu", ckpt_dir=None, batch_size=None, lr=1e-4):
     """Run full MAGIC pipeline and return attribution scores."""
-    optimizer = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2)
+    optimizer = torchopt.adamw(lr, betas=(0.95, 0.975), eps_root=1e-2)
     trainer, fwd_state = Trainer.initialize(model, optimizer)
 
-    batch_size = len(dataset)
+    if batch_size is None:
+        batch_size = len(dataset)
     stream = DataStream(dataset, batch_size=batch_size, device=device)
     assert len(stream) >= 1
 
     _tmpdir = tempfile.TemporaryDirectory() if ckpt_dir is None else None
     if _tmpdir is not None:
         ckpt_dir = _tmpdir.name
+    assert ckpt_dir is not None
 
     try:
         fwd_state = trainer.train(fwd_state, stream, inplace=True, save_dir=ckpt_dir)
@@ -123,6 +125,105 @@ def _ddp_worker(rank, world_size, port, dataset, result_dict, ckpt_dir):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+def _make_multistep_dataset(num_rows=16, seq_len=8):
+    """Deterministic dataset with several batches worth of rows.
+
+    All rows have equal length so that the mean loss over a batch equals the
+    mean of the per-rank microbatch means, keeping single- and multi-process
+    forward trajectories identical.
+    """
+    g = torch.Generator().manual_seed(0)
+    ids = torch.randint(1, 100, (num_rows, seq_len), generator=g).tolist()
+    return Dataset.from_dict(
+        {
+            "input_ids": ids,
+            "labels": ids,
+            "attention_mask": [[1] * seq_len] * num_rows,
+        }
+    )
+
+
+def _cpu_ddp_worker(
+    rank, world_size, port, dataset, batch_size, lr, result_dict, ckpt_dir
+):
+    """Gloo/CPU worker for the multi-step DDP test."""
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        model = _make_model()
+        scores = _run_magic(
+            model, dataset, ckpt_dir=ckpt_dir, batch_size=batch_size, lr=lr
+        )
+        result_dict[rank] = scores
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_ddp_matches_single_process_multistep():
+    """Multi-step DDP MAGIC scores should match single-process scores.
+
+    With more than one training step, the backward pass propagates the
+    query gradient through earlier steps via each batch's gradient
+    all-reduce. That collective must be autograd-aware: if the gradient
+    passes through it rank-locally (as with the non-differentiable
+    functional collectives), every rank drops the other ranks'
+    curvature terms and the scores silently diverge from the exact
+    single-process metagradient. A single-step run (the GPU test below)
+    cannot catch this, because the last step's backward happens to be
+    exact without any cross-rank exchange.
+
+    The lr is large so the curvature terms are big enough that dropping
+    the cross-rank ones moves scores well past the tolerance (~2% at
+    lr=5e-2 vs ~0.03% at lr=1e-3 for this model).
+    """
+    batch_size = 4
+    lr = 5e-2
+    dataset = _make_multistep_dataset(num_rows=16)
+
+    model = _make_model()
+    expected = _run_magic(model, dataset, batch_size=batch_size, lr=lr)
+    del model
+
+    world_size = 2
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+
+    manager = mp.Manager()
+    result_dict = manager.dict()
+
+    with tempfile.TemporaryDirectory() as shared_ckpt_dir:
+        mp.spawn(
+            _cpu_ddp_worker,
+            args=(
+                world_size,
+                port,
+                dataset,
+                batch_size,
+                lr,
+                result_dict,
+                shared_ckpt_dir,
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+
+    actual = result_dict[0]
+
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=1e-4,
+        rtol=1e-3,
+        msg="Multi-step DDP attribution scores diverged from single-process",
+    )
 
 
 @pytest.mark.skipif(

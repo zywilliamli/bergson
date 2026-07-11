@@ -56,7 +56,7 @@ def pad_dataset_to_batch_size(
 
     if global_rank == 0:
         print(
-            f"{label}: padded {pad_count}/{total} examples "
+            f"{label}: padded {pad_count}/{total + pad_count} examples "
             f"(weight=0) to fill last batch"
         )
     return dataset, num_docs, pad_count, weight_pad_count
