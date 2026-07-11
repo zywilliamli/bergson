@@ -1,6 +1,44 @@
 # CHANGELOG
 
 
+## v0.10.2 (2026-07-11)
+
+### Bug Fixes
+
+- Update bergson
+  ([`ab4b933`](https://github.com/EleutherAI/bergson/commit/ab4b933083f52c8be144ebd25b2c7cb5c7d0a1f4))
+
+### Documentation
+
+- Add Known limitations section (MoE fused experts, FSDP host-RAM load)
+  ([`290140a`](https://github.com/EleutherAI/bergson/commit/290140abbb605f97fddbf83d4839838199783dcd))
+
+Document two issues we are not fixing now, each with the responsible source file:line so maintainers
+  can locate them:
+
+- MoE fused-parameter experts and router are bare nn.Parameters on custom modules, outside
+  LayerAdapter.supported_modules (bergson/gradients.py:238; module walk in
+  bergson/collector/collector.py:154-155), so they are silently skipped. Only attention projections
+  and lm_head (~1-2% of params) are tracked. - Under FSDP the load path uses device_map="cpu" per
+  rank (bergson/utils/worker_utils.py:166), so every rank replicates a full dequantized model in
+  host RAM before sharding, which can OOM host memory independent of GPU VRAM.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_012NMtUnc12k72cAXd4uRMzN
+
+- Compact MoE limitation, drop FSDP host-RAM limitation
+  ([`1f573ba`](https://github.com/EleutherAI/bergson/commit/1f573ba0c9ef0ffb9f5e0b998704445b7203b8e3))
+
+Trim the MoE fused-experts note to what users need (affected model families, consequence,
+  legacy-layout caveat) and remove the FSDP host-RAM limitation, which is a straightforward fix
+  pending coordination.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_0149bxnr7vz4KcR8HpT4ipgn
+
+
 ## v0.10.1 (2026-07-09)
 
 ### Bug Fixes
