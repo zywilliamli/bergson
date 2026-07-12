@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from bergson.collector.collector import CollectorComputer, fwd_bwd_hessian_factory
@@ -53,39 +52,37 @@ def compute_exact_fim(
     A_sum = torch.zeros(hidden_size, hidden_size, device=device)
     G_sum = torch.zeros(vocab_size, vocab_size, device=device)
 
-    for batch_indices in batches:
-        for idx in batch_indices:
-            input_ids = torch.tensor(
-                dataset[idx]["input_ids"], device=device
-            ).unsqueeze(0)
-            labels = torch.tensor(dataset[idx]["labels"], device=device)
+    # The cross-entropy gradient wrt logits is softmax(logits) - onehot(target),
+    # so all positions of a row can be computed in one closed-form pass.
+    with torch.no_grad():
+        for batch_indices in batches:
+            for idx in batch_indices:
+                input_ids = torch.tensor(
+                    dataset[idx]["input_ids"], device=device
+                ).unsqueeze(0)
+                labels = torch.tensor(dataset[idx]["labels"], device=device)
 
-            hidden = model.model.embed(input_ids)
-            hidden.requires_grad_(True)
-            logits = model.model.linear(hidden)
+                # Positions 0..S-2 predict the next token, matching the loss.
+                a = model.model.embed(input_ids)[0, :-1]  # (S-1, H)
+                logits = model.model.linear(a)  # (S-1, V)
+                probs = torch.softmax(logits, dim=-1)
 
-            for s in range(input_ids.shape[1] - 1):
                 if sample:
                     # Sample from model distribution (true FIM)
-                    with torch.no_grad():
-                        probs = torch.softmax(logits[0, s].detach(), dim=-1)
-                        target = torch.multinomial(probs, num_samples=1).squeeze()
+                    targets = torch.multinomial(probs, num_samples=1).squeeze(1)
                 else:
                     # Use dataset labels (empirical FIM)
-                    target = labels[s + 1]
+                    targets = labels[1:]
 
-                loss = F.cross_entropy(logits[0, s], target)
+                g = probs.clone()
+                g[torch.arange(g.shape[0], device=device), targets] -= 1.0
 
-                (g,) = torch.autograd.grad(loss, logits, retain_graph=True)
-                g = g[0, s]
-                a = hidden[0, s].detach()
+                position_grads.append(torch.einsum("sv,sh->svh", g, a).flatten(1))
+                A_sum += a.T @ a
+                G_sum += g.T @ g
 
-                position_grads.append(torch.outer(g, a).flatten().detach())
-                A_sum += torch.outer(a, a)
-                G_sum += torch.outer(g.detach(), g.detach())
-
-    n_positions = len(position_grads)
-    grads_tensor = torch.stack(position_grads)
+    grads_tensor = torch.cat(position_grads)
+    n_positions = grads_tensor.shape[0]
     F_exact = grads_tensor.T @ grads_tensor / n_positions
 
     A = A_sum / n_positions

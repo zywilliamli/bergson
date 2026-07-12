@@ -17,13 +17,33 @@ SUBCOMMANDS = [
 ]
 
 
+@pytest.fixture(scope="module")
+def help_results() -> dict[str, subprocess.CompletedProcess]:
+    """Run every subcommand's --help concurrently.
+
+    Each invocation spends several seconds importing torch, so running them
+    sequentially costs ~1 minute; concurrently they take as long as the slowest.
+    """
+    procs = {
+        cmd: subprocess.Popen(
+            ["bergson", cmd, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for cmd in SUBCOMMANDS
+    }
+    results = {}
+    for cmd, proc in procs.items():
+        stdout, stderr = proc.communicate(timeout=120)
+        results[cmd] = subprocess.CompletedProcess(
+            proc.args, proc.returncode, stdout, stderr
+        )
+    return results
+
+
 @pytest.mark.parametrize("cmd", SUBCOMMANDS)
-def test_cli_help(cmd):
+def test_cli_help(cmd, help_results):
     """Each subcommand should produce --help output without crashing."""
-    result = subprocess.run(
-        ["bergson", cmd, "--help"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    result = help_results[cmd]
     assert result.returncode == 0, f"bergson {cmd} --help failed:\n{result.stderr}"

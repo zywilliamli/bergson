@@ -51,7 +51,7 @@ def test_gradient_scale_invariance(tmp_path, batch_size_a, batch_size_b):
     index_dir = tmp_path / "indices"
     index_dir.mkdir()
 
-    def run_bergson_build(index_name: str, dataset_path: str):
+    def start_bergson_build(index_name: str, dataset_path: str):
         index_path = index_dir / index_name
         cmd = [
             "bergson",
@@ -70,13 +70,20 @@ def test_gradient_scale_invariance(tmp_path, batch_size_a, batch_size_b):
             "--nproc_per_node",
             "1",
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        return index_path
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        return index_path, proc
 
-    # Build indices
-    index_a_path = run_bergson_build("a", str(data_dir / "data_a"))
-    index_b_path = run_bergson_build("b", str(data_dir / "data_b"))
-    index_combined_path = run_bergson_build("combined", str(data_dir / "data_combined"))
+    # Build the three independent indices concurrently
+    index_a_path, proc_a = start_bergson_build("a", str(data_dir / "data_a"))
+    index_b_path, proc_b = start_bergson_build("b", str(data_dir / "data_b"))
+    index_combined_path, proc_combined = start_bergson_build(
+        "combined", str(data_dir / "data_combined")
+    )
+    for proc in (proc_a, proc_b, proc_combined):
+        _, stderr = proc.communicate()
+        assert proc.returncode == 0, f"bergson build failed:\n{stderr}"
 
     # Load gradients
     grads_a = torch.from_numpy(

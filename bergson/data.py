@@ -772,7 +772,7 @@ def tokenize_and_chunk(
     chunk_size: int,
     text_column: str = "text",
     *,
-    num_proc: int = cpu_count() // 2,
+    num_proc: int | None = None,
 ) -> Dataset:
     """
     Tokenizes a text dataset and chunks tokens into uniform-length sequences.
@@ -787,6 +787,8 @@ def tokenize_and_chunk(
         chunk_size:  Number of tokens per output chunk.
         text_column: Name of the column containing raw text.
         num_proc:    Number of processes for the tokenization .map() pass.
+                     Defaults to half the CPUs, capped so each process gets
+                     at least ~256 documents.
 
     Returns:
         A Dataset where every row has a single 'input_ids' list of length chunk_size.
@@ -819,6 +821,9 @@ def tokenize_and_chunk(
     if n_dropped > 0:
         pct = n_dropped / n_before * 100
         print(f"Warning: {n_dropped}/{n_before} empty documents " f"({pct:.1f}%).")
+
+    if num_proc is None:
+        num_proc = min(cpu_count() // 2, max(1, len(dataset) // 256))
 
     # ── Step 1: tokenize each document in parallel ───────────────────────────
     def tokenize_batch(batch):

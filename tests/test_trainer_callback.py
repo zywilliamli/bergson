@@ -1,17 +1,9 @@
-import os
 from pathlib import Path
-
-from torch import nn
-
-from bergson import GradientProcessor
-from bergson.gradients import AdafactorNormalizer, AdamNormalizer
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["WANDB_MODE"] = "disabled"
 
 import pytest
 import torch
 from datasets import Dataset
+from torch import nn
 from transformers import (
     Adafactor,
     AutoConfig,
@@ -21,8 +13,10 @@ from transformers import (
 )
 from trl import SFTConfig, SFTTrainer
 
+from bergson import GradientProcessor
 from bergson.config import AttentionConfig
 from bergson.data import load_gradients
+from bergson.gradients import AdafactorNormalizer, AdamNormalizer
 from bergson.huggingface import (
     GradientCollectorCallback,
     prepare_for_gradient_collection,

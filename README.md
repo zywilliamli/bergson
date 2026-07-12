@@ -281,6 +281,8 @@ pyright
 
 We use [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/) for releases.
 
+If you have multiple GPUs, you can run pytest more quickly with `pytest -n 8 --dist loadgroup`.
+
 # Citation
 
 If you found Bergson useful in your research, please cite us:
