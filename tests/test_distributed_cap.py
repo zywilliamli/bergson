@@ -129,23 +129,39 @@ def test_parent_barrier_serializes_capped_build_writes(tmp_path):
     rename, since rank-0 sleeps to mimic a slow NFS move.
     """
     nnode = 2
-    partial_path = tmp_path / "out.part"
-    final_path = tmp_path / "out"
+    procs: list[mp.Process] = []
 
-    with socket.socket() as s:
-        s.bind(("", 0))
-        port = s.getsockname()[1]
+    # parent_barrier rendezvous on port+1, and anything on the machine can
+    # grab it between the bind probe below and the TCPStore listen. Retry
+    # with a fresh port on failure; a genuine barrier regression is
+    # deterministic and still fails every attempt.
+    for attempt in range(3):
+        partial_path = tmp_path / f"out{attempt}.part"
+        final_path = tmp_path / f"out{attempt}"
 
-    procs = [
-        mp.Process(
-            target=_capped_build_simulator,
-            args=(r, nnode, port, partial_path, final_path),
-        )
-        for r in range(nnode)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(timeout=30)
+        with socket.socket() as s:
+            s.bind(("", 0))
+            port = s.getsockname()[1]
+
+        procs = [
+            mp.Process(
+                target=_capped_build_simulator,
+                args=(r, nnode, port, partial_path, final_path),
+            )
+            for r in range(nnode)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+        for p in procs:
+            # If one rank crashed, its peer waits in parent_barrier forever;
+            # reap it or it outlives the test and pins the pytest process.
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+        if all(p.exitcode == 0 for p in procs) or attempt == 2:
+            break
+
     for p in procs:
         assert p.exitcode == 0, f"proc exited with {p.exitcode}"

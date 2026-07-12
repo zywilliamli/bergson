@@ -24,6 +24,26 @@ from bergson.utils.utils import setup_reproducibility
 Precision = str  # Type alias for precision strings
 
 
+# Test files that consume the session-scoped ground-truth fixtures below.
+# They must share one xdist worker: the fixtures regenerate per worker
+# (~20s each), so scattering these tests duplicates that setup instead of
+# sharing it. Self-contained files (e.g. test_fim_accuracy) stay ungrouped
+# so they can parallelize.
+GROUND_TRUTH_TEST_FILES = {
+    "test_compute_ekfac.py",
+    "test_covariance.py",
+    "test_ekfac_recomposition.py",
+    "test_factored_preconditioner.py",
+    "test_inversion.py",
+}
+
+
+def pytest_collection_modifyitems(items) -> None:
+    for item in items:
+        if item.path is not None and item.path.name in GROUND_TRUTH_TEST_FILES:
+            item.add_marker(pytest.mark.xdist_group("ekfac_ground_truth"))
+
+
 def pytest_addoption(parser) -> None:
     """Add custom command-line options for EKFAC tests."""
     parser.addoption(
