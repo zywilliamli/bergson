@@ -86,7 +86,7 @@ class HookCollectorBase(ContextDecorator, ABC):
 
     attribute_tokens: bool = False
     """When True, compute per-position gradients instead of per-example, filtered
-    to valid positions using ``_current_valid_mask``."""
+    to gradient-bearing positions using ``_current_collection_mask``."""
 
     lo: float = float("-inf")
     """Lower clamp bound for gradients. May be narrowed in subclass ``setup()``."""
@@ -297,26 +297,27 @@ class HookCollectorBase(ContextDecorator, ABC):
         self.processor._projection_matrices[key] = A
         return A
 
-    def with_batch(self, valid_mask: Tensor | None = None) -> "HookCollectorBase":
+    def with_batch(self, collection_mask: Tensor | None = None) -> "HookCollectorBase":
         """
-        Set the current batch indices and valid mask before entering the context.
+        Set the current collection mask before entering the context.
 
-        This allows hooks to access batch indices and valid mask during
-        forward/backward passes.
+        This allows hooks to access the mask during forward/backward passes.
         Usage:
-            with collector.with_batch(indices, valid_mask):
+            with collector.with_batch(collection_mask):
                 # forward/backward pass
-                # hooks can access self._current_indices and self._current_valid_mask
+                # hooks can access self._current_collection_mask
 
         Args:
-            indices: List of data indices in the current batch.
-            valid_mask: Optional boolean tensor of shape [batch_size, seq_len]
-                indicating which positions have valid labels for loss computation.
+            collection_mask: Optional boolean tensor of shape [batch_size, seq_len]
+                indicating every position containing a non-padding token with a
+                next-token target (excludes each sequence's final token). Unlike
+                ``pad_and_tensor``'s ``valid_masks``, it is independent of label
+                masking.
 
         Returns:
             self, for use as a context manager.
         """
-        self._current_valid_mask = valid_mask
+        self._current_collection_mask = collection_mask
         return self
 
     def __enter__(self):
@@ -515,7 +516,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                     P = self.double_sided_projection(name, P, g, p, o, i)
 
                 P = P.flatten(2)  # [N, S, grad_dim]
-                P = P[self._current_valid_mask]  # [total_valid, grad_dim]
+                P = P[self._current_collection_mask]  # [total_valid, grad_dim]
             else:
                 P = g.mT @ a  # [N,O,S] @ [N,S,I] → [N,O,I]
 
@@ -564,7 +565,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                     # [N, S, O/p, 1] * [N, S, 1, I/q] → [N, S, O/p, I/q]
                     P = g.unsqueeze(-1) * a.unsqueeze(-2)
                 P = P.flatten(2)  # [N, S, grad_dim]
-                P = P[self._current_valid_mask]  # [total_valid, grad_dim]
+                P = P[self._current_collection_mask]  # [total_valid, grad_dim]
             else:
                 if bias_grad is not None and p is not None:
                     P = self.double_sided_projection_with_bias(
@@ -601,7 +602,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                 )
                 if self.attribute_tokens:
                     P = P.flatten(2)  # [N, S, grad_dim]
-                    P = P[self._current_valid_mask]  # [total_valid, grad_dim]
+                    P = P[self._current_collection_mask]  # [total_valid, grad_dim]
             else:
                 # a was already projected in forward if p is set;
                 # project g individually
@@ -617,7 +618,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                     if bias_grad is not None:
                         P = torch.cat([P, bias_grad.unsqueeze(-1)], dim=-1)
                     P = P.flatten(2)  # [N, S, grad_dim]
-                    P = P[self._current_valid_mask]  # [total_valid, grad_dim]
+                    P = P[self._current_collection_mask]  # [total_valid, grad_dim]
                 else:
                     P = g.mT @ a  # [N, O/p, I/p]
                     if bias_grad is not None:
@@ -765,30 +766,16 @@ class CollectorComputer:
                 # Local padding only: bin-packer enforces a per-rank
                 # ``max_len × batch_size ≤ N`` budget that a global-max
                 # all-reduce would silently violate.
-                x, y, valid_mask = pad_and_tensor(
+                x, y, _, collection_mask = pad_and_tensor(
                     batch["input_ids"],
                     labels=batch.get("labels"),
                     device=self.device,
                     sync_max_len=False,
                 )
-                total_processed += valid_mask.sum()
-
-                # Per-token rows span every real position (g_t is nonzero at
-                # prompt positions too), so they sum to the per-doc gradient.
-                # valid_mask is left completion-only for the KFAC/Shampoo Hessian
-                # collectors that also run through this loop.
-                if self.collector.attribute_tokens:
-                    lengths = torch.tensor(
-                        [len(ids) for ids in batch["input_ids"]],
-                        device=self.device,
-                    )
-                    positions = torch.arange(x.size(1), device=self.device)
-                    row_mask = (positions.unsqueeze(0) + 1) < lengths.unsqueeze(1)
-                else:
-                    row_mask = valid_mask
+                total_processed += collection_mask.sum()
 
                 with (
-                    self.collector.with_batch(row_mask),
+                    self.collector.with_batch(collection_mask),
                     (
                         record_function(f"step_{step}")
                         if self.cfg.profile

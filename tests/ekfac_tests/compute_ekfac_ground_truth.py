@@ -343,19 +343,19 @@ def compute_covariance(
 
     for sl in tqdm(batches, desc=f"Rank {rank} covariances"):
         batch = data[sl]
-        x, y, valid_masks = pad_and_tensor(
+        x, y, _, collection_mask = pad_and_tensor(
             batch["input_ids"],
             labels=batch.get("labels"),
             device=device,
         )
 
-        total_processed += valid_masks.sum()
+        total_processed += collection_mask.sum()
 
         # Run both collectors simultaneously during the same forward/backward pass
         # This ensures they see exactly the same gradients
-        with collector.with_batch(valid_masks):
+        with collector.with_batch(collection_mask):
             if ekfac_collector is not None:
-                ekfac_ctx = ekfac_collector.with_batch(valid_masks)
+                ekfac_ctx = ekfac_collector.with_batch(collection_mask)
             else:
                 ekfac_ctx = None
 
@@ -643,15 +643,15 @@ def compute_eigenvalue_correction_amortized(
 
     for sl in tqdm(batches, desc=f"Rank {rank} eigenvalue corrections"):
         batch = data[sl]
-        x, y, valid_masks = pad_and_tensor(
+        x, y, _, collection_mask = pad_and_tensor(
             batch["input_ids"],
             labels=batch.get("labels"),
             device=device,
         )
 
-        total_processed += valid_masks.sum()
+        total_processed += collection_mask.sum()
 
-        with collector.with_batch(valid_masks):
+        with collector.with_batch(collection_mask):
             logits = model(x).logits
             losses = F.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.size(-1)),

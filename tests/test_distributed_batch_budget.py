@@ -55,7 +55,7 @@ def _worker(rank: int, world_size: int, port: int, results) -> None:
             # bin-packer's per-rank budget invariant is preserved. The
             # MAGIC path (default sync_max_len=True) still globally
             # syncs and is expected to over-pad in this scenario.
-            padded, _, _ = pad_and_tensor(input_ids, sync_max_len=False)
+            padded, _, _, _ = pad_and_tensor(input_ids, sync_max_len=False)
             cost = padded.shape[0] * padded.shape[1]
             worst = max(worst, cost)
         results[rank] = worst
