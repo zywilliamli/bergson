@@ -122,9 +122,6 @@ class Attributor:
             self.ordered_modules = self.faiss_index.ordered_modules
             return
 
-        # Load the gradients into memory. The store is mapped flat rather than
-        # structured — a structured record's itemsize overflows the C-int cap
-        # above ~537M tracked fp32 params — and sliced per module by column.
         mmap = load_gradients(index_path)
         with (index_path / "info.json").open("r") as f:
             grad_sizes = json.load(f)["grad_sizes"]

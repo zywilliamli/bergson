@@ -402,10 +402,7 @@ def create_index(
     grad_path = root / "gradients.bin"
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    # Legacy structured dtype, still written so external readers of older
-    # bergson gradient stores can open new files. In-library code always maps
-    # the file flat: a structured record's itemsize overflows numpy's C-int
-    # cap above ~537M tracked fp32 params.
+    # Legacy structured dtype, still written for external readers of older stores
     struct_dtype = {
         "names": [name for name in grad_sizes.keys()],
         "formats": [f"({size},){np.dtype(dtype).str}" for size in grad_sizes.values()],
@@ -505,8 +502,7 @@ def load_gradients(root_dir: Path | str) -> np.memmap:
     if "base_dtype" in info:
         dtype = np.dtype(info["base_dtype"])
     else:
-        # Stores written before base_dtype existed only carry the structured
-        # dtype; recover the scalar dtype from a field format like "(768,)<f4".
+        # Old stores lack base_dtype; recover the scalar dtype from a field format
         dtype = np.dtype(info["dtype"]["formats"][0]).base
 
     return np.memmap(
@@ -518,10 +514,9 @@ def load_gradients(root_dir: Path | str) -> np.memmap:
 
 
 class ModuleGradients:
-    """Dict-like, module-name-keyed view over a flat gradient store:
+    """Dict-like, module-name-keyed view over a flat memmapped gradient store:
     ``grads[name]`` returns the ``(num_grads, size)`` column slice for that
-    module. Replaces structured-dtype field access, whose per-record itemsize
-    overflows numpy's C-int cap above ~537M tracked fp32 params."""
+    module."""
 
     def __init__(self, mmap: np.memmap, grad_sizes: dict[str, int]):
         self.mmap = mmap
