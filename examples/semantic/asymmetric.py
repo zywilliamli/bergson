@@ -12,26 +12,27 @@ import numpy as np
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 
 from bergson.config import IndexConfig
+from bergson.data import ModuleGradients
 from examples.semantic.data import (
     HF_ANALYSIS_MODEL,
     load_experiment_data,
 )
 
 
-def _load_gradients_as_float(grads: np.memmap, name: str) -> np.ndarray:
-    """Load a gradient field and convert from bfloat16 to float32.
+def _load_gradients_as_float(grads: ModuleGradients, name: str) -> np.ndarray:
+    """Load a module's gradients and convert from bfloat16 to float32.
 
     Args:
-        grads: Structured gradient memmap.
-        name: Field name to access.
+        grads: Module-keyed view over a flat gradient store.
+        name: Module name to access.
 
     Returns:
         Float32 numpy array.
     """
-    g = grads[name]
-    # Gradients are stored as bfloat16 (2-byte void)
-    if g.dtype == np.dtype("|V2"):
-        g = g.view(ml_dtypes.bfloat16).astype(np.float32)
+    g = np.asarray(grads[name])
+    # Gradients may be stored as bfloat16, which torch can't view directly
+    if g.dtype != np.float32:
+        g = g.astype(np.float32)
     return g
 
 
@@ -451,7 +452,7 @@ def score_asymmetric_eval(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -497,11 +498,11 @@ def score_asymmetric_eval(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -569,7 +570,7 @@ def score_asymmetric_eval(
         )
 
     # Load eval gradients
-    eval_grads = load_gradients(eval_grads_path, structured=True)
+    eval_grads = load_module_gradients(eval_grads_path)
     eval_grad_list = []
     for name in tqdm(module_names, desc="Loading eval grads"):
         g = torch.from_numpy(_load_gradients_as_float(eval_grads, name))
@@ -707,7 +708,7 @@ def compute_style_hessian(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
 
     base_path = Path(base_path)
@@ -725,11 +726,11 @@ def compute_style_hessian(
     train_ds = _load_hf_dataset(data_path / "train.hf")
 
     train_styles = train_ds["style"]  # type: ignore[index]
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Separate indices by style
     dominant_indices = [
@@ -820,7 +821,7 @@ def score_asymmetric_eval_with_pca_projection(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -868,11 +869,11 @@ def score_asymmetric_eval_with_pca_projection(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -920,7 +921,7 @@ def score_asymmetric_eval_with_pca_projection(
         )
 
     # Load eval gradients and apply PCA projection
-    eval_grads = load_gradients(eval_grads_path, structured=True)
+    eval_grads = load_module_gradients(eval_grads_path)
     eval_grad_list = []
 
     # Track cumulative dimension for concatenation
@@ -1146,7 +1147,7 @@ def score_majority_style_eval(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -1190,11 +1191,11 @@ def score_majority_style_eval(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -1234,7 +1235,7 @@ def score_majority_style_eval(
         )
 
     # Load eval gradients
-    eval_grads = load_gradients(majority_eval_grads_path, structured=True)
+    eval_grads = load_module_gradients(majority_eval_grads_path)
     eval_grad_list = []
     for name in tqdm(module_names, desc="Loading eval grads"):
         g = torch.from_numpy(_load_gradients_as_float(eval_grads, name))
@@ -1316,7 +1317,7 @@ def score_summed_eval(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -1376,11 +1377,11 @@ def score_summed_eval(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -1435,8 +1436,8 @@ def score_summed_eval(
 
     # Load both eval gradient sets
     print("Loading eval gradients (minority + majority)...")
-    minority_grads = load_gradients(eval_minority_grads_path, structured=True)
-    majority_grads = load_gradients(eval_majority_grads_path, structured=True)
+    minority_grads = load_module_gradients(eval_minority_grads_path)
+    majority_grads = load_module_gradients(eval_majority_grads_path)
 
     # Sum gradients: for each eval fact, sum minority + majority style gradients
     # Align by semantic fact (identifier, field) since templates may differ
@@ -1964,7 +1965,7 @@ def score_with_inner_product(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -1990,11 +1991,11 @@ def score_with_inner_product(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -2021,10 +2022,8 @@ def score_with_inner_product(
         eval_grads_path = base_path / "eval_grads_majority"
     elif eval_style == "summed":
         # Need to sum minority + majority
-        minority_grads = load_gradients(base_path / "eval_grads", structured=True)
-        majority_grads = load_gradients(
-            base_path / "eval_grads_majority", structured=True
-        )
+        minority_grads = load_module_gradients(base_path / "eval_grads")
+        majority_grads = load_module_gradients(base_path / "eval_grads_majority")
 
         # Load eval datasets for alignment
         eval_minority_ds = _load_hf_dataset(data_path / "eval.hf")
@@ -2074,7 +2073,7 @@ def score_with_inner_product(
 
     # Load eval gradients
     print(f"Loading {eval_style} eval gradients...")
-    eval_grads = load_gradients(eval_grads_path, structured=True)
+    eval_grads = load_module_gradients(eval_grads_path)
 
     eval_grad_list = []
     for name in tqdm(module_names, desc="Loading eval grads"):
@@ -2356,7 +2355,7 @@ def score_summed_rewrites(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -2409,11 +2408,11 @@ def score_summed_rewrites(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -2468,8 +2467,8 @@ def score_summed_rewrites(
 
     # Load both eval gradient sets
     print("Loading eval gradients (shakespeare + pirate)...")
-    shakespeare_grads = load_gradients(shakespeare_grads_path, structured=True)
-    pirate_grads = load_gradients(pirate_grads_path, structured=True)
+    shakespeare_grads = load_module_gradients(shakespeare_grads_path)
+    pirate_grads = load_module_gradients(pirate_grads_path)
 
     # Sum gradients: for each eval fact, sum shakespeare + pirate style gradients
     summed_grad_list = []
@@ -2530,7 +2529,7 @@ def score_original_style_eval(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -2569,11 +2568,11 @@ def score_original_style_eval(
 
     # Load train gradients
     print("Loading train gradients...")
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -2615,7 +2614,7 @@ def score_original_style_eval(
 
     # Load original eval gradients
     print("Loading original style eval gradients...")
-    original_grads = load_gradients(original_grads_path, structured=True)
+    original_grads = load_module_gradients(original_grads_path)
 
     eval_grad_list = []
     for name in tqdm(module_names, desc="Loading original eval grads"):
@@ -2706,7 +2705,7 @@ def _score_single_style_eval(
     import torch
     from tqdm import tqdm
 
-    from bergson.data import load_gradients
+    from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
     from bergson.utils.math import damped_psd_power
 
@@ -2748,11 +2747,11 @@ def _score_single_style_eval(
     )
 
     # Load train gradients
-    train_grads = load_gradients(index_path, structured=True)
+    train_grads = load_module_gradients(index_path)
 
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    module_names = info["dtype"]["names"]
+    module_names = list(info["grad_sizes"])
 
     # Load hessian if specified
     h_inv = {}
@@ -2787,7 +2786,7 @@ def _score_single_style_eval(
         )
 
     # Load eval gradients
-    eval_grads = load_gradients(grads_path, structured=True)
+    eval_grads = load_module_gradients(grads_path)
     eval_grad_list = []
     for name in tqdm(module_names, desc=f"Loading {style} eval grads"):
         g = torch.from_numpy(_load_gradients_as_float(eval_grads, name))

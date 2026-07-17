@@ -72,8 +72,8 @@ def _get_example_loss(model, x, y, idx=0):
 
 def _measure(model, short_ids, long_ids, device):
     """Measure gradient cosine similarity: alone vs mixed batch."""
-    x_alone, y_alone, _ = pad_and_tensor([short_ids], device=device)
-    x_mixed, y_mixed, _ = pad_and_tensor([short_ids, long_ids], device=device)
+    x_alone, y_alone, _, _ = pad_and_tensor([short_ids], device=device)
+    x_mixed, y_mixed, _, _ = pad_and_tensor([short_ids, long_ids], device=device)
 
     # Pass 1: alone
     model.zero_grad()

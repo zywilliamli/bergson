@@ -37,7 +37,7 @@ if not run_path.exists():
 # Check whether items with the same subject value have a greater cosine similarity score
 # Than items from dissimilar subjects
 
-gradient_ds = load_gradient_dataset(run_path, structured=False)
+gradient_ds = load_gradient_dataset(run_path)
 
 subjects = gradient_ds["subject"]
 

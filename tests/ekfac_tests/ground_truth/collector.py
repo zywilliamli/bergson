@@ -24,7 +24,7 @@ class GroundTruthCovarianceCollector(HookCollectorBase):
 
     def forward_hook(self, module: nn.Module, a: Tensor) -> None:
         name = assert_type(str, module._name)
-        mask = self._current_valid_mask
+        mask = self._current_collection_mask
 
         # a: [N, S, I], valid_masks: [N, S] -> select valid positions
         if mask is not None:
@@ -41,7 +41,7 @@ class GroundTruthCovarianceCollector(HookCollectorBase):
 
     def backward_hook(self, module: nn.Module, g: Tensor) -> None:
         name = assert_type(str, module._name)
-        mask = self._current_valid_mask
+        mask = self._current_collection_mask
 
         # g: [N, S, O], valid_masks: [N, S] -> select valid positions
         if mask is not None:

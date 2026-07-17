@@ -109,7 +109,7 @@ class DataStream:
 
         indices = self.batch_rows(i)
         batch = self.dataset[indices]
-        x, y, valid_mask = pad_and_tensor(
+        x, y, valid_mask, _ = pad_and_tensor(
             batch["input_ids"],
             labels=batch.get("labels"),
             device=self.device,

@@ -1,3 +1,4 @@
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Literal
@@ -7,7 +8,7 @@ from torch import Tensor, nn
 
 from bergson.collector.gradient_collectors import TraceCollector
 from bergson.config import InversionConfig
-from bergson.data import load_gradients
+from bergson.data import column_offsets, load_gradients
 from bergson.gradients import GradientProcessor
 from bergson.hessians.preconditioner import (
     DensePreconditioner,
@@ -121,17 +122,17 @@ class Attributor:
             self.ordered_modules = self.faiss_index.ordered_modules
             return
 
-        # Load the gradients into memory
         mmap = load_gradients(index_path)
-        assert mmap.dtype.names is not None
+        with (index_path / "info.json").open("r") as f:
+            grad_sizes = json.load(f)["grad_sizes"]
         # Copy gradients into device memory
         self.grads = {
-            name: numpy_to_tensor(mmap[name]).to(device=device, dtype=dtype)
-            for name in mmap.dtype.names
+            name: numpy_to_tensor(mmap[:, lo:hi]).to(device=device, dtype=dtype)
+            for name, (lo, hi) in column_offsets(grad_sizes).items()
         }
-        self.N = mmap[mmap.dtype.names[0]].shape[0]
+        self.N = len(mmap)
 
-        self.ordered_modules = mmap.dtype.names
+        self.ordered_modules = list(grad_sizes)
 
         if unit_norm:
             if self.preconditioner is not None:

@@ -6,7 +6,7 @@ import random
 import re
 from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import ml_dtypes  # noqa: F401  # registers bfloat16 dtype with numpy
 import numpy as np
@@ -33,27 +33,27 @@ from .utils.utils import (
 
 
 def compute_num_token_grads(data: Dataset) -> np.ndarray:
-    """Compute the number of valid gradient positions per example.
+    """Number of per-token gradient rows stored per example.
 
-    A token at position t produces a gradient iff the *next* token's label
-    is not -100 (the ignore index).  When there is no explicit ``labels``
-    column every position except the last is valid, so
-    ``num_token_grads = length - 1``.
+    Position ``t``'s row is ``g_t (x) a_t``. ``g_t`` is generally nonzero even
+    at prompt / masked positions, because the completion-token losses backprop
+    through them via causal attention -- masking is applied to the *loss*, not
+    to the gradient. Storing every position therefore makes the per-token rows
+    sum to the per-document gradient. Only the final position (which predicts
+    nothing after ``logits[:, :-1]``) and right-padding are excluded, so
+    ``num_token_grads = length - 1`` regardless of the label mask.
 
     Returns
     -------
     np.ndarray of shape ``(len(data),)`` with dtype int64.
     """
-    if "labels" in data.column_names:
-        # Count positions where labels[t+1] != -100 for t in 0..len-2
-        counts = []
-        for labels in data["labels"]:
-            labels_arr = np.asarray(labels)
-            counts.append(int(np.sum(labels_arr[1:] != -100)))
-        return np.array(counts, dtype=np.int64)
+    if "length" in data.column_names:
+        lengths = np.asarray(data["length"], dtype=np.int64)
+    elif "input_ids" in data.column_names:
+        lengths = np.asarray([len(x) for x in data["input_ids"]], dtype=np.int64)
     else:
-        lengths = np.array(data["length"], dtype=np.int64)
-        return lengths - 1
+        lengths = np.asarray([len(x) for x in data["labels"]], dtype=np.int64)
+    return lengths - 1
 
 
 def create_token_index(
@@ -379,19 +379,30 @@ def _allocate_batches_world(
     return [allocation[rank] for rank in ranks]
 
 
+def column_offsets(grad_sizes: dict[str, int]) -> dict[str, tuple[int, int]]:
+    """Map each module name to its ``(start, end)`` column range in a flat
+    ``(num_grads, total_grad_dim)`` gradient array laid out in `grad_sizes`
+    order (the on-disk layout of :func:`create_index`)."""
+    offsets = {}
+    start = 0
+    for name, size in grad_sizes.items():
+        offsets[name] = (start, start + size)
+        start += size
+    return offsets
+
+
 def create_index(
     root: Path,
     num_grads: int,
     grad_sizes: dict[str, int],
     dtype: DTypeLike,
-    with_structure: bool = True,
 ) -> np.memmap:
-    """Create a memory-mapped file for storing structured gradients
-    and persist metadata."""
+    """Create a memory-mapped ``(num_grads, total_grad_dim)`` gradient file
+    (modules laid out in `grad_sizes` order) and persist metadata."""
     grad_path = root / "gradients.bin"
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    # Build a json-serializable structured dtype
+    # Legacy structured dtype, still written for external readers of older stores
     struct_dtype = {
         "names": [name for name in grad_sizes.keys()],
         "formats": [f"({size},){np.dtype(dtype).str}" for size in grad_sizes.values()],
@@ -428,18 +439,11 @@ def create_index(
     if dist.is_initialized():
         dist.barrier()
 
-    if with_structure:
-        dtype = np.dtype(struct_dtype)  # type: ignore
-        shape = (num_grads,)
-    else:
-        dtype = np.dtype(dtype)
-        shape = (num_grads, sum(grad_sizes.values()))
-
     return np.memmap(
         grad_path,
-        dtype=dtype,
+        dtype=np.dtype(dtype),
         mode="r+",
-        shape=shape,
+        shape=(num_grads, sum(grad_sizes.values())),
     )
 
 
@@ -487,38 +491,71 @@ def load_data_string(
     return ds
 
 
-def load_gradients(root_dir: Path | str, structured: bool = True) -> np.memmap:
-    """Map the structured gradients stored in `root_dir` into memory."""
+def load_gradients(root_dir: Path | str) -> np.memmap:
+    """Map the gradients stored in `root_dir` into memory as a flat
+    ``(num_grads, total_grad_dim)`` array, with modules laid out in
+    ``grad_sizes`` order (see :func:`column_offsets` for per-module slicing)."""
     root_dir = Path(root_dir)
     with (root_dir / "info.json").open("r") as f:
         info = json.load(f)
 
-    num_grads = info["num_grads"]
-
-    if structured:
-        dtype = info["dtype"]
-        shape = (num_grads,)
+    if "base_dtype" in info:
+        dtype = np.dtype(info["base_dtype"])
     else:
-        dtype = info["base_dtype"]
-        grad_sizes = info["grad_sizes"]
-        shape = (num_grads, sum(grad_sizes.values()))
+        # Old stores lack base_dtype; recover the scalar dtype from a field format
+        dtype = np.dtype(info["dtype"]["formats"][0]).base
 
     return np.memmap(
         root_dir / "gradients.bin",
         dtype=dtype,
         mode="r",
-        shape=shape,
+        shape=(info["num_grads"], sum(info["grad_sizes"].values())),
     )
 
 
-def load_gradient_dataset(root_dir: Path, structured: bool = True) -> Dataset:
+class ModuleGradients:
+    """Dict-like, module-name-keyed view over a flat memmapped gradient store:
+    ``grads[name]`` returns the ``(num_grads, size)`` column slice for that
+    module."""
+
+    def __init__(self, mmap: np.memmap, grad_sizes: dict[str, int]):
+        self.mmap = mmap
+        self.offsets = column_offsets(grad_sizes)
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        lo, hi = self.offsets[name]
+        return self.mmap[:, lo:hi]
+
+    def __len__(self) -> int:
+        return len(self.mmap)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.offsets)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.offsets
+
+    def keys(self):
+        return self.offsets.keys()
+
+
+def load_module_gradients(root_dir: Path | str) -> ModuleGradients:
+    """Load the gradients stored in `root_dir` keyed by module name."""
+    root_dir = Path(root_dir)
+    with (root_dir / "info.json").open("r") as f:
+        grad_sizes = json.load(f)["grad_sizes"]
+
+    return ModuleGradients(load_gradients(root_dir), grad_sizes)
+
+
+def load_gradient_dataset(root_dir: Path) -> Dataset:
     """Load a dataset of gradients from `root_dir`."""
 
     def load_shard(dir: Path) -> Dataset:
         ds = Dataset.load_from_disk(str(dir / "data.hf"))
 
         # Add gradients to HF dataset.
-        mmap = load_gradients(dir, structured=structured)
+        mmap = load_gradients(dir)
 
         def _to_arrow(arr: np.ndarray) -> pa.Array:
             """Convert numpy array to PyArrow, casting bfloat16 to float32."""
@@ -526,16 +563,9 @@ def load_gradient_dataset(root_dir: Path, structured: bool = True) -> Dataset:
                 arr = arr.astype(np.float32)
             return pa.array(arr)
 
-        if structured:
-            assert mmap.dtype.names is not None
-            for field_name in mmap.dtype.names:
-                flat = _to_arrow(mmap[field_name].reshape(-1).copy())
-                col = pa.FixedSizeListArray.from_arrays(flat, mmap[field_name].shape[1])
-                ds = ds.add_column(field_name, col, new_fingerprint=field_name)
-        else:
-            flat = _to_arrow(mmap.reshape(-1).copy())
-            col_arrow = pa.FixedSizeListArray.from_arrays(flat, mmap.shape[1])
-            ds = ds.add_column("gradients", col_arrow, new_fingerprint="gradients")
+        flat = _to_arrow(mmap.reshape(-1).copy())
+        col_arrow = pa.FixedSizeListArray.from_arrays(flat, mmap.shape[1])
+        ds = ds.add_column("gradients", col_arrow, new_fingerprint="gradients")
 
         return ds
 
@@ -617,12 +647,17 @@ def pad_and_tensor(
     dtype: torch.dtype | None = torch.long,
     device: torch.device | None = None,
     sync_max_len: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pad a list of sequences to the same length and convert them to tensors.
     Returns a tuple of padded sequences and labels. The labels are the same as the
     sequences, but with -100 for the padding positions, which is useful for ignoring
     padding in loss calculations.
+
+    Also returns two masks: ``valid_masks`` marks positions whose next-token
+    label is not -100 (loss positions), while ``collection_masks`` marks every
+    non-padding position but each sequence's last, independent of label
+    masking (the gradient-bearing positions).
 
     When ``sync_max_len`` is True (default) and a process group is
     initialized, the padding length is reduced to the global max across
@@ -659,7 +694,13 @@ def pad_and_tensor(
     valid_masks = torch.zeros(N, S, dtype=torch.bool, device=device)
     valid_masks[:, :-1] = padded_labels[:, 1:] != -100
 
-    return padded_tokens, padded_labels, valid_masks
+    # Compute collection_masks: every non-padding position but each
+    # sequence's last, regardless of label masking.
+    lengths = torch.tensor([len(seq) for seq in sequences], device=device)
+    positions = torch.arange(S, device=device)
+    collection_masks = (positions.unsqueeze(0) + 1) < lengths.unsqueeze(1)
+
+    return padded_tokens, padded_labels, valid_masks, collection_masks
 
 
 def tokenize(

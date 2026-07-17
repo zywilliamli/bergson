@@ -85,7 +85,7 @@ def per_doc_query_losses(
         for i in range(len(query_stream)):
             rows = query_stream.batch_rows(i)
             batch = ds[rows]
-            x, y, _ = pad_and_tensor(
+            x, y, _, _ = pad_and_tensor(
                 batch["input_ids"], labels=batch.get("labels"), device=device
             )
             if "doc_ids" in batch:
