@@ -1,6 +1,18 @@
 # CHANGELOG
 
 
+## v0.11.0 (2026-07-17)
+
+### Features
+
+- Custom gradient store class
+  ([`3ae519c`](https://github.com/EleutherAI/bergson/commit/3ae519c57e45090ea153d15bc0ba24c97b8e0937))
+
+Trim comments referencing the removed structured-dtype layout.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+
 ## v0.10.2 (2026-07-11)
 
 ### Bug Fixes
