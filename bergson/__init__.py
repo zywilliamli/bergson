@@ -16,9 +16,11 @@ from .config.config import (
     ScoreConfig,
 )
 from .data import (
+    ModuleGradients,
     TokenGradients,
     load_gradient_dataset,
     load_gradients,
+    load_module_gradients,
     load_token_gradients,
 )
 from .gradients import GradientProcessor
@@ -36,7 +38,9 @@ __all__ = [
     "collect_gradients",
     "load_gradients",
     "load_gradient_dataset",
+    "load_module_gradients",
     "load_token_gradients",
+    "ModuleGradients",
     "TokenGradients",
     "Builder",
     "load_from_optimizer",

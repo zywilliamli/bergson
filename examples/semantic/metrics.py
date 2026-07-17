@@ -69,13 +69,13 @@ def compute_metrics_groupwise(
 
     # Load gradient dataset with metadata
     print("Loading gradient dataset...")
-    grad_ds = load_gradient_dataset(index_path, structured=True)
+    grad_ds = load_gradient_dataset(index_path)
     print(f"  Loaded {len(grad_ds)} rows")
 
-    # Get gradient column names
+    # Get gradient module names
     with open(index_path / "info.json") as f:
         info = json.load(f)
-    grad_columns = info["dtype"]["names"]
+    grad_columns = list(info["grad_sizes"])
     print(f"  Gradient columns: {len(grad_columns)} modules")
 
     # Build style lookup (Qwen only, no Llama)
@@ -117,7 +117,7 @@ def compute_metrics_groupwise(
 
     # Load gradients directly from memmap (much faster than HF dataset)
     print("Loading gradients from memmap...")
-    grad_mmap = load_gradients(index_path, structured=False)
+    grad_mmap = load_gradients(index_path)
     # Select only the kept rows
     all_grads = torch.from_numpy(grad_mmap[keep_indices].copy()).float()
     print(f"  Gradient tensor shape: {all_grads.shape}")

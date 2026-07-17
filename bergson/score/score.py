@@ -15,6 +15,7 @@ from bergson.config.config import IndexConfig, PreprocessConfig, ScoreConfig
 from bergson.config.config_io import load_subconfig
 from bergson.data import (
     allocate_batches,
+    column_offsets,
     load_gradients,
 )
 from bergson.distributed import (
@@ -79,18 +80,15 @@ def get_query_grads(
     if not score_cfg.modules:
         score_cfg.modules = target_modules
 
-    mmap = load_gradients(Path(score_cfg.query_path), structured=False)
-
-    sizes = torch.tensor(list(grad_sizes.values()))
-    module_offsets = torch.tensor([0] + torch.cumsum(sizes, dim=0).tolist())
+    mmap = load_gradients(Path(score_cfg.query_path))
 
     # Cast to float32 only for dtypes not natively supported by numpy (e.g. bfloat16)
     needs_cast = not np.issubdtype(mmap.dtype, np.floating)
     grads: dict[str, torch.Tensor] = {}
-    for i, name in enumerate(grad_sizes.keys()):
+    for name, (lo, hi) in column_offsets(grad_sizes).items():
         if name not in target_modules:
             continue
-        sliced = mmap[:, module_offsets[i] : module_offsets[i + 1]]
+        sliced = mmap[:, lo:hi]
         if needs_cast:
             grads[name] = torch.from_numpy(sliced.astype(np.float32))
         else:
