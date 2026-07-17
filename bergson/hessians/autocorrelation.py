@@ -21,7 +21,8 @@ class AutocorrelationCollector(HookCollectorBase):
     """
 
     data: Dataset
-    """The dataset the Hessian is fit on (its length normalizes the Gram)."""
+    """The dataset the Hessian is fit on (its row count — documents, or
+    tokens under ``attribute_tokens`` — normalizes the Gram)."""
 
     path: str
     """Directory the fitted GradientProcessor is saved to."""
@@ -54,7 +55,7 @@ class AutocorrelationCollector(HookCollectorBase):
             process_autocorrelation_matrices(
                 self.processor,
                 self.processor.hessians,
-                len(self.data),
+                self.num_rows(self.data),
                 grad_sizes,
                 self.rank,
             )

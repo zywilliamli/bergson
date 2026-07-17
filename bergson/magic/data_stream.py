@@ -109,7 +109,7 @@ class DataStream:
 
         indices = self.batch_rows(i)
         batch = self.dataset[indices]
-        x, y, valid_mask, _ = pad_and_tensor(
+        x, y, shift_loss_mask, _ = pad_and_tensor(
             batch["input_ids"],
             labels=batch.get("labels"),
             device=self.device,
@@ -130,7 +130,7 @@ class DataStream:
             "input_ids": x,
             "labels": y,
             "example_weight": self.weights[indices],
-            "valid_mask": valid_mask,
+            "shift_loss_mask": shift_loss_mask,
         }
 
     def __iter__(self):

@@ -12,7 +12,7 @@ def weighted_causal_lm_ce(
     *,
     example_weight: Tensor | None = None,
     ignore_index: int = -100,
-    valid_mask: Tensor | None = None,
+    shift_loss_mask: Tensor | None = None,
     vocab_size: int | None = None,
     reduction: str = "mean",
     **kwargs,  # Ignored
@@ -21,15 +21,17 @@ def weighted_causal_lm_ce(
     HuggingFace-compatible causal LM loss with per-example weighting.
 
     Args:
-    logits         : [B, T, V] float tensor of prediction scores
-    labels         : [B, T] long tensor of target token ids, or ignore_index
-    example_weight : [B] or [B, T] float tensor of weights
-    ignore_index   : int, label value to ignore in loss computation
-    vocab_size     : optional int, vocabulary size (for validation)
-    reduction      : "mean": mean over all valid tokens in the batch
-                     (standard). "sum_of_means": mean over
-                     each sample's tokens, summed over the batch with no
-                     batch-size division.
+    logits          : [B, T, V] float tensor of prediction scores
+    labels          : [B, T] long tensor of target token ids, or ignore_index
+    example_weight  : [B] or [B, T] float tensor of weights
+    ignore_index    : int, label value to ignore in loss computation
+    shift_loss_mask : optional [B, T] bool tensor;
+                      mask[i] = labels[i+1] != ignore_index
+    vocab_size      : optional int, vocabulary size (for validation)
+    reduction       : "mean": mean over all valid tokens in the batch
+                      (standard). "sum_of_means": mean over
+                      each sample's tokens, summed over the batch with no
+                      batch-size division.
     """
     assert logits.ndim == 3 and labels.ndim == 2
     B, T, V = logits.shape
@@ -72,15 +74,16 @@ def weighted_causal_lm_ce(
     if reduction == "sum_of_means":
         # Per-sample token-mean, summed over the batch (no /B).
         row_valid = (
-            valid_mask[:, :-1].to(tok_loss.dtype)
-            if valid_mask is not None
+            shift_loss_mask[:, :-1].to(tok_loss.dtype)
+            if shift_loss_mask is not None
             else (shift_labels != ignore_index).to(tok_loss.dtype)
         )
         row_counts = row_valid.sum(dim=1).clamp_min(1.0)  # [B]
         row_loss = (tok_loss * w).sum(dim=1) / row_counts  # [B]
         return row_loss.sum()
 
-    denom = valid_mask[:, :-1].sum() if valid_mask is not None else T - 1
+    # The mask's last column is always False, so no [:, :-1] slice is needed.
+    denom = shift_loss_mask.sum() if shift_loss_mask is not None else T - 1
     return (tok_loss * w).sum() / denom
 
 
