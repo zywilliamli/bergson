@@ -11,12 +11,16 @@ Requires at least 2 CUDA devices.
 import pytest
 import torch
 
-from bergson.config import DataConfig, DistributedConfig
+from bergson.config import DataConfig, DistributedConfig, LRScheduleConfig
 from bergson.magic.cli import MagicConfig, run_magic
 
 # Both tests consume the module-scoped noclip_scores fixture, so they must run
 # on the same xdist worker or each worker recomputes the two no-clip runs.
 pytestmark = pytest.mark.xdist_group("distributed_magic")
+
+# Config default lr (1e-5) gives scores ~1e-6, too small to separate a
+# world-size gradient-sync bug from fp32 noise.
+_LR_SCHEDULE = LRScheduleConfig(lr=8e-4)
 
 # tiny-Phi3 grad norms on this data are ~0.35, so 0.2 clips on every step.
 MAX_GRAD_NORM = 0.2
@@ -40,6 +44,7 @@ def magic_cfg(run_path: str, *, fsdp: bool, clip: bool) -> MagicConfig:
         fsdp=fsdp,
         data=data,
         query=data,
+        lr_schedule=_LR_SCHEDULE,
         batch_size=8,
         num_epochs=1,
         overwrite=True,
