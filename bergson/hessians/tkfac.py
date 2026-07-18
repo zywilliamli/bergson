@@ -46,9 +46,9 @@ class TraceCovarianceCollector(HookCollectorBase):
         """Compute activation covariance: A^T @ A."""
 
         mask = self._current_collection_mask
-        assert mask is not None, "Valid mask not set for forward hook."
+        assert mask is not None, "Collection mask not set for forward hook."
 
-        # a: [N, S, I], collection_masks: [N, S] -> select collected positions
+        # a: [N, S, I], collection mask: [N, S] -> select gradient-carrying positions
         a_bi = a[mask]  # [num_valid, I]
 
         # Augment with a ones column so A matches the [O, I+1] gradient layout
@@ -67,7 +67,7 @@ class TraceCovarianceCollector(HookCollectorBase):
         A_tcov_ki = self.A_tcov_dict[name]
         mask = self._current_collection_mask
 
-        # g: [N, S, O], mask: [N, S] -> select valid positions
+        # g: [N, S, O], mask: [N, S] -> select gradient-carrying positions
         g_bo = g[mask].to(self.dtype)  # [num_valid, O]
         a_bi = module._inputs.to(self.dtype)
         assert isinstance(a_bi, Tensor)

@@ -7,13 +7,19 @@ from bergson.gradients import GradientProcessor
 def process_autocorrelation_matrices(
     processor: GradientProcessor,
     hessians: dict[str, torch.Tensor],
-    len_data: int,
+    num_rows: int,
     grad_sizes: dict[str, int],
     rank: int,
 ):
     """
     Aggregate autocorrelation matrices across ranks and compute their eigen
     decomposition distributed across all ranks.
+
+    ``num_rows`` is the number of gradient rows summed into the Gram — the
+    document count for per-sequence gradients, or the gradient-carrying token
+    count when ``attribute_tokens`` produced per-token rows — so the
+    normalized matrix is the second moment over whichever unit the rows
+    represent.
     """
     hessians_eigen = {}
 
@@ -24,7 +30,7 @@ def process_autocorrelation_matrices(
         print("Saving hessians...")
 
     for name, prec in hessians.items():
-        hessians[name] = (prec / len_data).cpu()
+        hessians[name] = (prec / num_rows).cpu()
 
     if rank == 0:
         print("Computing hessian eigen decompositions...")

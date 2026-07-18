@@ -45,9 +45,9 @@ class CovarianceCollector(HookCollectorBase):
         name = assert_type(str, module._name)
         A_cov_ki = self.A_cov_dict[name]
         mask = self._current_collection_mask
-        assert mask is not None, "Valid mask not set for forward hook."
+        assert mask is not None, "Collection mask not set for forward hook."
 
-        # a: [N, S, I], collection_masks: [N, S] -> select collected positions
+        # a: [N, S, I], collection mask: [N, S] -> select gradient-carrying positions
         a_bi = a[mask].to(self.dtype)  # [num_valid, I]
 
         # Augment with a ones column so A matches the [O, I+1] gradient layout
@@ -77,7 +77,7 @@ class CovarianceCollector(HookCollectorBase):
         S_cov_po = self.S_cov_dict[name]
         mask = self._current_collection_mask
 
-        # g: [N, S, O], mask: [N, S] -> select valid positions
+        # g: [N, S, O], mask: [N, S] -> select gradient-carrying positions
         g_bo = g[mask].to(self.dtype)  # [num_valid, O]
 
         # Compute local covariance

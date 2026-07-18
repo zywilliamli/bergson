@@ -650,14 +650,16 @@ def pad_and_tensor(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pad a list of sequences to the same length and convert them to tensors.
-    Returns a tuple of padded sequences and labels. The labels are the same as the
-    sequences, but with -100 for the padding positions, which is useful for ignoring
-    padding in loss calculations.
+    Returns a tuple of (padded sequences, padded labels, shift_loss_masks,
+    collection_masks). The labels are the same as the sequences, but with -100
+    for the padding positions, which is useful for ignoring padding in loss
+    calculations.
 
-    Also returns two masks: ``valid_masks`` marks positions whose next-token
-    label is not -100 (loss positions), while ``collection_masks`` marks every
+    Both masks are aligned with input positions. ``shift_loss_masks[i]`` is
+    True iff ``labels[i+1] != -100``, i.e. it marks the input positions whose
+    next-token prediction is supervised. ``collection_masks`` marks every
     non-padding position but each sequence's last, independent of label
-    masking (the gradient-bearing positions).
+    masking (the gradient-carrying positions).
 
     When ``sync_max_len`` is True (default) and a process group is
     initialized, the padding length is reduced to the global max across
@@ -689,10 +691,10 @@ def pad_and_tensor(
     padded_tokens = torch.tensor(padded, dtype=dtype, device=device)
     padded_labels = torch.tensor(labels, dtype=dtype, device=device)
 
-    # Compute valid_masks: position i is valid if labels[i+1] != -100
+    # shift_loss_masks[i] = labels[i+1] != -100
     N, S = padded_tokens.shape
-    valid_masks = torch.zeros(N, S, dtype=torch.bool, device=device)
-    valid_masks[:, :-1] = padded_labels[:, 1:] != -100
+    shift_loss_masks = torch.zeros(N, S, dtype=torch.bool, device=device)
+    shift_loss_masks[:, :-1] = padded_labels[:, 1:] != -100
 
     # Compute collection_masks: every non-padding position but each
     # sequence's last, regardless of label masking.
@@ -700,7 +702,7 @@ def pad_and_tensor(
     positions = torch.arange(S, device=device)
     collection_masks = (positions.unsqueeze(0) + 1) < lengths.unsqueeze(1)
 
-    return padded_tokens, padded_labels, valid_masks, collection_masks
+    return padded_tokens, padded_labels, shift_loss_masks, collection_masks
 
 
 def tokenize(

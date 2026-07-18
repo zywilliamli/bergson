@@ -98,10 +98,10 @@ def compute_exact_fim(
     [
         ((512,), 100, False, 0.05),
         ((512,), 100, True, 0.05),
-        ((4,), 10000, False, 0.05),  # rel_error = ~0.25 without valid_masks logic
-        ((4,), 10000, True, 0.10),  # rel_error = ~0.25 without valid_masks logic
-        ((512, 2), 100, False, 0.05),  # rel_error = ~0.6 without valid_masks logic
-        ((512, 2), 100, True, 0.20),  # rel_error = ~1.2 without valid_masks logic
+        ((4,), 10000, False, 0.05),  # rel_error = ~0.25 without collection-mask logic
+        ((4,), 10000, True, 0.10),  # rel_error = ~0.25 without collection-mask logic
+        ((512, 2), 100, False, 0.05),  # rel_error = ~0.6 without collection-mask logic
+        ((512, 2), 100, True, 0.20),  # rel_error = ~1.2 without collection-mask logic
     ],
 )
 def test_kfac_fim_accuracy(seq_lengths, num_batches, max_rel_error, sample, tmp_path):

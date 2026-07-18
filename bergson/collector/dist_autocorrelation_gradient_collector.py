@@ -135,7 +135,7 @@ class GradientCollectorWithDistributedAutocorrelationMatrices(HookCollectorBase)
             process_autocorrelation_matrices(
                 self.processor,
                 self.processor.hessians,
-                len(self.data),
+                self.num_rows(self.data),
                 grad_sizes,
                 self.rank,
             )

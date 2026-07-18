@@ -28,7 +28,7 @@ from tqdm.auto import tqdm
 from transformers import PreTrainedModel
 
 from bergson.config import AttentionConfig, HessianConfig, IndexConfig
-from bergson.data import pad_and_tensor
+from bergson.data import compute_num_token_grads, pad_and_tensor
 from bergson.gradients import (
     AdafactorNormalizer,
     AdamNormalizer,
@@ -85,8 +85,7 @@ class HookCollectorBase(ContextDecorator, ABC):
     """
 
     attribute_tokens: bool = False
-    """When True, compute per-position gradients instead of per-example, filtered
-    to gradient-bearing positions using ``_current_collection_mask``."""
+    """When True, compute per-position gradients instead of per-example."""
 
     lo: float = float("-inf")
     """Lower clamp bound for gradients. May be narrowed in subclass ``setup()``."""
@@ -297,6 +296,15 @@ class HookCollectorBase(ContextDecorator, ABC):
         self.processor._projection_matrices[key] = A
         return A
 
+    def num_rows(self, data: Dataset) -> int:
+        """Number of gradient rows accumulated into an autocorrelation Gram
+        over ``data``: one per gradient-carrying token when
+        ``attribute_tokens`` is set, else one per document. Used to normalize
+        the Gram into a second moment over the matching unit."""
+        if self.attribute_tokens:
+            return int(compute_num_token_grads(data).sum())
+        return len(data)
+
     def with_batch(self, collection_mask: Tensor | None = None) -> "HookCollectorBase":
         """
         Set the current collection mask before entering the context.
@@ -308,11 +316,10 @@ class HookCollectorBase(ContextDecorator, ABC):
                 # hooks can access self._current_collection_mask
 
         Args:
-            collection_mask: Optional boolean tensor of shape [batch_size, seq_len]
-                indicating every position containing a non-padding token with a
-                next-token target (excludes each sequence's final token). Unlike
-                ``pad_and_tensor``'s ``valid_masks``, it is independent of label
-                masking.
+            collection_mask: Optional boolean tensor of shape [batch_size, seq_len],
+                aligned with input positions, marking which positions the hooks
+                collect. This normally spans every real (non-padding) position
+                but each sequence's last.
 
         Returns:
             self, for use as a context manager.
@@ -772,6 +779,7 @@ class CollectorComputer:
                     device=self.device,
                     sync_max_len=False,
                 )
+                # Must count the same positions the collectors ingest.
                 total_processed += collection_mask.sum()
 
                 with (
