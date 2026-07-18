@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bergson.config import DataConfig
 from bergson.data import pad_and_tensor, tokenize
+from bergson.utils.utils import simple_parse_kwargs_string
 
 
 @dataclass
@@ -53,6 +54,10 @@ class DiagnoseConfig:
 
     threshold: float = 0.99
     """Cosine similarity below this is flagged as problematic."""
+
+    model_kwargs: str = ""
+    """Extra kwargs forwarded to ``from_pretrained`` as ``a=b,c=d`` (e.g.
+    ``trust_remote_code=True`` for custom model architectures)."""
 
 
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -380,6 +385,7 @@ def diagnose(diagnose_cfg: DiagnoseConfig):
         torch_dtype=base_dtype,
         attn_implementation="sdpa",
         device_map={"": device},
+        **simple_parse_kwargs_string(diagnose_cfg.model_kwargs),
     )
     eq_model.eval()
 
@@ -420,6 +426,7 @@ def diagnose(diagnose_cfg: DiagnoseConfig):
             torch_dtype=dtype,
             attn_implementation="sdpa",
             device_map={"": device},
+            **simple_parse_kwargs_string(diagnose_cfg.model_kwargs),
         )
         model.eval()
 
