@@ -454,7 +454,7 @@ def score_asymmetric_eval(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -527,9 +527,14 @@ def score_asymmetric_eval(
             regularizer = None
             if reg_proc is not None and name in reg_proc.hessians:
                 regularizer = reg_proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(
-                H, power=-1, damping_factor=damping_factor, regularizer=regularizer
-            )
+            if regularizer is not None:
+                # (H + c*R)^-1: fold the custom regularizer in, then invert
+                # without additional identity damping.
+                h_inv[name] = invert_psd_matrix(
+                    H + damping_factor * regularizer, damping_factor=0.0
+                )
+            else:
+                h_inv[name] = invert_psd_matrix(H, damping_factor=damping_factor)
 
     # Concatenate train gradients
     print("Preparing train gradients...")
@@ -823,7 +828,7 @@ def score_asymmetric_eval_with_pca_projection(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     from .hessians import project_orthogonal_to_style_subspace
 
@@ -883,7 +888,7 @@ def score_asymmetric_eval_with_pca_projection(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1, damping_factor=damping_factor)
+            h_inv[name] = invert_psd_matrix(H, damping_factor=damping_factor)
 
     # Concatenate train gradients
     print("Preparing train gradients...")
@@ -1149,7 +1154,7 @@ def score_majority_style_eval(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -1205,7 +1210,7 @@ def score_majority_style_eval(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
     # Concatenate train gradients
     print("Preparing train gradients...")
@@ -1319,7 +1324,7 @@ def score_summed_eval(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -1391,7 +1396,7 @@ def score_summed_eval(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
     # Concatenate train gradients
     print("Preparing train gradients...")
@@ -1967,7 +1972,7 @@ def score_with_inner_product(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -2005,7 +2010,7 @@ def score_with_inner_product(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
     # Concatenate train gradients - NO NORMALIZATION
     print("Preparing train gradients (no normalization)...")
@@ -2357,7 +2362,7 @@ def score_summed_rewrites(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -2422,7 +2427,7 @@ def score_summed_rewrites(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
     # Concatenate train gradients
     print("Preparing train gradients...")
@@ -2531,7 +2536,7 @@ def score_original_style_eval(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -2582,7 +2587,7 @@ def score_original_style_eval(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
     # Concatenate train gradients
     print("Preparing train gradients...")
@@ -2707,7 +2712,7 @@ def _score_single_style_eval(
 
     from bergson.data import load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -2760,7 +2765,7 @@ def _score_single_style_eval(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
     # Prepare train gradients
     train_grad_list = []

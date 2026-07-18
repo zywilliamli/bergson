@@ -730,7 +730,7 @@ def score_attribute_eval(
 
     from bergson.data import ModuleGradients, load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -793,7 +793,7 @@ def score_attribute_eval(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1, damping_factor=damping_factor)
+            h_inv[name] = invert_psd_matrix(H, damping_factor=damping_factor)
 
     def load_grad_as_float(grads: ModuleGradients, name: str) -> np.ndarray:
         g = np.asarray(grads[name])
@@ -1150,7 +1150,7 @@ def score_attribute_eval_with_pca(
 
     from bergson.data import ModuleGradients, load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     from .hessians import project_orthogonal_to_style_subspace
 
@@ -1216,7 +1216,7 @@ def score_attribute_eval_with_pca(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, -1.0, damping_factor=damping_factor)
+            h_inv[name] = invert_psd_matrix(H, damping_factor=damping_factor)
 
     def load_grad_as_float(grads: ModuleGradients, name: str) -> np.ndarray:
         g = np.asarray(grads[name])
@@ -1759,7 +1759,7 @@ def score_majority_style_eval(
 
     from bergson.data import ModuleGradients, load_module_gradients
     from bergson.gradients import GradientProcessor
-    from bergson.utils.math import damped_psd_power
+    from bergson.hessians.inversion import invert_psd_matrix
 
     base_path = Path(base_path)
     index_path = base_path / "index"
@@ -1812,7 +1812,7 @@ def score_majority_style_eval(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1, damping_factor=damping_factor)
+            h_inv[name] = invert_psd_matrix(H, damping_factor=damping_factor)
 
     def load_grad_as_float(grads: ModuleGradients, name: str) -> np.ndarray:
         g = np.asarray(grads[name])
