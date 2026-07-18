@@ -58,6 +58,13 @@ class EkfacApplicator:
         if inversion_cfg is not None and apply_fn is not None:
             raise ValueError("Pass either inversion_cfg or apply_fn, not both.")
 
+        if cfg.projection_dim > 0 and cfg.ev_correction:
+            raise ValueError(
+                "projection_dim compression is not supported with EK-FAC "
+                "(ev_correction=True); set ev_correction=False or "
+                "projection_dim=0."
+            )
+
         self.cfg = cfg
         self.path = cfg.hessian_method_path
         self.gradient_path = cfg.gradient_path

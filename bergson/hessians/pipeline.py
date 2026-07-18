@@ -56,6 +56,14 @@ def hessian_pipeline(
     3. Apply the inverse Hessian to the mean query gradient.
     4. Score each training example against the transformed query gradient.
     """
+    if preprocess_cfg.unit_normalize:
+        raise ValueError(
+            "preprocess_cfg.unit_normalize (cosine similarity) is not "
+            "supported with Kronecker-factored Hessians; hessian_pipeline "
+            "only ever fits and applies a factored (kfac/tkfac/shampoo) "
+            "Hessian."
+        )
+
     run_path = index_cfg.run_path
     method = hessian_cfg.method
     query_path = f"{run_path}/query"

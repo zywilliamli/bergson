@@ -297,3 +297,16 @@ def test_apply_hessian_compresses_per_module(tmp_path):
         assert torch.allclose(
             compressed, expected, atol=1e-4, rtol=1e-4
         ), f"{name}: compressed IVHP output doesn't match manual post-projection"
+
+
+def test_apply_hessian_rejects_compression_with_ev_correction():
+    """projection_dim compression is not supported with EK-FAC (ev_correction)."""
+    cfg = EkfacConfig(
+        hessian_method_path="unused",
+        gradient_path="unused",
+        run_path="unused",
+        ev_correction=True,
+        projection_dim=8,
+    )
+    with pytest.raises(ValueError, match="EK-FAC"):
+        EkfacApplicator(cfg, inversion_cfg=InversionConfig())
