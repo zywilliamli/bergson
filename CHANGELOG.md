@@ -1,6 +1,33 @@
 # CHANGELOG
 
 
+## v0.12.1 (2026-07-18)
+
+### Bug Fixes
+
+- Correctly differentiate cross-rank gradient sync in MAGIC's backward-through-training
+  ([`bfc2938`](https://github.com/EleutherAI/bergson/commit/bfc29381bc2436310ef0b554716177ee858711e4))
+
+Trainer.step() synchronizes per-rank parameter gradients with a differentiable all-reduce so the
+  resulting graph can be differentiated again during backward-through-training. Rebased onto main,
+  which had independently landed a different fix for the same underlying bug (51a822dd, "Update DDP
+  MAGIC all reduce") using torch.distributed.nn.functional.all_reduce plus a single `/world_size`
+  correction applied once at the end of Trainer.backward().
+
+This commit replaces that mechanism with a custom _ReplicatedAllReduceSum autograd Function,
+  differentiable to arbitrary order via a recursive backward. Unlike torch.distributed.nn's
+  all_reduce, this one already applies its `/world_size` correction inline (dividing before the
+  reduce, once per occurrence), so the leftover unconditional `bwd_state.weight_grads /=
+  dist.get_world_size()` at the end of `backward()` — carried over from main's fix, which does need
+  it — was double-correcting and silently deflating scores by another 1/world_size. Confirmed via
+  tests/test_ddp.py::test_ddp_matches_single_process, which should be exact with no cross-rank
+  correction needed for a single step: it failed at exactly a 1/world_size ratio with the line still
+  in place, and passes with it removed. Both CPU (test_ddp.py) and real multi-GPU
+  (test_distributed_magic.py, FSDP-vs-DDP with and without grad clipping) suites pass after the fix.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+
 ## v0.12.0 (2026-07-18)
 
 ### Features
