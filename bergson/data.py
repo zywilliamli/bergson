@@ -651,13 +651,13 @@ def pad_and_tensor(
     """
     Pad a list of sequences to the same length and convert them to tensors.
     Returns a tuple of (padded sequences, padded labels, shift_loss_masks,
-    position_masks). The labels are the same as the sequences, but with -100
+    collection_masks). The labels are the same as the sequences, but with -100
     for the padding positions, which is useful for ignoring padding in loss
     calculations.
 
     Both masks are aligned with input positions. ``shift_loss_masks[i]`` is
     True iff ``labels[i+1] != -100``, i.e. it marks the input positions whose
-    next-token prediction is supervised. ``position_masks`` marks every
+    next-token prediction is supervised. ``collection_masks`` marks every
     non-padding position but each sequence's last, independent of label
     masking (the gradient-carrying positions).
 
@@ -696,13 +696,13 @@ def pad_and_tensor(
     shift_loss_masks = torch.zeros(N, S, dtype=torch.bool, device=device)
     shift_loss_masks[:, :-1] = padded_labels[:, 1:] != -100
 
-    # Compute position_masks: every non-padding position but each
+    # Compute collection_masks: every non-padding position but each
     # sequence's last, regardless of label masking.
     lengths = torch.tensor([len(seq) for seq in sequences], device=device)
     positions = torch.arange(S, device=device)
-    position_masks = (positions.unsqueeze(0) + 1) < lengths.unsqueeze(1)
+    collection_masks = (positions.unsqueeze(0) + 1) < lengths.unsqueeze(1)
 
-    return padded_tokens, padded_labels, shift_loss_masks, position_masks
+    return padded_tokens, padded_labels, shift_loss_masks, collection_masks
 
 
 def tokenize(

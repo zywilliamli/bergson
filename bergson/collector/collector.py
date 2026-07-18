@@ -305,18 +305,18 @@ class HookCollectorBase(ContextDecorator, ABC):
             return int(compute_num_token_grads(data).sum())
         return len(data)
 
-    def with_batch(self, position_mask: Tensor | None = None) -> "HookCollectorBase":
+    def with_batch(self, collection_mask: Tensor | None = None) -> "HookCollectorBase":
         """
-        Set the current position mask before entering the context.
+        Set the current collection mask before entering the context.
 
         This allows hooks to access the mask during forward/backward passes.
         Usage:
-            with collector.with_batch(position_mask):
+            with collector.with_batch(collection_mask):
                 # forward/backward pass
-                # hooks can access self._current_position_mask
+                # hooks can access self._current_collection_mask
 
         Args:
-            position_mask: Optional boolean tensor of shape [batch_size, seq_len],
+            collection_mask: Optional boolean tensor of shape [batch_size, seq_len],
                 aligned with input positions, marking which positions the hooks
                 collect. This normally spans every real (non-padding) position
                 but each sequence's last.
@@ -324,7 +324,7 @@ class HookCollectorBase(ContextDecorator, ABC):
         Returns:
             self, for use as a context manager.
         """
-        self._current_position_mask = position_mask
+        self._current_collection_mask = collection_mask
         return self
 
     def __enter__(self):
@@ -523,7 +523,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                     P = self.double_sided_projection(name, P, g, p, o, i)
 
                 P = P.flatten(2)  # [N, S, grad_dim]
-                P = P[self._current_position_mask]  # [total_valid, grad_dim]
+                P = P[self._current_collection_mask]  # [total_valid, grad_dim]
             else:
                 P = g.mT @ a  # [N,O,S] @ [N,S,I] → [N,O,I]
 
@@ -572,7 +572,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                     # [N, S, O/p, 1] * [N, S, 1, I/q] → [N, S, O/p, I/q]
                     P = g.unsqueeze(-1) * a.unsqueeze(-2)
                 P = P.flatten(2)  # [N, S, grad_dim]
-                P = P[self._current_position_mask]  # [total_valid, grad_dim]
+                P = P[self._current_collection_mask]  # [total_valid, grad_dim]
             else:
                 if bias_grad is not None and p is not None:
                     P = self.double_sided_projection_with_bias(
@@ -609,7 +609,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                 )
                 if self.attribute_tokens:
                     P = P.flatten(2)  # [N, S, grad_dim]
-                    P = P[self._current_position_mask]  # [total_valid, grad_dim]
+                    P = P[self._current_collection_mask]  # [total_valid, grad_dim]
             else:
                 # a was already projected in forward if p is set;
                 # project g individually
@@ -625,7 +625,7 @@ class HookCollectorBase(ContextDecorator, ABC):
                     if bias_grad is not None:
                         P = torch.cat([P, bias_grad.unsqueeze(-1)], dim=-1)
                     P = P.flatten(2)  # [N, S, grad_dim]
-                    P = P[self._current_position_mask]  # [total_valid, grad_dim]
+                    P = P[self._current_collection_mask]  # [total_valid, grad_dim]
                 else:
                     P = g.mT @ a  # [N, O/p, I/p]
                     if bias_grad is not None:
@@ -773,20 +773,17 @@ class CollectorComputer:
                 # Local padding only: bin-packer enforces a per-rank
                 # ``max_len × batch_size ≤ N`` budget that a global-max
                 # all-reduce would silently violate.
-                # Gradients flow back through attention to every real position
-                # regardless of loss masking, so collectors get a mask over all
-                # gradient-carrying positions (each real position but the last).
-                x, y, _, position_mask = pad_and_tensor(
+                x, y, _, collection_mask = pad_and_tensor(
                     batch["input_ids"],
                     labels=batch.get("labels"),
                     device=self.device,
                     sync_max_len=False,
                 )
                 # Must count the same positions the collectors ingest.
-                total_processed += position_mask.sum()
+                total_processed += collection_mask.sum()
 
                 with (
-                    self.collector.with_batch(position_mask),
+                    self.collector.with_batch(collection_mask),
                     (
                         record_function(f"step_{step}")
                         if self.cfg.profile

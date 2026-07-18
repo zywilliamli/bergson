@@ -51,7 +51,7 @@ class CountingCovarianceCollector(CovarianceCollector):
         self.ingested = dict.fromkeys(self.target_info, 0)
 
     def forward_hook(self, module, a):
-        mask = self._current_position_mask
+        mask = self._current_collection_mask
         assert mask is not None
         name = assert_type(str, module._name)
         self.ingested[name] += int(mask.sum())
