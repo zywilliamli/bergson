@@ -3,12 +3,14 @@ import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from simple_parsing import ArgumentParser
 
+from bergson.collector.collector import create_projection_matrix
 from bergson.config import InversionConfig
 from bergson.data import column_offsets, create_index, load_gradients
 from bergson.distributed import init_dist
@@ -28,6 +30,10 @@ class EkfacConfig:
     `HessianConfig.ev_correction=True`."""
     apply_batch_size: int = 32
     """Number of query gradients moved on-device and preconditioned at a time."""
+    projection_dim: int = 0
+    """When set, compress each module's IVHP output to a ``[p, p]`` Kronecker
+    random projection (``P_S @ (H^-1 G) @ P_A^T``)."""
+    projection_type: Literal["normal", "rademacher"] = "rademacher"
     debug: bool = False
 
 
@@ -77,9 +83,18 @@ class EkfacApplicator:
             ev_correction=self.cfg.ev_correction,
         )
 
-        grad_sizes = {
+        o_dims = {
             name: preconditioner.eigen_g[name].shape[1]
-            * preconditioner.eigen_a[name].shape[1]
+            for name in preconditioner.eigen_a
+        }
+        i_dims = {
+            name: preconditioner.eigen_a[name].shape[1]
+            for name in preconditioner.eigen_a
+        }
+
+        p = self.cfg.projection_dim
+        grad_sizes = {
+            name: p * p if p > 0 else o_dims[name] * i_dims[name]
             for name in preconditioner.eigen_a
         }
 
@@ -125,6 +140,30 @@ class EkfacApplicator:
             del grads
 
             self.logger.debug("Finished H^{-1} G = Q_S @ (G' / lambda) @ Q_A^T batch")
+
+            if p > 0:
+                for name, flat in transformed.items():
+                    if name not in o_dims:
+                        continue
+                    g = flat.view(-1, o_dims[name], i_dims[name])
+                    P_l = create_projection_matrix(
+                        f"{name}/left",
+                        p,
+                        o_dims[name],
+                        g.dtype,
+                        g.device,
+                        self.cfg.projection_type,
+                    )
+                    P_r = create_projection_matrix(
+                        f"{name}/right",
+                        p,
+                        i_dims[name],
+                        g.dtype,
+                        g.device,
+                        self.cfg.projection_type,
+                    )
+                    transformed[name] = torch.einsum("ps,nsa,ra->npr", P_l, g, P_r)
+                self.logger.debug("Compressed IVHP output to [p, p] per module")
 
             # Stage the async D2H copies, synchronize once, then read them
             # into the numpy buffer. `.numpy()` is a host read so the

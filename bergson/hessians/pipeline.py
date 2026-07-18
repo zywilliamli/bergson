@@ -110,6 +110,8 @@ def hessian_pipeline(
             gradient_path=query_path,
             run_path=transformed_query_path,
             ev_correction=hessian_cfg.ev_correction,
+            projection_dim=index_cfg.projection_dim,
+            projection_type=index_cfg.projection_type,
         )
         launch_distributed_run(
             "apply_hessian",
@@ -123,7 +125,6 @@ def hessian_pipeline(
     if not _step_complete(scores_path, resume):
         score_index_cfg = deepcopy(index_cfg)
         score_index_cfg.run_path = scores_path
-        score_index_cfg.projection_dim = 0
         score_cfg.query_path = transformed_query_path
         score_cfg.higher_is_better = True
         _validate(score_index_cfg)
