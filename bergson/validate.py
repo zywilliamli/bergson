@@ -64,6 +64,24 @@ def load_attribution_scores(score_path: str) -> tuple[torch.Tensor, bool]:
     return scores, scores.ndim == 2 and scores.shape[1] > 1
 
 
+def _load_banked_model(
+    run_cfg: ValidationConfig, out_dir: str, device: torch.device | str
+) -> torch.nn.Module:
+    """Load a banked ``save_retrained_models`` checkpoint into a ready model."""
+    if os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
+        from peft import PeftModel
+
+        base = AutoModelForCausalLM.from_pretrained(
+            run_cfg.model, dtype=torch.float32, attn_implementation="eager"
+        )
+        model = PeftModel.from_pretrained(base, out_dir)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            out_dir, dtype=torch.float32, attn_implementation="eager"
+        )
+    return model.to(device)  # type: ignore
+
+
 def per_doc_query_losses(
     model: torch.nn.Module,
     query_stream: DataStream,
@@ -484,11 +502,7 @@ def evaluate_retrained(
     baseline = 0.0
     baseline_per_doc = torch.zeros(num_real_query_docs)
     if base_dir.exists():
-        base = AutoModelForCausalLM.from_pretrained(
-            base_dir, dtype=torch.float32, attn_implementation="eager"
-        ).to(
-            device  # type: ignore
-        )
+        base = _load_banked_model(run_cfg, str(base_dir), device)
         if multi_query:
             baseline_per_doc = query_losses_per_doc(base)
             print(
@@ -515,11 +529,7 @@ def evaluate_retrained(
     pbar = tqdm(range(len(subsets)), desc="Evaluating")
     for i in pbar:
         model_dir = models_root / f"subset_{i}"
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, dtype=torch.float32, attn_implementation="eager"
-        ).to(
-            device  # type: ignore
-        )
+        model = _load_banked_model(run_cfg, str(model_dir), device)
         if multi_query:
             diff_vec = baseline_per_doc - query_losses_per_doc(model)
             del model
