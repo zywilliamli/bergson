@@ -103,6 +103,9 @@ def metasmoothness_worker(
             weights[-weight_pad_count:] = 0.0
         stream.weights.data.copy_(weights.to(stream.weights.device))
 
+        torch.manual_seed(run_cfg.seed)
+        torch.cuda.manual_seed_all(run_cfg.seed)
+
         trainer, fwd_state, model = prepare_trainer(run_cfg, rank, schedule)
         fwd_state.detach_()
         fwd_state = trainer.train(fwd_state, stream, inplace=True, fsdp=run_cfg.fsdp)

@@ -203,6 +203,8 @@ def worker(
         dist.barrier()
 
     schedule = run_cfg.lr_schedule.get_schedule(len(stream))
+    torch.manual_seed(run_cfg.seed)
+    torch.cuda.manual_seed_all(run_cfg.seed)
     trainer, fwd_state, model = prepare_trainer(run_cfg, rank, schedule)
 
     ckpts_path = os.path.join(run_cfg.run_path, "checkpoints")
