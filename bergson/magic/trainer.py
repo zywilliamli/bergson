@@ -15,7 +15,6 @@ import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor  # noqa: F401 — register DTensor for torch.load
 import torchopt
 from torch import nn
-from torch.distributed.nn.functional import all_reduce as differentiable_all_reduce
 from torch.distributed.tensor import DTensor, Replicate, init_device_mesh
 from torchopt.pytree import tree_flatten_with_path, tree_iter, tree_map
 from torchopt.typing import GradientTransformation, OptState
@@ -47,6 +46,25 @@ def suppress_c_stdout():
     finally:
         os.dup2(fd, 1)
         os.close(fd)
+
+
+class _ReplicatedAllReduceSum(torch.autograd.Function):
+    """All-reduce-sum across ranks, differentiable to arbitrary order.
+
+    Used inside a ``create_graph=True`` training step so the graph can be
+    differentiated again during MAGIC's backward-through-training.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        ctx.group = group
+        out = x.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=group)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        return _ReplicatedAllReduceSum.apply(grad_output, ctx.group), None
 
 
 def _maybe_get_cuda_rng_state() -> torch.Tensor:
@@ -338,15 +356,15 @@ class Trainer:
 
         if dist.is_initialized() and not fsdp:
             if trace:
-                # torch.distributed.nn's all_reduce is autograd-aware: its
-                # backward all-reduces the incoming gradient, so the VJP keeps
-                # the cross-rank curvature terms of the metagradient. Every
-                # rank seeds the backward with the full (replicated) query
-                # gradient, which makes each rank's weight grads world_size
-                # times the true metagradient; `backward` divides that out.
+                # Twice-differentiable all-reduce.
                 grads = {
-                    k: cast(torch.Tensor, differentiable_all_reduce(g))
-                    / dist.get_world_size()
+                    k: cast(
+                        torch.Tensor,
+                        _ReplicatedAllReduceSum.apply(
+                            g / dist.get_world_size(),
+                            dist.distributed_c10d._get_default_group(),
+                        ),
+                    )
                     for k, g in grads.items()
                 }
             else:
@@ -782,7 +800,15 @@ class Trainer:
             param_grads = {k: result[i] for i, k in enumerate(p_keys)}
             del result[: len(p_keys)]
 
-            weight_grads = result[-1] + w_grads
+            this_step_weight_grad = result[-1]
+            if dist.is_initialized() and not fsdp:
+                # The all-reduce above correctly gives the true, averaged
+                # gradient for the parameter update. But a given document
+                # only contributes to 1/world_size of that average, so to
+                # recover its score from the average gradient we divide
+                # by world_size.
+                this_step_weight_grad = this_step_weight_grad / dist.get_world_size()
+            weight_grads = this_step_weight_grad + w_grads
             bwd_state = BackwardState(param_grads, result[:-1], weight_grads)
 
             # Save backward state for resume
@@ -794,14 +820,6 @@ class Trainer:
 
         for fut in save_futures:
             fut.result()
-
-        # Each rank backpropagates the full replicated query gradient, and the
-        # autograd-aware all_reduce in `step` sums the adjoints across ranks in
-        # its backward, so every rank's weight grads are world_size times the
-        # true metagradient. Divide once here; resume checkpoints store the
-        # unscaled accumulator, so this stays correct across interruptions.
-        if dist.is_initialized() and not fsdp:
-            bwd_state.weight_grads /= dist.get_world_size()
 
         # Clean up backward state file on successful completion
         if os.path.exists(bwd_ckpt_path):
