@@ -103,6 +103,15 @@ def compute_query_gradients(
     return grad_accum, float(loss_accum)
 
 
+def scores_are_per_token(score_path: str) -> bool:
+    if os.path.isdir(score_path):
+        return os.path.isfile(os.path.join(score_path, "token_scores.bin"))
+    if score_path.endswith(".npy"):
+        return False
+    scores = torch.load(score_path, map_location="cpu")
+    return isinstance(scores, torch.Tensor) and scores.ndim == 2 and scores.shape[1] > 1
+
+
 def attach_doc_ids_if_missing(dataset: Dataset) -> Dataset:
     """Ensure the dataset has a ``doc_ids`` column.
 
@@ -172,7 +181,11 @@ def worker(
         )
     )
 
-    if getattr(run_cfg, "per_token", False):
+    # Plain magic runs enter with score_path="" (scores are computed below).
+    per_token = getattr(run_cfg, "per_token", False) or (
+        score_path and scores_are_per_token(score_path)
+    )
+    if per_token:
         seq_len = run_cfg.data.chunk_length
         if seq_len <= 0:
             seq_len = max(train_dataset["length"])

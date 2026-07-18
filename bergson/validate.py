@@ -37,19 +37,55 @@ from .utils.utils import get_device
 from .utils.worker_utils import setup_data_pipeline
 
 
+def _load_token_grid(path: str) -> torch.Tensor:
+    """Unpack a packed per-token score directory into a zero-padded
+    ``[docs, seq_len]`` grid, so token ``t`` of doc ``d`` lands at
+    ``grid[d, t]`` (the per-token training weight layout)."""
+    score_dir = Path(path)
+    info = json.loads((score_dir / "info.json").read_text())
+    num_docs, num_scores = info["num_items"], info["num_scores"]
+
+    offsets = np.load(score_dir / "offsets.npy")
+    tokens_per_doc = np.diff(offsets).astype(np.int64)
+    packed = np.memmap(
+        score_dir / "token_scores.bin",
+        dtype=info["dtype"],
+        mode="r",
+        shape=(info["total_tokens"], num_scores),
+    )
+
+    # A doc of length L stores L-1 rows (nothing is predicted at the last
+    # position), so the weight-grid width is one more than the widest doc.
+    seq_len = int(tokens_per_doc.max()) + 1
+    grid = np.zeros((num_docs, seq_len, num_scores), dtype=np.float32)
+    for doc in range(num_docs):
+        grid[doc, : tokens_per_doc[doc]] = packed[offsets[doc] : offsets[doc + 1]]
+
+    scores = torch.from_numpy(grid)
+    return scores[..., 0] if num_scores == 1 else scores
+
+
 def load_attribution_scores(score_path: str) -> tuple[torch.Tensor, bool]:
     """Load attribution scores from a score directory, ``.npy``, or ``.pt`` file.
 
-    Returns ``(scores, multi_query)``. ``multi_query`` is True when the scores
-    hold one column per query (score directories and ``.npy`` arrays with a
-    second dimension > 1). 2D tensors in ``.pt`` files are per-token MAGIC
-    scores, never multi-query, so callers should load those themselves.
+    Returns ``(scores, multi_query)``. Token score directories are per-token,
+    with a query dimension when ``num_scores > 1`` (``[docs, seq_len,
+    queries]``); plain score directories and ``.npy`` arrays are per-document,
+    with one column per query; 2-D ``.pt`` tensors are per-token MAGIC scores
+    (``[docs, seq_len]``, single-query).
 
     Score directories are negated when their ``score_cfg.higher_is_better`` is
-    set, aligning them with the loss-diff convention. ``.npy`` files (e.g. the
-    summed approximate-unrolling scores) carry no ``score_cfg`` and are loaded
-    as-is.
+    set, aligning them with the loss-diff convention. ``.npy`` files carry no
+    ``score_cfg`` and are loaded as-is.
     """
+    if os.path.isdir(score_path) and os.path.isfile(
+        os.path.join(score_path, "token_scores.bin")
+    ):
+        scores = _load_token_grid(score_path)
+        score_cfg = load_subconfig(score_path, "score_cfg", ScoreConfig)
+        if score_cfg is not None and score_cfg.higher_is_better:
+            scores = -scores
+        return scores, scores.ndim == 3
     if os.path.isdir(score_path):
         scores = torch.from_numpy(load_scores(Path(score_path))[:])
         score_cfg = load_subconfig(score_path, "score_cfg", ScoreConfig)
@@ -217,9 +253,9 @@ def validate_scores(
     num_real_query_docs = num_query_docs - query_weight_pad_count
     baseline_per_doc = torch.zeros(num_real_query_docs)
     if multi_query:
-        if scores.shape[1] != num_real_query_docs:
+        if scores.shape[-1] != num_real_query_docs:
             raise ValueError(
-                f"scores has {scores.shape[1]} query columns but the query "
+                f"scores has {scores.shape[-1]} query columns but the query "
                 f"dataset has {num_real_query_docs} documents; multi-query "
                 "validation requires one score column per query document"
             )
@@ -227,15 +263,21 @@ def validate_scores(
             baseline_per_doc = per_doc_query_losses(
                 model, query_stream, num_query_docs
             )[:num_real_query_docs].cpu()
+    elif scores.ndim == 2 and scores.shape[1] > 1:
+        pass  # Per-token [docs, seq_len]; kept 2-D.
     else:
         assert scores.ndim == 1 or scores.shape[1] == 1
         scores = scores.flatten()
 
+    # flat_scores rows are the leave-out units: documents, or
+    # doc * seq_len + token positions for per-token scores.
+    num_queries = scores.shape[-1] if multi_query else 1
+    flat_scores = scores.reshape(-1, num_queries)
+
     if run_cfg.exclude_zero_scores:
-        nonzero = scores != 0 if scores.ndim == 1 else (scores != 0).any(dim=1)
-        valid_indices = torch.nonzero(nonzero, as_tuple=True)[0]
+        valid_indices = torch.nonzero((flat_scores != 0).any(dim=1), as_tuple=True)[0]
     else:
-        valid_indices = torch.arange(len(scores))
+        valid_indices = torch.arange(flat_scores.shape[0])
 
     if run_cfg.subset_strategy == "random":
         rng = torch.Generator().manual_seed(run_cfg.seed)
@@ -302,7 +344,7 @@ def validate_scores(
                 stream.weights.data[-weight_pad_count:] = 0.0
             else:
                 stream.weights.data[-pad_count:] = 0.0
-        stream.weights[subset] = 0.0
+        stream.weights.view(-1)[subset] = 0.0
 
         for x in stream:
             fwd_state = trainer.step(fwd_state, x, inplace=True, fsdp=run_cfg.fsdp)
@@ -319,7 +361,7 @@ def validate_scores(
             with fwd_state.activate(model):
                 per_doc = per_doc_query_losses(model, query_stream, num_query_docs)
             diff_vec = baseline_per_doc - per_doc[:num_real_query_docs].cpu()
-            score_sum_vec = scores[subset].sum(dim=0)
+            score_sum_vec = flat_scores[subset].sum(dim=0)
             for q in range(num_real_query_docs):
                 val_csv_writer.writerow(
                     i, q, diff_vec[q].item(), score_sum_vec[q].item()
@@ -353,7 +395,7 @@ def validate_scores(
             dist.all_reduce(loss, op=dist.ReduceOp.AVG)
 
         diff = baseline - loss.item()
-        score_sum = scores[subset].sum().item()
+        score_sum = flat_scores[subset].sum().item()
         val_csv_writer.writerow(i, diff, score_sum)
 
         if global_rank == 0:
