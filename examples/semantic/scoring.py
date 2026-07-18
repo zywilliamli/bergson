@@ -11,8 +11,8 @@ from tqdm import tqdm
 from bergson import IndexConfig
 from bergson.data import load_gradients, load_module_gradients
 from bergson.gradients import GradientProcessor
+from bergson.hessians.inversion import invert_psd_matrix
 from bergson.process_grads import mix_autocorrelation_matrices
-from bergson.utils.math import damped_psd_power
 
 
 def load_scores_matrix(scores_path: Path | str) -> np.ndarray:
@@ -108,7 +108,7 @@ def compute_scores_fast(
         device = torch.device("cuda:0")
         for name in tqdm(module_names, desc="Computing H^(-1)"):
             H = proc.hessians[name].to(device=device)
-            h_inv[name] = damped_psd_power(H, power=-1)
+            h_inv[name] = invert_psd_matrix(H)
 
         # Bergson's approach (from score.py):
         # 1. Query: precondition with H^(-1), then unit normalize
