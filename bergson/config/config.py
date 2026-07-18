@@ -824,6 +824,13 @@ class TrackstarConfig:
     index hessians intersect at this component. Typical value is
     ~1000 out of ~65K total components."""
 
+    mix_hessians: bool = True
+    """Mix the query and value autocorrelation hessians (§A.1.3 of Chang
+    et al., 2024) before preconditioning. Disable to precondition with the
+    value (train) hessian alone and skip the query hessian entirely, e.g.
+    when query and train data are IID and the query set is too small for a
+    reliable hessian estimate."""
+
     stats_sample_size: int | None = 10_000
     """Number of examples to use for estimating the autocorrelation Hessian
     in the trackstar pipeline's hessian-fitting steps. Set to None to use

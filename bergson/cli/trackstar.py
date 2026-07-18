@@ -71,49 +71,54 @@ def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
         )
         approximate_hessians(value_hess_cfg, hess_cfg)
 
-    # Step 2: Compute hessians on query dataset
-    print("Step 2/5: Computing hessians on query dataset...")
-    if not _step_complete(query_hess_path, resume):
-        query_hess_cfg = deepcopy(index_cfg)
-        query_hess_cfg.run_path = query_hess_path
-        query_hess_cfg.data = deepcopy(trackstar_cfg.query)
-        _limit_split_for_hess(query_hess_cfg, trackstar_cfg.stats_sample_size)
-        _validate(query_hess_cfg)
-        save_run_config(
-            Hessian(hessian_cfg=hess_cfg, index_cfg=query_hess_cfg),
-            query_hess_cfg.partial_run_path,
-        )
-        approximate_hessians(query_hess_cfg, hess_cfg)
-
-    # Step 3: Mix query and value hessians
-    print("Step 3/5: Mixing hessians...")
-    if not _step_complete(mixed_hess_path, resume):
-        if index_cfg.distributed._node_rank == 0:
+    if not trackstar_cfg.mix_hessians:
+        print("Steps 2-3/5: Skipped (mix_hessians=false); using the value hessian.")
+        precondition_hess_path = value_hess_path
+    else:
+        # Step 2: Compute hessians on query dataset
+        print("Step 2/5: Computing hessians on query dataset...")
+        if not _step_complete(query_hess_path, resume):
+            query_hess_cfg = deepcopy(index_cfg)
+            query_hess_cfg.run_path = query_hess_path
+            query_hess_cfg.data = deepcopy(trackstar_cfg.query)
+            _limit_split_for_hess(query_hess_cfg, trackstar_cfg.stats_sample_size)
+            _validate(query_hess_cfg)
             save_run_config(
-                Mix(
+                Hessian(hessian_cfg=hess_cfg, index_cfg=query_hess_cfg),
+                query_hess_cfg.partial_run_path,
+            )
+            approximate_hessians(query_hess_cfg, hess_cfg)
+
+        # Step 3: Mix query and value hessians
+        print("Step 3/5: Mixing hessians...")
+        if not _step_complete(mixed_hess_path, resume):
+            if index_cfg.distributed._node_rank == 0:
+                save_run_config(
+                    Mix(
+                        query_path=query_hess_path,
+                        index_path=value_hess_path,
+                        output_path=mixed_hess_path,
+                        target_downweight_components=(
+                            trackstar_cfg.target_downweight_components
+                        ),
+                    ),
+                    mixed_hess_path,
+                )
+                mix_autocorrelation_matrices(
                     query_path=query_hess_path,
                     index_path=value_hess_path,
                     output_path=mixed_hess_path,
                     target_downweight_components=(
                         trackstar_cfg.target_downweight_components
                     ),
-                ),
-                mixed_hess_path,
-            )
-            mix_autocorrelation_matrices(
-                query_path=query_hess_path,
-                index_path=value_hess_path,
-                output_path=mixed_hess_path,
-                target_downweight_components=(
-                    trackstar_cfg.target_downweight_components
-                ),
-            )
+                )
+        precondition_hess_path = mixed_hess_path
     parent_barrier(index_cfg.distributed)
 
-    # The mixed hessian is set here but only applied during step 4. if the
+    # The preconditioning hessian is set here but only applied during step 4. if the
     # user is aggregating the query dataset (preprocess_cfg.aggregation != "none").
     # Otherwise, preconditioning will be deferred to score time in step 5.
-    trackstar_cfg.preprocess_cfg.hessian_path = mixed_hess_path
+    trackstar_cfg.preprocess_cfg.hessian_path = precondition_hess_path
 
     # Step 4: Build query gradient index using query-specific normalizer.
     print("Step 4/5: Building query gradient index...")
