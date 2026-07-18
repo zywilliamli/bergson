@@ -33,7 +33,7 @@ from .data import load_scores, pad_and_tensor
 from .magic.data_stream import DataStream, pad_dataset_to_batch_size
 from .magic.trainer import TrainerState, prepare_trainer
 from .utils.csv_writer import CSVWriter
-from .utils.utils import get_device
+from .utils.utils import get_device, simple_parse_kwargs_string
 from .utils.worker_utils import setup_data_pipeline
 
 
@@ -104,17 +104,15 @@ def _load_banked_model(
     run_cfg: ValidationConfig, out_dir: str, device: torch.device | str
 ) -> torch.nn.Module:
     """Load a banked ``save_retrained_models`` checkpoint into a ready model."""
+    load_kwargs = {"dtype": torch.float32, "attn_implementation": "eager"}
+    load_kwargs.update(simple_parse_kwargs_string(run_cfg.model_kwargs))
     if os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
         from peft import PeftModel
 
-        base = AutoModelForCausalLM.from_pretrained(
-            run_cfg.model, dtype=torch.float32, attn_implementation="eager"
-        )
+        base = AutoModelForCausalLM.from_pretrained(run_cfg.model, **load_kwargs)
         model = PeftModel.from_pretrained(base, out_dir)
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            out_dir, dtype=torch.float32, attn_implementation="eager"
-        )
+        model = AutoModelForCausalLM.from_pretrained(out_dir, **load_kwargs)
     return model.to(device)  # type: ignore
 
 
