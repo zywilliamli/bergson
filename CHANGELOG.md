@@ -1,6 +1,35 @@
 # CHANGELOG
 
 
+## v0.11.1 (2026-07-18)
+
+### Bug Fixes
+
+- Optimizer-state loading — orientation, HF param groups, PEFT, FSDP
+  ([`342a216`](https://github.com/EleutherAI/bergson/commit/342a2160a07af76f7b5c31e6b221a9d7251f9b83))
+
+Four fixes to the optimizer.pt loading used for attribution normalizers, plus matching export
+  hardening:
+
+- Orient second moments by module class (LayerAdapter.weight_transposed: HF Conv1D stores [in, out])
+  instead of shape matching, which cannot detect transposed storage for SQUARE weights — GPT-2's
+  attn.c_proj normalizers were silently transposed. - Map state indices group-aware: HF Trainer
+  writes two decay/no-decay param groups whose index order differs from named_parameters(); the old
+  positional mapping assigned moments to the wrong modules. Reconstructed with transformers' own
+  utilities and shape-verified. - Apply the group-aware mapping to PEFT checkpoints too (HF Trainer
+  splits LoRA params across the same groups). - Make save_second_moments_as_optimizer_pt
+  collective-safe (FSDP DTensor moments are gathered by every rank; rank 0 writes — previously a
+  rank-0 -only call would hang) and record each entry's canonical param_name, since FSDP wrapping
+  renames and reorders parameters; readers prefer the recorded name. Optional standard
+  step/betas/eps fields make snapshot exports self-describing. Model type widened to nn.Module.
+
+Tests: square-Conv1D orientation, decay-split identity vs a real two-group AdamW, PEFT + two-group
+  checkpoint, and the real-checkpoint round-trips now look entries up group-aware with shape
+  assertions the old convention fails.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+
 ## v0.11.0 (2026-07-17)
 
 ### Features
