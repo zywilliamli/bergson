@@ -1,6 +1,32 @@
 # CHANGELOG
 
 
+## v0.12.0 (2026-07-18)
+
+### Features
+
+- Add mix_hessians toggle to TrackStar pipeline
+  ([`08e9e23`](https://github.com/EleutherAI/bergson/commit/08e9e23876320b731c662b1466bfdbb4bdd7c617))
+
+Lets TrackStar skip computing and mixing the query autocorrelation hessian (steps 2-3) and
+  precondition with the value/train hessian alone. Useful when query and train data are IID and the
+  query set is too small to estimate its own hessian reliably.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Refactoring
+
+- Use invert_psd_matrix in semantic scoring examples
+  ([`d005091`](https://github.com/EleutherAI/bergson/commit/d0050914b1d419c25ea768b98f78ab7e305c931d))
+
+Updates example scripts to call bergson.hessians.inversion.invert_psd_matrix instead of the old
+  bergson.utils.math.damped_psd_power, matching the already-landed inversion API. Where a custom
+  regularizer was passed in, fold it into H + damping_factor*regularizer before inverting rather
+  than passing it as a separate argument.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+
 ## v0.11.1 (2026-07-18)
 
 ### Bug Fixes
