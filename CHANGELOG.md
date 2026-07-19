@@ -1,6 +1,38 @@
 # CHANGELOG
 
 
+## v0.13.0 (2026-07-19)
+
+### Features
+
+- Compress K-FAC IVHP output to match compressed gradient stores
+  ([`157fa1b`](https://github.com/EleutherAI/bergson/commit/157fa1b96b80b24648aabf593d3400f83a407666))
+
+EKFAC's H^-1 must be applied to the full, unprojected gradient (the eigenbasis rotation only makes
+  sense at the true parameter dimension), so apply_hessian.py's IVHP path and the query build step
+  have always forced projection_dim=0. But the training-side gradient store built by `bergson
+  build`/`bergson score` uses index_cfg.projection_dim's per-module Kronecker random projection by
+  default, so the hessian_pipeline's scoring step had to force projection_dim=0 there too --
+  silently ignoring whatever compression the user asked for and scoring against full dense
+  gradients.
+
+EkfacConfig gains projection_dim/projection_type; when set, EkfacApplicator.compute_ivhp_sharded
+  compresses each module's H^-1 G output to [p, p] as a post-processing step, using the same
+  create_projection_matrix identifiers (f"{name}/left" / f"{name}/right") that bergson build already
+  uses on training gradients. The hessian_pipeline now threads
+  index_cfg.projection_dim/projection_type into the apply step and no longer overrides the score
+  step's projection_dim to 0, so a compressed query and a compressed training-side store are
+  directly comparable end to end.
+
+Supersedes EleutherAI/bergson#275, which predates the FactoredPreconditioner refactor and no longer
+  applies; ports the same idea (compress the IVHP output rather than the pre-Hessian gradient) onto
+  the current apply path.
+
+Co-Authored-By: Girish Gupta <girish@girishgupta.com>
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+
 ## v0.12.1 (2026-07-18)
 
 ### Bug Fixes
