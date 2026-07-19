@@ -690,3 +690,21 @@ def test_score_factored_hessian_rejects_projection(tmp_path: Path):
             ScoreConfig(query_path=str(tmp_path / "q")),
             PreprocessConfig(hessian_path=hessian_path),
         )
+
+
+def test_score_factored_hessian_rejects_projection_with_unit_normalize(
+    tmp_path: Path,
+):
+    """Kronecker-factored hessian + projection + unit_normalize (cosine
+    similarity) together fail fast, with a message naming the actual cause."""
+    modules = {"mod_a": (4, 6)}
+    hessian_path = str(tmp_path / "hessian")
+    _write_factored_hessian(Path(hessian_path), modules)
+
+    index_cfg = IndexConfig(run_path=str(tmp_path / "out"), projection_dim=16)
+    with pytest.raises(ValueError, match="unit_normalize=True"):
+        score_dataset(
+            index_cfg,
+            ScoreConfig(query_path=str(tmp_path / "q")),
+            PreprocessConfig(hessian_path=hessian_path, unit_normalize=True),
+        )

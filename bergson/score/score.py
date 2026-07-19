@@ -378,6 +378,16 @@ def score_dataset(
         and index_cfg.projection_dim != 0
         and is_factored_hessian(preprocess_cfg.hessian_path)
     ):
+        if preprocess_cfg.unit_normalize:
+            raise ValueError(
+                f"Scoring with a factored (EKFAC) hessian at "
+                f"{preprocess_cfg.hessian_path} and unit_normalize=True (cosine "
+                f"similarity) requires projection_dim=0: split (two-sided "
+                f"H^-1/2) scoring needs full, unprojected index gradients, but "
+                f"index_cfg.projection_dim={index_cfg.projection_dim}. Rebuild "
+                f"the index and query with projection_dim=0, or use a dense "
+                f"(autocorrelation) hessian."
+            )
         raise ValueError(
             f"Scoring with a factored (EKFAC) hessian at "
             f"{preprocess_cfg.hessian_path} requires projection_dim=0, but "

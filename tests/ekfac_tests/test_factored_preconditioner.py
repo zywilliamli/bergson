@@ -16,6 +16,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from bergson.collector.collector import create_projection_matrix
 from bergson.config import InversionConfig
 from bergson.data import create_index, load_module_gradients
 from bergson.hessians.apply_hessian import EkfacApplicator, EkfacConfig
@@ -239,3 +240,73 @@ def test_factored_apply_invariant_to_shard_count(tmp_path, inversion: str):
         assert torch.allclose(
             out1[name], out2[name], atol=1e-5
         ), f"{inversion}: apply on {name} depends on shard count"
+
+
+def test_apply_hessian_compresses_per_module(tmp_path):
+    """``EkfacConfig.projection_dim > 0`` compresses the IVHP output to a
+    ``[p, p]`` per-module Kronecker random projection, applied *after* H^-1
+    on the full gradient. It must use the exact same
+    ``create_projection_matrix`` convention (identifiers ``f"{name}/left"``
+    / ``f"{name}/right"``) that ``bergson build`` uses on training
+    gradients, so a compressed query is directly comparable to a compressed
+    training-side gradient store.
+    """
+    modules = {"a": (4, 6), "b": (5, 3)}  # (O, I)
+    hessian_path = tmp_path / "hessian"
+    _write_factored_hessian(hessian_path, modules, num_shards=1, seed=0)
+
+    grad_sizes = {name: o * i for name, (o, i) in modules.items()}
+    num_grads = 3
+    query_path = str(tmp_path / "query")
+    _make_query_gradients(query_path, grad_sizes, num_grads)
+
+    inversion_cfg = InversionConfig(inversion="damped_inverse", damping_factor=0.1)
+
+    # Reference: full, uncompressed IVHP output.
+    ref = _apply(
+        str(hessian_path),
+        query_path,
+        str(tmp_path / "out_full"),
+        "damped_inverse",
+        ev_correction=False,
+    )
+
+    p = 2
+    compressed_cfg = EkfacConfig(
+        hessian_method_path=str(hessian_path),
+        gradient_path=query_path,
+        run_path=str(tmp_path / "out_compressed"),
+        ev_correction=False,
+        projection_dim=p,
+    )
+    EkfacApplicator(compressed_cfg, inversion_cfg=inversion_cfg).compute_ivhp_sharded()
+    got = load_module_gradients(str(tmp_path / "out_compressed"))
+
+    for name, (o, i) in modules.items():
+        full = torch.from_numpy(np.asarray(ref[name][:])).view(num_grads, o, i)
+        P_l = create_projection_matrix(
+            f"{name}/left", p, o, full.dtype, full.device, "rademacher"
+        )
+        P_r = create_projection_matrix(
+            f"{name}/right", p, i, full.dtype, full.device, "rademacher"
+        )
+        expected = torch.einsum("ps,nsa,ra->npr", P_l, full, P_r)
+
+        compressed = torch.from_numpy(np.asarray(got[name][:])).view(num_grads, p, p)
+        assert compressed.shape == (num_grads, p, p)
+        assert torch.allclose(
+            compressed, expected, atol=1e-4, rtol=1e-4
+        ), f"{name}: compressed IVHP output doesn't match manual post-projection"
+
+
+def test_apply_hessian_rejects_compression_with_ev_correction():
+    """projection_dim compression is not supported with EK-FAC (ev_correction)."""
+    cfg = EkfacConfig(
+        hessian_method_path="unused",
+        gradient_path="unused",
+        run_path="unused",
+        ev_correction=True,
+        projection_dim=8,
+    )
+    with pytest.raises(ValueError, match="EK-FAC"):
+        EkfacApplicator(cfg, inversion_cfg=InversionConfig())
