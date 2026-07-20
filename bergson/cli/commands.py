@@ -16,6 +16,7 @@ from ..config.config import (
     HessianConfig,
     HessianPipelineConfig,
     IndexConfig,
+    TrackstarIndexConfig,
     MetasmoothnessConfig,
     MixConfig,
     PreprocessConfig,
@@ -228,7 +229,9 @@ class Score(Serializable):
 class Trackstar(Serializable):
     """Run hessians, build, and score as a single pipeline."""
 
-    index_cfg: IndexConfig
+    # Trackstar uses random-projection compression, so override the default
+    # projection_dim of 0.
+    index_cfg: TrackstarIndexConfig
 
     trackstar_cfg: TrackstarConfig
 

@@ -492,7 +492,7 @@ class AttentionConfig:
 class IndexConfig(AttributionConfig, Serializable):
     """Config for building the index and running the model/dataset pipeline."""
 
-    projection_dim: int = 16
+    projection_dim: int = 0
     """Dimension of the random projection for the index, or 0 to disable it."""
 
     include_bias: bool = False
@@ -576,6 +576,14 @@ class IndexConfig(AttributionConfig, Serializable):
     def partial_run_path(self) -> Path:
         """Temporary path to use while writing build artifacts."""
         return Path(self.run_path + ".part")
+
+
+@dataclass
+class TrackstarIndexConfig(IndexConfig):
+    """IndexConfig for the Trackstar command, which uses random-projection
+    compression and so defaults ``projection_dim`` to 16."""
+
+    projection_dim: int = 16
 
 
 @dataclass
