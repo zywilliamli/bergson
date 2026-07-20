@@ -130,7 +130,7 @@ def setup_paths_and_config(
     parent_path = os.path.join(current_path, "test_files", f"pile_{n_samples}_examples")
 
     # Configuration
-    cfg = IndexConfig(run_path="", loss_reduction="sum")
+    cfg = IndexConfig(run_path="", loss_reduction="sum", projection_dim=0)
     cfg.model = model_name
     cfg.precision = precision  # type: ignore[assignment]
     cfg.fsdp = False

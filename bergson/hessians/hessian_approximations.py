@@ -72,6 +72,13 @@ def approximate_hessians(
     str
         Path to the directory containing the computed Hessian approximations.
     """
+    if hessian_cfg.ev_correction and index_cfg.projection_dim != 0:
+        raise ValueError(
+            "EK-FAC (ev_correction=True) does not support gradient "
+            f"projection; got index_cfg.projection_dim={index_cfg.projection_dim}. "
+            "Set projection_dim=0."
+        )
+
     if hessian_cfg.method == "autocorrelation" and index_cfg.projection_dim == 0:
         warnings.warn(
             "Computing an autocorrelation (dense) Hessian with "

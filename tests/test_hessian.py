@@ -5,6 +5,18 @@ import pytest
 import torch
 
 from bergson import GradientProcessor
+from bergson.config import HessianConfig, IndexConfig
+from bergson.hessians.hessian_approximations import approximate_hessians
+
+
+def test_ekfac_rejects_nonzero_projection_dim(tmp_path: Path):
+    """EK-FAC fitting doesn't support gradient projection, so a nonzero
+    projection_dim must fail fast."""
+    index_cfg = IndexConfig(run_path=str(tmp_path), projection_dim=16)
+    hessian_cfg = HessianConfig(method="kfac", ev_correction=True)
+
+    with pytest.raises(ValueError, match="projection_dim=0"):
+        approximate_hessians(index_cfg, hessian_cfg)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
