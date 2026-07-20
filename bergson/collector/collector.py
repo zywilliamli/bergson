@@ -223,9 +223,10 @@ class HookCollectorBase(ContextDecorator, ABC):
 
     @property
     def per_module_projection_dim(self) -> int | None:
+        """Per-module projection dimension, or None if projection is disabled."""
         if self.processor.projection_target == "global":
             return None
-        return self.processor.projection_dim
+        return self.processor.projection_dim or None
 
     def shapes(self) -> Mapping[str, torch.Size]:
         """Return the shapes of the gradients collected by this collector."""
@@ -235,7 +236,7 @@ class HookCollectorBase(ContextDecorator, ABC):
 
         proj_shape = (
             torch.Size((p_dim, p_dim))
-            if (p_dim := self.processor.projection_dim) is not None
+            if (p_dim := self.per_module_projection_dim) is not None
             else None
         )
 

@@ -18,6 +18,7 @@ def test_build_consistency(tmp_path: Path, model, dataset):
         run_path=str(tmp_path),
         token_batch_size=1024,
         loss_reduction="mean",
+        projection_dim=16,
     )
     collect_gradients(
         model=model,

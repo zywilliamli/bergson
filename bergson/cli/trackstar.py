@@ -42,6 +42,14 @@ def _step_complete(path: str, resume: bool) -> bool:
 
 def trackstar(index_cfg: IndexConfig, trackstar_cfg: TrackstarConfig):
     """Run the full trackstar pipeline: hessians -> mix -> build -> score."""
+    if index_cfg.projection_dim == 0:
+        raise ValueError(
+            "Trackstar scores via compressed random-projected gradients and "
+            "requires a nonzero index_cfg.projection_dim; got 0. Leave "
+            "projection_dim unset to use TrackstarIndexConfig's default of "
+            "16, or set it explicitly."
+        )
+
     run_path = index_cfg.run_path
     value_hess_path = f"{run_path}/value_hessian"
     query_hess_path = f"{run_path}/query_hessian"
