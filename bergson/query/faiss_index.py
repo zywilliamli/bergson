@@ -242,7 +242,7 @@ class FaissIndex:
         assert info_paths, f"No gradient metadata found under {gradients_path}"
 
         total_grads = sum(
-            [json.load(open(info_path))["num_grads"] for info_path in info_paths]
+            json.load(open(info_path))["num_grads"] for info_path in info_paths
         )
 
         assert faiss_cfg.num_shards <= total_grads and faiss_cfg.num_shards > 0

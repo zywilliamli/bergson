@@ -64,11 +64,17 @@ def create_token_index(
 ) -> tuple[np.memmap, np.ndarray]:
     """Allocate a flat memory-mapped file for ragged per-token gradients.
 
+    Same on-disk format as :func:`create_index` (``gradients.bin`` +
+    ``info.json`` with ``num_grads``/``grad_sizes``/``base_dtype``), plus
+    ``offsets.npy`` so row ``offsets[i]:offsets[i+1]`` -- rather than row
+    ``i`` -- is example *i*'s gradients. ``info["attribute_tokens"]`` marks
+    that distinction for readers.
+
     Parameters
     ----------
     root : Path
-        Directory in which ``token_gradients.bin``, ``num_token_grads.npy``,
-        ``offsets.npy`` and ``info.json`` will be created.
+        Directory in which ``gradients.bin``, ``offsets.npy`` and
+        ``info.json`` will be created.
     num_token_grads : np.ndarray
         Number of valid gradient rows per example, shape ``(num_items,)``.
     grad_sizes : dict[str, int]
@@ -89,7 +95,7 @@ def create_token_index(
     total_tokens = int(offsets[-1])
 
     np_dtype = np.dtype(dtype)
-    grad_path = root / "token_gradients.bin"
+    grad_path = root / "gradients.bin"
 
     if rank == 0:
         root.mkdir(parents=True, exist_ok=True)
@@ -98,16 +104,14 @@ def create_token_index(
             f.truncate(nbytes)
             os.fsync(f.fileno())
 
-        np.save(root / "num_token_grads.npy", num_token_grads)
         np.save(root / "offsets.npy", offsets)
 
         with (root / "info.json").open("w") as f:
             json.dump(
                 {
                     "attribute_tokens": True,
-                    "total_tokens": total_tokens,
-                    "total_grad_dim": total_grad_dim,
                     "num_items": len(num_token_grads),
+                    "num_grads": total_tokens,
                     "grad_sizes": grad_sizes,
                     "base_dtype": np_dtype.name,
                 },
@@ -140,21 +144,9 @@ def load_token_gradients(
         shape ``(num_token_grads[i], total_grad_dim)``.
     """
     root_dir = Path(root_dir)
-    with (root_dir / "info.json").open("r") as f:
-        info = json.load(f)
-
-    total_tokens = info["total_tokens"]
-    total_grad_dim = info["total_grad_dim"]
-    base_dtype = info["base_dtype"]
-
-    mmap = np.memmap(
-        root_dir / "token_gradients.bin",
-        dtype=np.dtype(base_dtype),
-        mode="r",
-        shape=(total_tokens, total_grad_dim),
-    )
-    num_token_grads = np.load(root_dir / "num_token_grads.npy")
+    mmap = load_gradients(root_dir)
     offsets = np.load(root_dir / "offsets.npy")
+    num_token_grads = np.diff(offsets).astype(np.int64)
     return mmap, num_token_grads, offsets
 
 
@@ -398,16 +390,15 @@ def create_index(
     dtype: DTypeLike,
 ) -> np.memmap:
     """Create a memory-mapped ``(num_grads, total_grad_dim)`` gradient file
-    (modules laid out in `grad_sizes` order) and persist metadata."""
+    (modules laid out in `grad_sizes` order) and persist metadata.
+
+    Same on-disk format as :func:`create_token_index` minus ``offsets.npy``:
+    row ``i`` is example *i*'s gradients directly (``num_grads ==
+    num_items``), rather than a range picked out by ``offsets``.
+    """
     grad_path = root / "gradients.bin"
     rank = dist.get_rank() if dist.is_initialized() else 0
-
-    # Legacy structured dtype, still written for external readers of older stores
-    struct_dtype = {
-        "names": [name for name in grad_sizes.keys()],
-        "formats": [f"({size},){np.dtype(dtype).str}" for size in grad_sizes.values()],
-        "itemsize": np.dtype(dtype).itemsize * sum(grad_sizes.values()),
-    }
+    itemsize = np.dtype(dtype).itemsize * sum(grad_sizes.values())
 
     # ── 1. Rank-0 creates file & metadata exactly once ─────────────────────────
     if rank == 0:
@@ -415,7 +406,7 @@ def create_index(
         root.mkdir(parents=True, exist_ok=True)
 
         # Allocate (extends file to right size without writing zeros byte-by-byte)
-        nbytes = struct_dtype["itemsize"] * num_grads
+        nbytes = itemsize * num_grads
         with open(grad_path, "wb") as f:
             f.truncate(nbytes)
 
@@ -426,8 +417,9 @@ def create_index(
         with (root / "info.json").open("w") as f:
             json.dump(
                 {
+                    "attribute_tokens": False,
+                    "num_items": num_grads,
                     "num_grads": num_grads,
-                    "dtype": struct_dtype,
                     "grad_sizes": grad_sizes,
                     "base_dtype": np.dtype(dtype).name,
                 },
@@ -494,7 +486,15 @@ def load_data_string(
 def load_gradients(root_dir: Path | str) -> np.memmap:
     """Map the gradients stored in `root_dir` into memory as a flat
     ``(num_grads, total_grad_dim)`` array, with modules laid out in
-    ``grad_sizes`` order (see :func:`column_offsets` for per-module slicing)."""
+    ``grad_sizes`` order (see :func:`column_offsets` for per-module slicing).
+
+    :func:`create_index` and :func:`create_token_index` write the same
+    ``gradients.bin`` layout -- ``num_grads`` is the row count either way
+    (``== num_items`` for a plain index, ``== total_tokens`` for a
+    per-token one). ``info["attribute_tokens"]`` only matters for callers
+    that need ``offsets.npy`` to know which rows belong to which document;
+    this function doesn't care.
+    """
     root_dir = Path(root_dir)
     with (root_dir / "info.json").open("r") as f:
         info = json.load(f)
@@ -579,15 +579,30 @@ def load_gradient_dataset(root_dir: Path) -> Dataset:
 
 
 class Scores:
-    def __init__(self, mmap: np.memmap, info: dict[str, Any]):
+    """Score store written by
+    :class:`bergson.score.score_writer.MemmapSequenceScoreWriter` or
+    :class:`bergson.score.score_writer.MemmapTokenScoreWriter` -- both write
+    the same ``scores.bin`` layout (a structured ``(score_i, written_i))``
+    array), differing only in what a row means. ``offsets`` is set when the
+    store is per-token (``info["attribute_tokens"]``): row
+    ``offsets[i]:offsets[i+1]`` holds document ``i``'s per-token scores.
+    Otherwise row ``i`` is document ``i`` directly."""
+
+    def __init__(
+        self,
+        mmap: np.memmap,
+        info: dict[str, Any],
+        offsets: NDArray | None = None,
+    ):
         self.mmap = mmap
         self.info = info
+        self.offsets = offsets
         self.num_scores = info["num_scores"]
 
         self._score_fields = [f"score_{i}" for i in range(self.num_scores)]
 
     def __len__(self) -> int:
-        return len(self.mmap)
+        return self.info["num_items"]
 
     def __getitem__(self, key: Any) -> NDArray:
         items = self.mmap[key]
@@ -598,26 +613,76 @@ class Scores:
         return self.mmap[key][f"score_{score_idx}"]
 
     def is_written(self) -> bool:
-        """Check whether all scores in the structured mmap have
-        been written to (i.e. are not still zeros)"""
+        """Check whether every stored cell has been written to."""
         return all(np.all(self.mmap[f"written_{i}"]) for i in range(self.num_scores))
 
+    def to_grid(self) -> torch.Tensor:
+        """Unpack a per-token store into a zero-padded ``[docs, seq_len]``
+        grid (``[docs, seq_len, num_scores]`` when multi-query), so token
+        ``t`` of doc ``d`` lands at ``grid[d, t]`` -- the per-token training
+        weight layout. Only valid when ``offsets`` is set."""
+        assert self.offsets is not None, "to_grid() requires a per-token store"
+        num_docs = len(self)
+        tokens_per_doc = np.diff(self.offsets).astype(np.int64)
+        seq_len = int(tokens_per_doc.max()) + 1
 
-def load_scores(path: Path) -> Scores:
-    bin_path = path / "scores.bin"
+        grid = np.zeros((num_docs, seq_len, self.num_scores), dtype=np.float32)
+        for doc in range(num_docs):
+            grid[doc, : tokens_per_doc[doc]] = self[
+                self.offsets[doc] : self.offsets[doc + 1]
+            ]
+
+        scores = torch.from_numpy(grid)
+        return scores[..., 0] if self.num_scores == 1 else scores
+
+
+class ArrayScores:
+    """Dense ``[num_items, num_scores]`` score matrix with the same interface
+    as :class:`Scores`, for scores saved as a plain ``.npy`` (e.g. an ad hoc
+    array from outside the standard scoring pipeline)."""
+
+    def __init__(self, arr: np.ndarray):
+        if arr.ndim == 1:
+            arr = arr[:, None]
+        self.arr = arr
+        self.num_scores = arr.shape[1]
+
+    def __len__(self) -> int:
+        return self.arr.shape[0]
+
+    def __getitem__(self, key: Any) -> NDArray:
+        return self.arr[key]
+
+    def get(self, key: Any, score_idx: int = 0) -> NDArray:
+        return self.arr[key, score_idx]
+
+    def is_written(self) -> bool:
+        return True
+
+
+def load_scores(path: Path) -> Scores | ArrayScores:
+    """Load a score store written by the standard scoring pipeline.
+
+    A plain ``.npy`` array loads as :class:`ArrayScores`. Any other score
+    directory loads its ``scores.bin`` as :class:`Scores`, with ``offsets``
+    set when ``info["attribute_tokens"]`` marks it as a per-token store.
+    """
+    if path.suffix == ".npy":
+        return ArrayScores(np.load(path))
+
     info_path = path / "info.json"
-
     with open(info_path, "r") as f:
         info = json.load(f)
 
     mmap = np.memmap(
-        bin_path,
+        path / "scores.bin",
         dtype=info["dtype"],
         mode="r",
-        shape=(info["num_items"],),
+        shape=(info["num_rows"],),
     )
+    offsets = np.load(path / "offsets.npy") if info.get("attribute_tokens") else None
 
-    return Scores(mmap, info)
+    return Scores(mmap, info, offsets)
 
 
 def sorted_checkpoints(folder: str) -> list[tuple[int, str]]:
