@@ -1,6 +1,96 @@
 # CHANGELOG
 
 
+## v0.13.1 (2026-07-22)
+
+### Bug Fixes
+
+- Scale random projections by 1/sqrt(p) (Johnson-Lindenstrauss)
+  ([#346](https://github.com/EleutherAI/bergson/pull/346),
+  [`4b9b255`](https://github.com/EleutherAI/bergson/commit/4b9b255b332d6efb15452873a41afcd57a2ca26e))
+
+* Scale random projections by 1/sqrt(p) (Johnson-Lindenstrauss)
+
+create_projection_matrix normalized each row over its n entries, giving entry variance 1/n. JL
+  requires 1/p (p = projected dim) so that E[A^T A] = I and projected inner products are unbiased.
+  The consequence is not the overall scale — a constant cancels from any ranking — but that the
+  factor p/n depends on the module's SHAPE, so modules are silently reweighted against each other in
+  the summed score. Attention (d x d) and MLP (d x 4d) blocks differ by 4x.
+
+Measured E[proj]/true, 3000 draws per shape:
+
+shape p before predicted p^2/(o*i) after 32x32 16 0.24972 0.25000 0.99889 64x64 32 0.25042 0.25000
+  1.00167 128x128 32 0.06247 0.06250 0.99949 256x64 32 0.06253 0.06250 1.00045
+
+This matches the TrackStar paper (arXiv 2410.17413 §A.1.2), which specifies the same two-sided
+  per-block projection and states "Projection matrix entries are sampled i.i.d. from N(0, 1/d)" —
+  variance 1/(number of rows), exactly A /= sqrt(m). It also matches docs/preprocessing.rst's claim
+  that projections preserve inner products, which the old scaling did not.
+
+Existing tests could not catch this: they compare the collector against L @ G @ R^T using the SAME
+  matrices, so they are invariant to how those are scaled. test_global_projection_linearity uses one
+  R sliced into blocks — the paper's construction, not the code's.
+  tests/test_projection_inner_products.py now pins projected against unprojected (12 tests, all 12
+  fail without this fix), including that the scale does not depend on module shape.
+
+BREAKING: changes all stored index scales. Existing indices built with projection_dim > 0 must be
+  regenerated, and any published numbers re-run. runs/test_build_cache.npy is regenerated here; the
+  measured ratio is exactly 0.5000, matching theory (sqrt(o*i)/p = 8/16 for tiny-Phi3).
+
+THREE TESTS FAIL ON THIS BRANCH AND ARE LEFT FAILING, PENDING A DECISION:
+
+tests/test_batch_size_invariance.py::test_gradient_scale_invariance[100-100]
+  tests/test_batch_size_invariance.py::test_gradient_scale_invariance[50-150] Relative error is
+  UNCHANGED by this fix (6.83e-06 on main vs 7.58e-06 here) and already exceeds the assert_close
+  default rtol=1.3e-06 on main. It passes on main only because the values are ~150x smaller, so the
+  absolute difference stays under atol=1e-05. Restoring the correct scale trips atol. The test is
+  magnitude-sensitive rather than wrong about the invariant.
+
+tests/test_gradients.py::test_gradient_collector_proj_norm 1 of 256 elements, greatest relative
+  difference 2.46e-04 against the test's explicit 1e-4 tolerance. Probably a near-cancelling element
+  landing differently at the new scale — the test already carries a comment about accumulating
+  numerical error — but this is NOT proven.
+
+These are regression guards; loosening them is a call for a human, not something to do to make a
+  branch green.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+* Make two projection tests independent of gradient magnitude
+
+test_gradient_scale_invariance compared std separately-vs-combined with assert_close's defaults. The
+  invariant is scale-free, but the default atol=1e-5 let a relative disagreement pass whenever the
+  operands were small enough: on main the relative error is already 6.83e-06 against rtol=1.3e-06,
+  and the test passes only because the values are ~150x smaller than the correctly-scaled ones. Use
+  rtol=1e-4 with atol=0 so the check tracks the invariant rather than the magnitude.
+
+test_gradient_collector_proj_norm compares A @ normalize(g) @ B.T against the collector, which
+  projects activations and output grads separately. The two orderings are mathematically identical
+  and differ only in fp32 rounding; at the corrected scale that noise reached 2.46e-04 relative on
+  an O(1) element, over the existing 1e-4. Widen to 1e-3 and say what the tolerance is measuring.
+
+* Add projection_scale to read indexes built with the old scaling
+
+Indexes store their projected gradients, so changing the projection scaling makes existing ones
+  unreadable at the correct weighting. projection_scale selects the convention: "jl" (default,
+  variance 1/projection_dim) or "row_norm".
+
+GradientProcessor.load resolves a missing projection_scale key to "row_norm", so existing indexes
+  keep working with no user action, and new ones record "jl" in processor_config.yaml. Threaded
+  through IndexConfig, create_processor and EkfacConfig, which builds matching matrices to compress
+  the IVHP output.
+
+* [pre-commit.ci] auto fixes from pre-commit.com hooks
+
+for more information, see https://pre-commit.ci
+
+---------
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+Co-authored-by: pre-commit-ci[bot] <66853113+pre-commit-ci[bot]@users.noreply.github.com>
+
+
 ## v0.13.0 (2026-07-19)
 
 ### Features
