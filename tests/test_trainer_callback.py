@@ -438,3 +438,147 @@ class TestGradientCollectorCallback:
                 assert (
                     norm.bias_avg_sq is None
                 ), f"Unexpected bias_avg_sq for {layer_name}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    "model_name",
+    ["trl-internal-testing/tiny-Phi3ForCausalLM", "sshleifer/tiny-gpt2"],
+)
+def test_callback_with_optimizer_state_trains(tmp_path: Path, model_name: str):
+    """``use_optimizer_state=True`` (the default) must work on a real CausalLM.
+
+    The optimizer owns every parameter, including ``lm_head.weight``, which
+    lives outside ``base_model`` for both tied and untied models.
+    """
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32)
+    data = {"input_ids": [[1, 2, 3, 4, 5]] * 4}
+    data["labels"] = data["input_ids"]
+    dataset = Dataset.from_dict(data)
+
+    training_args = TrainingArguments(
+        output_dir=str(tmp_path / "output"),
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        save_strategy="no",
+        logging_strategy="no",
+        remove_unused_columns=False,
+        report_to=[],
+    )
+    callback = GradientCollectorCallback(path=tmp_path / "gradients")
+    assert callback.use_optimizer_state, "this test is about the default"
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        callbacks=[callback],
+    )
+    trainer = prepare_for_gradient_collection(trainer)
+    trainer.train()
+
+    assert callback.collector is not None
+    assert callback.collector.processor.normalizers, "no normalizers were built"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_callback_normalizers_match_offline_orientation(tmp_path: Path):
+    """Live-callback normalizers use the same ``[out, in]`` orientation as
+    ``load_from_optimizer``, which matters for HF ``Conv1D`` (stored
+    ``[in, out]``)."""
+    from transformers.pytorch_utils import Conv1D
+
+    model = AutoModelForCausalLM.from_pretrained(
+        "sshleifer/tiny-gpt2", dtype=torch.float32
+    )
+    data = {"input_ids": [[1, 2, 3, 4, 5]] * 4}
+    data["labels"] = data["input_ids"]
+    dataset = Dataset.from_dict(data)
+
+    training_args = TrainingArguments(
+        output_dir=str(tmp_path / "output"),
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        save_strategy="no",
+        logging_strategy="no",
+        remove_unused_columns=False,
+        report_to=[],
+    )
+    callback = GradientCollectorCallback(path=tmp_path / "gradients")
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        callbacks=[callback],
+    )
+    trainer = prepare_for_gradient_collection(trainer)
+    trainer.train()
+
+    assert callback.collector is not None
+    base = model.base_model
+    checked = 0
+    for name, norm in callback.collector.processor.normalizers.items():
+        module = base.get_submodule(name)
+        if not isinstance(module, Conv1D):
+            continue
+        out_f, in_f = module.nf, module.weight.shape[0]
+        assert isinstance(norm, AdamNormalizer)
+        assert norm.weight_avg_sq.shape == (out_f, in_f), (
+            f"{name}: normalizer is {tuple(norm.weight_avg_sq.shape)}, "
+            f"expected {(out_f, in_f)}"
+        )
+        # The normalizer must accept a gradient in the collector's layout.
+        dev = norm.weight_avg_sq.device
+        norm.normalize_weight(torch.randn(out_f, in_f, device=dev))
+        checked += 1
+
+    assert checked, "no Conv1D normalizers were produced"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_scale_by_lr_matches_adam_update(tmp_path: Path):
+    """``scale_by_lr`` makes the normalizer produce ``lr * g / sqrt(v)``."""
+    model = AutoModelForCausalLM.from_pretrained(
+        "sshleifer/tiny-gpt2", dtype=torch.float32
+    )
+    data = {"input_ids": [[1, 2, 3, 4, 5]] * 4}
+    data["labels"] = data["input_ids"]
+    dataset = Dataset.from_dict(data)
+
+    def run(scale_by_lr: bool):
+        torch.manual_seed(0)
+        m = AutoModelForCausalLM.from_pretrained(
+            "sshleifer/tiny-gpt2", dtype=torch.float32
+        )
+        args = TrainingArguments(
+            output_dir=str(tmp_path / f"out_{scale_by_lr}"),
+            num_train_epochs=1,
+            per_device_train_batch_size=2,
+            save_strategy="no",
+            logging_strategy="no",
+            remove_unused_columns=False,
+            report_to=[],
+            lr_scheduler_type="constant",
+        )
+        cb = GradientCollectorCallback(
+            path=tmp_path / f"grads_{scale_by_lr}", scale_by_lr=scale_by_lr
+        )
+        trainer = Trainer(model=m, args=args, train_dataset=dataset, callbacks=[cb])
+        trainer = prepare_for_gradient_collection(trainer)
+        trainer.train()
+        assert cb.collector is not None
+        lr = trainer.optimizer.param_groups[0]["lr"]
+        return cb.collector.processor.normalizers, lr
+
+    plain, _ = run(False)
+    scaled, lr = run(True)
+
+    assert plain and scaled
+    for name, norm in scaled.items():
+        assert isinstance(norm, AdamNormalizer)
+        # second moment divided by lr^2 -> normalize_weight multiplies by lr
+        torch.testing.assert_close(
+            norm.weight_avg_sq * lr**2,
+            assert_type(AdamNormalizer, plain[name]).weight_avg_sq,
+        )
+    del model

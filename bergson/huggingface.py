@@ -20,6 +20,10 @@ from bergson import AttentionConfig, GradientProcessor
 from bergson.collector.gradient_collectors import StreamingGradientCollector
 from bergson.data import column_offsets, create_index
 from bergson.gradients import AdafactorNormalizer, AdamNormalizer
+from bergson.utils.load_from_optimizer import (
+    _orient_factored_second_moment,
+    _orient_weight_second_moment,
+)
 from bergson.utils.peft import detect_peft_modules
 from bergson.utils.utils import convert_dtype_to_torch
 
@@ -37,6 +41,7 @@ class GradientCollectorCallback(TrainerCallback):
         dtype: np.dtype = np.dtype(np.float16),
         accumulate_grads: bool = False,
         use_optimizer_state: bool = True,
+        scale_by_lr: bool = True,
         track_order: bool = False,
     ):
         """
@@ -51,6 +56,11 @@ class GradientCollectorCallback(TrainerCallback):
             use_optimizer_state: Whether to use the optimizer state to
                 normalize the gradients. If `False`, no normalization is
                 applied.
+            scale_by_lr: Scale the normalizer so the stored gradient is the
+                update the optimizer applied, ``lr * g / sqrt(v)``. Each example
+                is captured at the step it was trained on, so this weights it by
+                that step's learning rate. Set False for ``g / sqrt(v)``, which
+                matches ``load_from_optimizer``.
             track_order: Whether to record the shuffled order of training data.
         attention_cfgs: Information used to split matrix-valued parameters into
             per-head matrices before down projection.
@@ -68,6 +78,7 @@ class GradientCollectorCallback(TrainerCallback):
         self.projection_dim = projection_dim
         self.include_bias = include_bias
         self.use_optimizer_state = use_optimizer_state
+        self.scale_by_lr = scale_by_lr
         self.order: list[dict] | None = [] if track_order else None
 
         self.mod_grads = {}
@@ -263,7 +274,11 @@ class GradientCollectorCallback(TrainerCallback):
             group_lr = group["lr"]
 
             for param in group["params"]:
-                param_name = param_to_name[param]
+                # The optimizer owns the full model's parameters; anything
+                # outside base_model (e.g. lm_head) is never a target module.
+                param_name = param_to_name.get(param)
+                if param_name is None:
+                    continue
 
                 # Extract layer name (remove .weight or .bias suffix)
                 if param_name.endswith(".weight"):
@@ -301,33 +316,38 @@ class GradientCollectorCallback(TrainerCallback):
                 elif (eas := p_state.get("exp_avg_sq")) is not None:
                     layer_second_moments[layer_name][param_type] = eas
 
-                # Build normalizers from collected second moments
-                for layer_name, moments in layer_second_moments.items():
-                    lr = moments["lr"]
+        # Build normalizers from collected second moments
+        for layer_name, moments in layer_second_moments.items():
+            # Dividing the second moment by lr^2 makes normalize_weight compute
+            # lr * g / sqrt(v), the update the optimizer applied.
+            scale = moments["lr"] ** 2 if self.scale_by_lr else 1.0
 
-                    lr_sq = lr**2
+            # Adam-like: has weight exp_avg_sq
+            if "weight" in moments:
+                weight_eas = _orient_weight_second_moment(
+                    moments["weight"], model, layer_name
+                )
+                weight_eas = weight_eas / scale
+                bias_eas = moments.get("bias")
+                bias_eas = bias_eas / scale if bias_eas is not None else None
 
-                    # Adam-like: has weight exp_avg_sq
-                    if "weight" in moments:
-                        weight_eas = moments["weight"] / lr_sq
-                        bias_eas = moments.get("bias")
-                        bias_eas = bias_eas / lr_sq if bias_eas is not None else None
+                norm = AdamNormalizer(weight_eas, bias_eas)
 
-                        norm = AdamNormalizer(weight_eas, bias_eas)
+            # Adafactor-like: has row/col factorization
+            elif "row" in moments and "col" in moments:
+                row, col = _orient_factored_second_moment(
+                    moments["row"], moments["col"], model, layer_name
+                )
+                row, col = row / scale, col / scale
+                bias_eas = moments.get("bias")
+                bias_eas = bias_eas / scale if bias_eas is not None else None
 
-                    # Adafactor-like: has row/col factorization
-                    elif "row" in moments and "col" in moments:
-                        row = moments["row"] / lr_sq
-                        col = moments["col"] / lr_sq
-                        bias_eas = moments.get("bias")
-                        bias_eas = bias_eas / lr_sq if bias_eas is not None else None
+                norm = AdafactorNormalizer(row, col, bias_eas)
+            else:
+                # No weight moments found - skip this layer
+                continue
 
-                        norm = AdafactorNormalizer(row, col, bias_eas)
-                    else:
-                        # No weight moments found - skip this layer
-                        continue
-
-                    normalizers[layer_name] = norm
+            normalizers[layer_name] = norm
 
         proc.normalizers = normalizers
 
