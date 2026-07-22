@@ -43,6 +43,10 @@ def compute_num_token_grads(data: Dataset) -> np.ndarray:
     nothing after ``logits[:, :-1]``) and right-padding are excluded, so
     ``num_token_grads = length - 1`` regardless of the label mask.
 
+    Documents shorter than 2 tokens contribute **zero** rows: they have no
+    valid next-token label, and :func:`_allocate_batches_world` drops them from
+    the forward pass. ``length - 1`` is clamped at 0 accordingly.
+
     Returns
     -------
     np.ndarray of shape ``(len(data),)`` with dtype int64.
@@ -53,7 +57,7 @@ def compute_num_token_grads(data: Dataset) -> np.ndarray:
         lengths = np.asarray([len(x) for x in data["input_ids"]], dtype=np.int64)
     else:
         lengths = np.asarray([len(x) for x in data["labels"]], dtype=np.int64)
-    return lengths - 1
+    return np.maximum(lengths - 1, 0)
 
 
 def create_token_index(
