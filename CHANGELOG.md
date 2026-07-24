@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.13.2 (2026-07-24)
+
+### Bug Fixes
+
+- Thread hessian_dtype into the EK-FAC lambda collector; add fp64
+  ([#356](https://github.com/EleutherAI/bergson/pull/356),
+  [`2671534`](https://github.com/EleutherAI/bergson/commit/26715342c5705782814596dde59450b98b1fb675))
+
+hessian_dtype only reached the covariance collectors — the eigenvalue-correction pass ignored it and
+  accumulated in the activations' dtype. Pass it to LambdaCollector in both the standard and
+  per-checkpoint (SOURCE) paths, and add an fp64 option for kronfluence-parity precision studies.
+
+
 ## v0.13.1 (2026-07-22)
 
 ### Bug Fixes
