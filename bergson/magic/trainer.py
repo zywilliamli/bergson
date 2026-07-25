@@ -68,12 +68,18 @@ class _ReplicatedAllReduceSum(torch.autograd.Function):
 
 
 def _maybe_get_cuda_rng_state() -> torch.Tensor:
-    """ "Get the CUDA RNG state if CUDA is initialized, otherwise return zeros."""
+    """Get the CUDA RNG state, or a zeros placeholder when CUDA is uninitialized."""
     if torch.cuda.is_initialized():
         return torch.cuda.random.get_rng_state()
 
     # This corresponds to a manual seed of 0
     return torch.zeros(16, dtype=torch.uint8)
+
+
+def _maybe_set_cuda_rng_state(rng_state: torch.Tensor) -> None:
+    """Restore a CUDA RNG state, or no-op when CUDA is uninitialized."""
+    if torch.cuda.is_initialized():
+        torch.cuda.set_rng_state(rng_state)
 
 
 @dataclass
@@ -275,12 +281,16 @@ class TrainerState:
     @contextmanager
     def activate(self, model: nn.Module):
         cpu_state = torch.random.get_rng_state()
+        cuda_state = _maybe_get_cuda_rng_state()
         torch.random.set_rng_state(self.cpu_rng_state)
+        _maybe_set_cuda_rng_state(self.cuda_rng_state)
 
-        with swap_parameters(model, self.params, self.buffers, strict=True) as p:
-            yield p
-
-        torch.random.set_rng_state(cpu_state)
+        try:
+            with swap_parameters(model, self.params, self.buffers, strict=True) as p:
+                yield p
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            _maybe_set_cuda_rng_state(cuda_state)
 
     def state_dict(self) -> dict:
         # Convert to dict manually because dataclasses.asdict does a deep copy
@@ -384,6 +394,7 @@ class Trainer:
                 disables clipping.
         """
         torch.random.set_rng_state(state.cpu_rng_state)
+        _maybe_set_cuda_rng_state(state.cuda_rng_state)
 
         # Trainable params live on the meta device and are swapped in from state.
         # Frozen params remain on-device in the model and are left untouched.
