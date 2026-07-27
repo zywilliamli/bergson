@@ -1,6 +1,47 @@
 # CHANGELOG
 
 
+## v0.13.3 (2026-07-27)
+
+### Performance Improvements
+
+- Remove torch.compile from normalizers (fixes import on Python 3.14)
+  ([#361](https://github.com/EleutherAI/bergson/pull/361),
+  [`315088c`](https://github.com/EleutherAI/bergson/commit/315088c21fd17c9d2663b5172214688030baf67d))
+
+* fix: guard torch.compile so bergson imports on Python 3.14
+
+torch.compile raises RuntimeError at decoration time on interpreters Dynamo doesn't support (Python
+  3.14+ with torch <= 2.9). The normalizers in bergson/gradients.py apply it at import time, so
+  importing bergson crashed outright on 3.14.
+
+- Add compile_if_supported: falls back to the eager function with a warning when torch.compile is
+  unavailable - Add tests covering the fallback path, including a subprocess test that simulates the
+  3.14 condition on any interpreter - Add an import-py314 CI job that installs bergson on Python
+  3.14 and imports it, catching future import-time regressions
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+* ci: run compile-fallback tests on the Python 3.14 job
+
+* perf: remove torch.compile from normalizers
+
+A100 benchmarks (torch 2.7.1, py3.11) show the compiled normalizers are net slower in the common
+  case: ~50us of dynamo guard overhead per call dominates the sub-100us kernels at 768-dim shapes
+  and on every bias path, and each run pays 0.3-1.5s compile latency per graph (17 graphs observed
+  from bin-packing's varying batch sizes). Compiled kernels only win on very large tensors (up to
+  ~2x on [4, 50304, 768] bf16), a regime worth a few percent of end-to-end build time at most, and
+  only when --optimizer_state is set.
+
+Removing the decorators also makes bergson importable on Python 3.14, where torch.compile raises at
+  decoration time (torch <= 2.9). The import-py314 CI job guards against reintroducing import-time
+  compiles.
+
+---------
+
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+
+
 ## v0.13.2 (2026-07-24)
 
 ### Bug Fixes
