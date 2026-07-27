@@ -656,13 +656,16 @@ def _multi_step_stream(n_steps: int, device: str = "cpu") -> DataStream:
     return DataStream(ds, batch_size=1, device=device)
 
 
-def _fresh_trainer(seed: int = 42):
+def _fresh_trainer(seed: int = 42, dropout: float = 0.0):
     """Build a fresh model/trainer/state, as a new process would."""
     torch.manual_seed(seed)
     config = AutoConfig.from_pretrained(TINY_MODEL)
+    if dropout:
+        config.resid_pdrop = dropout
     model = AutoModelForCausalLM.from_config(
         config, torch_dtype=torch.float32, attn_implementation="eager"
     )
+    model.train() if dropout else model.eval()
     model.loss_function = weighted_causal_lm_ce
     model.requires_grad_(True)
 
@@ -944,3 +947,57 @@ def test_step_reproduces_cuda_dropout_masks():
     assert loss1 == loss2, (loss1, loss2)
     for k in s1.params:
         torch.testing.assert_close(s1.params[k], s2.params[k])
+
+
+def test_prepare_trainer_respects_train_mode(tmp_path):
+    """train_mode drives the model's train/eval mode; default is eval."""
+    from bergson.magic.config import MagicConfig
+    from bergson.magic.trainer import prepare_trainer
+
+    def build(train_mode):
+        cfg = MagicConfig(
+            run_path=str(tmp_path),
+            model="EleutherAI/pythia-14m",
+            train_mode=train_mode,
+        )
+        _, _, model = prepare_trainer(cfg, rank=0, schedule=lambda step: 1e-4)
+        return model.training
+
+    assert build(False) is False
+    assert build(True) is True
+
+
+def test_magic_backward_matches_across_save_modes_with_dropout(monkeypatch):
+    """Sparse checkpointing must not change MAGIC scores when dropout is active.
+
+    Each save mode rematerializes a different number of steps before the traced
+    re-do, so if the replay drew fresh dropout masks instead of restoring each
+    step's saved RNG, the schedules would disagree.
+    """
+    import types
+
+    from bergson.magic import trainer as trainer_mod
+
+    monkeypatch.setattr(
+        trainer_mod.psutil,
+        "virtual_memory",
+        lambda: types.SimpleNamespace(available=1 << 60),
+    )
+
+    scores = {}
+    for mode in ("all", "log"):
+        trainer, fwd_state, model = _fresh_trainer(dropout=0.5)
+        assert any(
+            isinstance(m, torch.nn.Dropout) and m.training and m.p > 0
+            for m in model.modules()
+        ), "dropout is not active; test is degenerate"
+        stream = _multi_step_stream(9)
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            fwd_state = trainer.train(
+                fwd_state, stream, inplace=True, save_dir=ckpt_dir, save_mode=mode
+            )
+            scores[mode] = _magic_scores(trainer, model, fwd_state, stream, ckpt_dir)
+
+    assert scores["all"].abs().sum() > 0, "scores are all zero; test is degenerate"
+    torch.testing.assert_close(scores["log"], scores["all"], atol=1e-12, rtol=1e-6)

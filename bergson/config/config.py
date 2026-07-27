@@ -349,6 +349,9 @@ class TrainingConfig(AttributionConfig, Serializable):
     """Optimizer to use for the training steps. Muon is an efficient
     optimizer that can reduce memory usage and speed up training."""
 
+    train_mode: bool = False
+    """Enable ``.train()`` mode. Not certified MAGIC-safe."""
+
     save_optimizer_state: bool = False
     """After training, export the optimizer's second moments to
     ``<run_path>/optimizer.pt`` for use as an attribution normalizer.

@@ -888,6 +888,12 @@ def prepare_trainer(cfg: TrainingConfig, rank: int, schedule: Callable):
     )
     model.to(get_device(rank))  # type: ignore[reportArgumentType]
 
+    # setup_model_and_peft leaves the model in from_pretrained's eval mode.
+    if cfg.train_mode:
+        model.train()
+    else:
+        model.eval()
+
     if target_modules:
         # Only train the PEFT adapter parameters
         model.requires_grad_(False)
