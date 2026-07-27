@@ -28,6 +28,10 @@ extensions = [
 
 release = metadata.version("Bergson")
 
+# Prefix auto-generated section labels with the document name so same-named
+# headings in different pages (e.g. "Quickstart") don't collide.
+autosectionlabel_prefix_document = True
+
 napoleon_google_docstring = True
 napoleon_use_param = False
 napoleon_use_ivar = True
@@ -38,9 +42,9 @@ exclude_patterns = ["build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
 html_theme = "furo"
 html_static_path = ["_static"]
 html_theme_options = {
-    "source_repository": "https://github.com/AlignmentResearch/tuned-lens",
+    "source_repository": "https://github.com/EleutherAI/bergson",
     "source_branch": "main",
-    "source_directory": "docs/source",
+    "source_directory": "docs",
     "light_css_variables": {
         "sidebar-item-font-size": "85%",
     },

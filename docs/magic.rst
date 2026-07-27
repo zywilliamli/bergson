@@ -1,7 +1,7 @@
-MAGIC Attribution
+MAGIC (Unrolling)
 =================
 
-`MAGIC <https://arxiv.org/abs/2504.16430>`_ (Model-Agnostic Generation-time Influence via Checkpointing) attributes evaluation loss to individual training examples by backpropagating through the entire training process. Unlike influence functions which use a local approximation, MAGIC computes exact counterfactual attribution by differentiating through checkpointed training steps.
+`MAGIC <https://arxiv.org/abs/2504.16430>`_ attributes evaluation loss to individual training examples by backpropagating through the entire training process. Unlike influence functions which use a local approximation, MAGIC computes exact counterfactual attribution by differentiating through checkpointed training steps.
 
 We provide a `Trainer` class that takes differentiable training steps and handles all three phases of MAGIC attribution. We support FSDP training using the `bergson.magic.dtensor_patch` runtime patch, which makes PyTorch's DTensor redistribution twice-differentiable (`pytorch/pytorch#160509 <https://github.com/pytorch/pytorch/pull/160509>`_). The patch is applied in memory, so no torch source files are modified.
 
@@ -66,11 +66,12 @@ After a run completes, ``run_cfg.run_path`` contains:
 * ``validation.csv`` — leave-subset-out validation results (if validation
   was run).
 
-Meta Smoothness
+Metasmoothness
 ---------------
 
-MAGIC is valid when the function you are differentiating through is meta smooth. There a few heuristics known to encourage meta smoothness:
+MAGIC is valid when the function you are differentiating through is metasmooth. There a few heuristics known to encourage metasmoothness:
 
+* Use the Muon optimizer
 * Increase batch size
 * Scale model outputs down
 * Clip gradients
@@ -78,7 +79,7 @@ MAGIC is valid when the function you are differentiating through is meta smooth.
 * QK norm
 * Tune weight decay
 
-Many of these methods boil down to "Identify and manage spikes in your training loss."
+Many of these methods boil down to "Identify and manage spikes in your training loss." You can measure your metasmoothness with ``bergson metasmoothness``.
 
 Core components
 ^^^^^^^^^^^^^^^
@@ -87,7 +88,7 @@ Core components
 
 .. code-block:: python
 
-   from bergson.trainer import Trainer, DataStream, BackwardState, TrainerState
+   from bergson.magic import BackwardState, DataStream, Trainer, TrainerState
    import torchopt
 
    # Initialize
@@ -95,11 +96,11 @@ Core components
    trainer, state = Trainer.initialize(model, opt)
 
    # Forward training with checkpoints
-   stream = DataStream(dataset, tokenizer, batch_size=4, device="cuda")
+   stream = DataStream(dataset, batch_size=4, device="cuda")
    state = trainer.train(state, stream, save_dir="checkpoints/")
 
    # Compute eval gradients, then backward through training
-   bwd_state = trainer.backward("checkpoints/", stream, bwd_state)
+   bwd_state = trainer.backward("checkpoints/", stream, bwd_state, state)
    scores = bwd_state.weight_grads  # attribution scores
 
 **DataStream**: Wraps a dataset with differentiable per-example (or per-token) weights that receive gradients during the backward pass.
@@ -107,10 +108,10 @@ Core components
 .. code-block:: python
 
    # Per-example attribution
-   stream = DataStream(dataset, tokenizer, batch_size=4, device="cuda")
+   stream = DataStream(dataset, batch_size=4, device="cuda")
 
    # Per-token attribution
-   stream = DataStream(dataset, tokenizer, batch_size=4, device="cuda", weight_shape=(len(dataset), max_length))
+   stream = DataStream(dataset, batch_size=4, device="cuda", weight_shape=(len(dataset), max_length))
 
 **DTensor patch**: For multi-GPU runs with FSDP, apply the DTensor patch before any distributed operations:
 

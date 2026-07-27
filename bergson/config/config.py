@@ -307,7 +307,7 @@ class AttributionConfig(ModelConfig, ABC):
 
 @dataclass
 class TrainingConfig(AttributionConfig, Serializable):
-    """Configuration for the MAGIC trainer."""
+    """Configuration for the Bergson trainer."""
 
     lr_schedule: LRScheduleConfig = field(default_factory=LRScheduleConfig)
     """Learning rate schedule configuration."""
@@ -723,9 +723,10 @@ class ScoreConfig(Serializable):
 
     score: Literal["nearest", "individual"] = "individual"
     """Method for scoring the gradients with the query.
-        `nearest`: compute each gradient's similarity to the most
-            similar query gradient (the maximum score).
-        `individual`: compute a separate score for each query gradient."""
+
+    ``nearest``: compute each gradient's similarity to the most similar query
+    gradient (the maximum score).
+    ``individual``: compute a separate score for each query gradient."""
 
     batch_size: int = 1024
     """Batch size for processing the query dataset."""
