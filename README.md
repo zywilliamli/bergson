@@ -23,12 +23,14 @@ pip install -e .
 
 ## Functionality
 
-| Method | LDS (GPT-2 fine-tune) |
-|:---|:---:|
-| MAGIC | **0.983 ± 0.005** |
-| SOURCE | 0.387 ± 0.039 |
-| EK-FAC | 0.257 ± 0.015 |
-| TrackStar | 0.184 ± 0.015 |
+| Method | LDS (GPT-2 fine-tune) | Training Optimizer |
+|:---|:---:|:---:|
+| MAGIC | **0.983 ± 0.005** | Adam |
+| Shampoo | 0.522 ± 0.037 | Muon |
+| EK-FAC | 0.474 ± 0.036 | Muon |
+| SOURCE | 0.387 ± 0.039 | Adam |
+| EK-FAC | 0.257 ± 0.015 | Adam |
+| TrackStar | 0.184 ± 0.015 | Adam |
 
 ### Attribute through Training
 
