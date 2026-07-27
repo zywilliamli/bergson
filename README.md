@@ -23,8 +23,8 @@ pip install -e .
 
 ## Functionality
 
-| Method | LDS (GPT-2 fine-tune) | Compute (re-use regime)
-|:---|:---:|:---:|
+| Method | LDS (GPT-2 fine-tune) |
+|:---|:---:|
 | MAGIC | **0.983 ± 0.005** |
 | SOURCE | 0.387 ± 0.039 |
 | EK-FAC | 0.257 ± 0.015 |
