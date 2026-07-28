@@ -1,6 +1,39 @@
 # CHANGELOG
 
 
+## v0.13.4 (2026-07-28)
+
+### Performance Improvements
+
+- Re-use re-train bank losses in `bergson validate`
+  ([#365](https://github.com/EleutherAI/bergson/pull/365),
+  [`52a5a34`](https://github.com/EleutherAI/bergson/commit/52a5a34bf99a850cf7d502fe65708a6d5ebcf0b7))
+
+* perf: cache method-independent bank losses in evaluate_retrained
+
+Evaluating attribution scores against a pre-saved leave-k-out bank re-runs every banked model on the
+  query set to get each subset's query-loss diff. Those per-subset losses depend only on the bank
+  and the query set, never on the attribution scores, so scoring a second method against the same
+  bank repeats the entire (dominant) cost for nothing.
+
+Cache the per-subset losses (and baseline) under the bank keyed by the query set and load settings,
+  and reuse them automatically whenever the key matches. The first method scored on a bank pays the
+  full cost; every later method skips model evaluation entirely and only re-sums its own scores. A
+  metadata guard recomputes when the key no longer matches.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+* [pre-commit.ci] auto fixes from pre-commit.com hooks
+
+for more information, see https://pre-commit.ci
+
+---------
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+Co-authored-by: pre-commit-ci[bot] <66853113+pre-commit-ci[bot]@users.noreply.github.com>
+
+
 ## v0.13.3 (2026-07-27)
 
 ### Performance Improvements
