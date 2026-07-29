@@ -1,6 +1,20 @@
 # CHANGELOG
 
 
+## v0.15.1 (2026-07-29)
+
+### Bug Fixes
+
+- Import load_from_optimizer lazily to break a spawn-time cycle
+  ([#368](https://github.com/EleutherAI/bergson/pull/368),
+  [`f824782`](https://github.com/EleutherAI/bergson/commit/f8247824424db8a39216fe6b88228a7740e11536))
+
+Importing it at module scope pulls in bergson.gradients, which re-enters the package __init__ and
+  reaches magic.cli -> validate -> magic.trainer. In-process that resolves, but a spawned worker
+  unpickling through magic.cli hits magic.trainer half-initialized and fails on TrainerState, taking
+  out test_grad_accum_matches_full_batch.
+
+
 ## v0.15.0 (2026-07-29)
 
 ### Features
