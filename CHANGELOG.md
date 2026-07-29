@@ -1,6 +1,17 @@
 # CHANGELOG
 
 
+## v0.15.0 (2026-07-29)
+
+### Features
+
+- Seamless Bergson Trainer -> SOURCE attribute
+  ([#367](https://github.com/EleutherAI/bergson/pull/367),
+  [`914c77a`](https://github.com/EleutherAI/bergson/commit/914c77a0eb208194015abc523b9f360a3d0a0bf2))
+
+feat: run SOURCE directly off a bergson training run
+
+
 ## v0.14.0 (2026-07-29)
 
 ### Features
