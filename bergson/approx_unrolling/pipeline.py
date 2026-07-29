@@ -52,6 +52,7 @@ from .segment_aggregation import (
     aggregate_segment_covariances,
     aggregate_segment_lambdas,
 )
+from .trainer_run import resolve
 
 # Total number of steps in the full approximate unrolling pipeline. Used only for the
 # user-facing "Step k/N_TOTAL_STEPS:" prefix. Bump as steps land.
@@ -81,6 +82,9 @@ def approx_unrolling_pipeline(
         If ``True``, skip steps whose output directories already exist.
     """
     logger = get_logger("approx_unrolling_pipeline")
+
+    # Use the Bergson training run to resolve unset config fields if present.
+    approx_unrolling_cfg = resolve(approx_unrolling_cfg)
 
     n_ckpts = len(approx_unrolling_cfg.checkpoints)
     n_segments = approx_unrolling_cfg.segments

@@ -352,10 +352,8 @@ class TrainingConfig(AttributionConfig, Serializable):
     train_mode: bool = False
     """Enable ``.train()`` mode. Not certified MAGIC-safe."""
 
-    save_optimizer_state: bool = False
-    """After training, export the optimizer's second moments to
-    ``<run_path>/optimizer.pt`` for use as an attribution normalizer.
-    AdamW only."""
+    save_optimizer_state: Literal["none", "last", "all"] = "none"
+    """Which checkpoints' optimizer second moments to persist. AdamW only."""
 
     weight_decay: float = 0.01
     """Weight decay coefficient for AdamW and Muon."""
@@ -380,6 +378,13 @@ class TrainingConfig(AttributionConfig, Serializable):
 
     wandb_project: str = ""
     """Weights & Biases project name. If set, logs training loss to W&B."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # TODO Lucia Quirke August: remove bwd-compat
+        if isinstance(self.save_optimizer_state, bool):
+            self.save_optimizer_state = "last" if self.save_optimizer_state else "none"
 
 
 @dataclass
@@ -785,6 +790,11 @@ class ApproxUnrollingConfig(Serializable):
     step_size_list: list[int] = field(default_factory=list)
     """Per-segment optimizer step count; length must == segments. If
     empty, inferred from per-checkpoint step counts."""
+
+    momentum: float | None = None
+    """SGD heavy-ball momentum beta; scales lr*steps by 1/(1-beta) (Bae et al.
+    2024, App. D.2). When ``None`` it's derived from the run if present or set
+    to 0.0."""
 
     query: DataConfig = field(default_factory=DataConfig)
     """Query dataset spec; gradients computed at the final checkpoint."""

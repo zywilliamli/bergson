@@ -26,6 +26,7 @@ from transformers.utils.logging import (
     set_verbosity_error as hf_set_verbosity_error,
 )
 
+from ..approx_unrolling.trainer_run import write_lr_history
 from ..config.config import TrainingConfig, ValidationConfig
 from ..config.config_io import save_run_config
 from ..distributed import grad_tree, launch_distributed_run
@@ -237,6 +238,9 @@ def worker(
     ckpts_path = os.path.join(run_cfg.run_path, "checkpoints")
     resume = run_cfg.resume
 
+    if global_rank == 0:
+        write_lr_history(ckpts_path, schedule, len(stream))
+
     fwd_state = trainer.train(
         fwd_state,
         stream,
@@ -249,8 +253,17 @@ def worker(
         fsdp=run_cfg.fsdp,
         max_grad_norm=run_cfg.max_grad_norm,
         grad_accum_steps=run_cfg.grad_accum_steps,
+        optimizer_cfg=(
+            dict(
+                betas=(run_cfg.adam_beta1, run_cfg.adam_beta2),
+                eps=run_cfg.adam_eps,
+                eps_root=run_cfg.eps_root,
+            )
+            if getattr(run_cfg, "save_optimizer_state", "none") == "all"
+            else None
+        ),
     )
-    if getattr(run_cfg, "save_optimizer_state", False) and global_rank == 0:
+    if getattr(run_cfg, "save_optimizer_state", "none") != "none" and global_rank == 0:
         save_second_moments_as_optimizer_pt(
             model,  # type: ignore[reportArgumentType]
             fwd_state.opt_state,
