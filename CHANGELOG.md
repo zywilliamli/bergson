@@ -1,6 +1,16 @@
 # CHANGELOG
 
 
+## v0.14.0 (2026-07-29)
+
+### Features
+
+- Magic gradient accumulation ([#357](https://github.com/EleutherAI/bergson/pull/357),
+  [`e7d0358`](https://github.com/EleutherAI/bergson/commit/e7d0358cd59b948a299019529f42ad174c89ce59))
+
+feat: Add gradient accumulation (grad_accum_steps) to MAGIC trainer
+
+
 ## v0.13.4 (2026-07-28)
 
 ### Performance Improvements
