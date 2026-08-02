@@ -452,7 +452,9 @@ def worker(
             os.path.join(run_cfg.run_path, "optimizer.pt"),
         )
 
-    if run_cfg.save_models and global_rank == 0:
+    # A sliced run leaves the shared baseline to the process that starts at 0.
+    trails_slice = isinstance(run_cfg, ValidationConfig) and run_cfg.subset_start != 0
+    if run_cfg.save_models and global_rank == 0 and not trails_slice:
         # For the leave-k-out family the trained model is the query baseline
         # that evaluate_retrained reads from retrained/base.
         if isinstance(run_cfg, ValidationConfig):
