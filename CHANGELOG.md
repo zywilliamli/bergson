@@ -1,6 +1,29 @@
 # CHANGELOG
 
 
+## v0.19.0 (2026-08-02)
+
+### Features
+
+- Adam SOURCE preconditioner and Eq-43 hybrid
+  ([#379](https://github.com/EleutherAI/bergson/pull/379),
+  [`5d4b765`](https://github.com/EleutherAI/bergson/commit/5d4b76567d64e730014280f34ecd6c1f2708e5ed))
+
+Evaluate the unrolling eigenfunctions on a diagonal approximation of the preconditioned Hessian
+  P^1/2 H P^1/2, built per segment from the checkpoints' saved second moments (Bae et al. 2024, App.
+  C). With adam_segment_hybrid, F_segment uses the App. D Eq-43 form: the diagonal supplies only the
+  matrix exponential and the EK-FAC factors supply H^-1. Requires optimizer.pt in each checkpoint
+  dir, written by the trainer's save_optimizer_state and carried across by export_checkpoints.
+
+### Testing
+
+- Save_optimizer_state must not hang under FSDP
+  ([#380](https://github.com/EleutherAI/bergson/pull/380),
+  [`054ebc7`](https://github.com/EleutherAI/bergson/commit/054ebc7c25901a0ae75a3a69cc6ba4957a2328ec))
+
+Covers the every-rank collective fix from #376.
+
+
 ## v0.18.0 (2026-08-02)
 
 ### Features
