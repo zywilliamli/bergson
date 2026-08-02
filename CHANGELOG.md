@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v0.16.1 (2026-08-02)
+
+### Bug Fixes
+
+- Normalize SOURCE segment eigenvalues per document
+  ([#375](https://github.com/EleutherAI/bergson/pull/375),
+  [`ad939f5`](https://github.com/EleutherAI/bergson/commit/ad939f5afc69808d23c26926a5e4b712c6b9fab7))
+
+Segment eigenvalues were unnormalized sums over documents x checkpoints. EK-FAC is unaffected --
+  damping is relative to mean(lambda), so every inversion is homogeneous in the scale -- but
+  SOURCE's eigenfunctions are not scale-invariant: sigma enters exp(-lr*K*sigma), and the
+  unnormalized scale puts it in the function's dead range (LDS 0.125 vs 0.383). Eq. 1 of Bae et al.
+  2024 defines the risk as a per-document mean, and kronfluence divides its lambda matrix by the
+  processed-sample count; dividing the pooled segment sum by the pooled document count matches both.
+
+
 ## v0.16.0 (2026-08-02)
 
 ### Features
