@@ -1,6 +1,30 @@
 # CHANGELOG
 
 
+## v0.17.0 (2026-08-02)
+
+### Bug Fixes
+
+- Call save_second_moments_as_optimizer_pt from every rank
+  ([#376](https://github.com/EleutherAI/bergson/pull/376),
+  [`4174502`](https://github.com/EleutherAI/bergson/commit/41745028e7966538b889e9c29b60ed9ba7421347))
+
+Gathering FSDP's sharded (DTensor) moments is a collective, so gating the call on global_rank == 0
+  hangs non-zero ranks; the function already restricts the file write to rank 0.
+
+### Features
+
+- Interval save mode for the trainer ([#373](https://github.com/EleutherAI/bergson/pull/373),
+  [`8eea5ef`](https://github.com/EleutherAI/bergson/commit/8eea5ef2d5bfe91245454f5c8018376631508a9f))
+
+save_mode="interval" writes a checkpoint every save_interval steps, plus the final state when the
+  cadence lands on it (the other modes' backward replay indexes the data stream by checkpoint, so
+  only interval mode may add a trailing snapshot). save_mode and save_interval move from MagicConfig
+  to TrainingConfig so `bergson train` covers trainer-only runs such as producing SOURCE
+  checkpoints, and MagicSaveMode becomes SaveMode to match; the MAGIC backward rejects interval
+  mode.
+
+
 ## v0.16.1 (2026-08-02)
 
 ### Bug Fixes
