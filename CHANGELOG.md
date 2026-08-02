@@ -1,6 +1,26 @@
 # CHANGELOG
 
 
+## v0.16.0 (2026-08-02)
+
+### Features
+
+- **validate**: Save subsets.json by default and reuse it if present
+  ([#372](https://github.com/EleutherAI/bergson/pull/372),
+  [`781583b`](https://github.com/EleutherAI/bergson/commit/781583bf096f7d5e8315ac049df53de8fdfeeda4))
+
+Write subsets.json and reload it when possible so different methods using the same re-train bank
+  re-use them
+
+### Refactoring
+
+- Rename save_retrained_models to save_models
+  ([#371](https://github.com/EleutherAI/bergson/pull/371),
+  [`d6c3940`](https://github.com/EleutherAI/bergson/commit/d6c3940b0c0baf8a329cb3b75ef64f8eaeb63456))
+
+Rename save_retrained_models -> save_models
+
+
 ## v0.15.1 (2026-07-29)
 
 ### Bug Fixes
