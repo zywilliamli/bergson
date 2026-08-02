@@ -1,47 +1,24 @@
 """Fill in unset SOURCE configuration from a bergson run's ``config.yaml``
 if present."""
 
-import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
 from ..config.config import ApproxUnrollingConfig, TrainingConfig
 from ..config.config_io import CONFIG_FILENAME
+from ..magic.trainer import LR_HISTORY_FILENAME
 from ..utils.logger import get_logger
-
-EXPORT_DIRNAME = "exported"
-"""Where export_checkpoints puts ``checkpoint-<N>`` dirs by default, and so the
-first place discovery looks."""
-
-LR_HISTORY_FILENAME = "log_history.json"
-"""Per-step LRs in HF's ``log_history`` shape, written beside a run's
-checkpoints -- the path the LR math already checks first."""
 
 logger = get_logger(__name__)
 
 
-def write_lr_history(
-    save_dir: str | Path, schedule: Callable[[int], float], num_steps: int
-) -> Path:
-    """Record per-step LRs beside the checkpoints, from the ``schedule`` the
-    optimizer was built with, so it is exact rather than reconstructed."""
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    history = [
-        {"step": step, "learning_rate": float(schedule(step))}
-        for step in range(num_steps)
-    ]
-    path = save_dir / LR_HISTORY_FILENAME
-    with open(path, "w") as f:
-        json.dump(history, f)
-    return path
-
-
 def load_training_config(trainer_run: str | Path) -> TrainingConfig:
-    """Load the ``TrainingConfig`` a run was launched with. ``save_run_config``
-    writes ``{command_name: {...}}``, so the single value is the config."""
+    """Load the ``TrainingConfig`` a run was launched with.
+
+    ``save_run_config`` writes ``{steps: [{command_name: {...}}], metadata: ...}``,
+    so the training config is the first step's single value."""
     path = Path(trainer_run) / CONFIG_FILENAME
     if not path.is_file():
         raise FileNotFoundError(
@@ -50,9 +27,11 @@ def load_training_config(trainer_run: str | Path) -> TrainingConfig:
         )
 
     with open(path) as f:
-        loaded = yaml.safe_load(f)
+        loaded: Any = yaml.safe_load(f)
 
-    # One-step configs are a list of {command: payload}; take the first payload.
+    if isinstance(loaded, dict) and "steps" in loaded:
+        loaded = loaded["steps"]
+    # Steps are a list of {command: payload}; take the first payload.
     if isinstance(loaded, list):
         if not loaded:
             raise ValueError(f"{path} is empty")
@@ -64,7 +43,12 @@ def load_training_config(trainer_run: str | Path) -> TrainingConfig:
     if not isinstance(payload, dict):
         raise ValueError(f"{path} is not a bergson run config")
 
-    return TrainingConfig.from_dict(payload, drop_extra_fields=True)
+    try:
+        return TrainingConfig.from_dict(payload, drop_extra_fields=True)
+    except Exception as e:
+        # An attribution run's config.yaml has the same shape, so reaching here
+        # is expected; callers that guess at a run dir catch ValueError.
+        raise ValueError(f"{path} is not a bergson training config: {e}") from e
 
 
 def derive_momentum(training_cfg: TrainingConfig) -> float:
@@ -86,18 +70,6 @@ def derive_momentum(training_cfg: TrainingConfig) -> float:
             return 0.0
 
 
-def _reject_unexported(checkpoints: list[str]) -> None:
-    """SOURCE loads checkpoints with from_pretrained, so a raw DCP directory
-    would fail deep in the pipeline; say what to do instead."""
-    native = [c for c in checkpoints if Path(c).name.endswith(".ckpt")]
-    if native:
-        raise ValueError(
-            f"{native[:3]} are the trainer's DCP checkpoints, which "
-            "from_pretrained cannot load. Export them first with "
-            "bergson.utils.trainer_export.export_checkpoints(run_path)."
-        )
-
-
 def infer_trainer_run(checkpoints: list[str]) -> str:
     """The bergson run a checkpoint came from, or "" if it did not come from one.
 
@@ -116,9 +88,12 @@ def infer_trainer_run(checkpoints: list[str]) -> str:
 
 
 def resolve(cfg: ApproxUnrollingConfig) -> ApproxUnrollingConfig:
-    """Fill unset fields from ``cfg.trainer_run``. A no-op when it is empty;
+    """Fill unset fields from the training run the checkpoints came from;
     never overwrites a field the caller set."""
-    _reject_unexported(cfg.checkpoints)
+    # Local import: trainer_export imports load_training_config from here.
+    from ..utils.trainer_export import ensure_exported
+
+    cfg.checkpoints = ensure_exported(cfg.checkpoints)
 
     trainer_run = infer_trainer_run(cfg.checkpoints)
     if not trainer_run:
@@ -127,7 +102,16 @@ def resolve(cfg: ApproxUnrollingConfig) -> ApproxUnrollingConfig:
             cfg.momentum = 0.0
         return cfg
 
-    training_cfg = load_training_config(trainer_run)
+    try:
+        training_cfg = load_training_config(trainer_run)
+    except ValueError as e:
+        # trainer_run may be a config.yaml for something other than a
+        # training run - infer nothing.
+        logger.warning("Ignoring %s as a trainer run: %s", trainer_run, e)
+        if cfg.momentum is None:
+            cfg.momentum = 0.0
+        return cfg
+
     filled: list[str] = []
 
     if cfg.model_path is None:
