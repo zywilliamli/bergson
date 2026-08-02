@@ -1,6 +1,39 @@
 # CHANGELOG
 
 
+## v0.18.0 (2026-08-02)
+
+### Features
+
+- Auto-export trainer DCP checkpoints in the SOURCE pipeline
+  ([#378](https://github.com/EleutherAI/bergson/pull/378),
+  [`92867b2`](https://github.com/EleutherAI/bergson/commit/92867b27c993b6c1df2f184f15479bdf9671efc9))
+
+* fix: read the training config out of the saved {steps, metadata} document
+
+save_run_config has always wrapped the step list in a document with a metadata block, so
+  load_training_config rejected every real run directory; its test hand-rolled the bare list it
+  expected instead of calling save_run_config. Have the test write configs the way the writer does,
+  and report an unparseable payload as ValueError so callers guessing at a run dir still degrade to
+  their fallback.
+
+(cherry picked from commit cf91c5b67892ff4e4c830ba816099d5335033962)
+
+* feat: auto-export trainer DCP checkpoints in the SOURCE pipeline
+
+resolve() converts raw checkpoints/step_<n>.ckpt paths to the HF exported/checkpoint-<n> dirs
+  from_pretrained needs, exporting on demand and reusing existing exports, instead of rejecting
+  them. load_training_config gains a fallback so a checkpoint whose sibling config.yaml belongs to
+  an attribution run infers nothing rather than failing the pipeline.
+
+* refactor: put trainer and export code with their owners
+
+trainer_run.py becomes train_cfg_io.py: it reads the training run's config and artifacts, and the
+  old name read as "run the trainer". write_lr_history moves into the magic trainer that calls it,
+  ending magic's import of approx_unrolling; ensure_exported and EXPORT_DIRNAME move next to
+  export_checkpoints in utils.trainer_export.
+
+
 ## v0.17.1 (2026-08-02)
 
 ### Bug Fixes
