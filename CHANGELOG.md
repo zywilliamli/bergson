@@ -1,6 +1,21 @@
 # CHANGELOG
 
 
+## v0.17.1 (2026-08-02)
+
+### Bug Fixes
+
+- Score each segment against its own checkpoints' training gradients
+  ([#377](https://github.com/EleutherAI/bergson/pull/377),
+  [`4d5de7e`](https://github.com/EleutherAI/bergson/commit/4d5de7e33c66eeb47408dcc00e7a641d9e4141b1))
+
+score_per_segment_and_aggregate evaluated every segment's training gradients at the final
+  checkpoint, collapsing SOURCE toward influence functions at convergence. Bae et al. 2024 Sec. 3.4
+  defines g_bar_l as the expected training gradient over segment l's checkpoints; scores are linear
+  in the training gradient, so averaging per-checkpoint scores within the segment is equivalent and
+  reuses the existing scorer.
+
+
 ## v0.17.0 (2026-08-02)
 
 ### Bug Fixes
