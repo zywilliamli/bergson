@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.21.2 (2026-08-03)
+
+### Bug Fixes
+
+- Metasmoothness trains with run_magic's epoch pipeline
+  ([#393](https://github.com/EleutherAI/bergson/pull/393),
+  [`0ec50f4`](https://github.com/EleutherAI/bergson/commit/0ec50f45d3aff460b8ee056d5275d40572ece403))
+
+run_metasmoothness shuffled once and never concatenated epoch copies, so its three trainings ran a
+  single epoch with a fixed order regardless of num_epochs; run_magic implements epochs as
+  independently shuffled concatenated copies. The measured config now trains exactly as MAGIC would.
+
+
 ## v0.21.1 (2026-08-03)
 
 ### Bug Fixes
