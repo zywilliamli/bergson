@@ -1,6 +1,53 @@
 # CHANGELOG
 
 
+## v0.21.1 (2026-08-03)
+
+### Bug Fixes
+
+- Source resume polarity ([#390](https://github.com/EleutherAI/bergson/pull/390),
+  [`19ecf86`](https://github.com/EleutherAI/bergson/commit/19ecf868649a7f99d532c4f1f1000d3c36eb066c))
+
+* Fix inverted resume polarity in the SOURCE pipeline
+
+Steps 2-4 passed `resume=index_cfg.overwrite`, and step 5 skipped its work when
+  `index_cfg.overwrite` was set. `resume=True` means "skip if the output exists", so the flag was
+  inverted everywhere it was used: with `overwrite: true` -- what
+  examples/pipelines/approx_unrolling_pythia.yaml sets -- step 1 recomputed the per-checkpoint
+  Hessians while steps 2-5 reused stale segment covariances, lambdas and query gradients. With
+  `overwrite: false` the opposite happened. Neither setting produced "re-run == fresh run".
+
+Step 1 already used the flag correctly, which is why the two halves of the pipeline disagreed.
+
+The new test stubs each step and asserts its resume flag is `not overwrite`; without this change it
+  fails in both directions.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+* Track step completion with the .part rename
+
+Skipping a step because its output directory exists cannot tell a finished step from one that
+  crashed halfway: a resumed run reuses the partial output as if it were complete. Steps that go
+  through build/score already write to <out>.part and rename on success, and that rename is atomic
+  on one filesystem, so the final name's existence is a completion record already.
+
+step_state.py exposes that as prepare_step/promote_step, and the two segment aggregation steps now
+  use it instead of writing straight to their output directory and probing for artifacts.
+  _step_complete in the hessian pipeline used a bare Path.exists(); it now clears an interrupted
+  .part and re-runs.
+
+A resumed run therefore skips completed steps and restarts interrupted ones, and overwrite forces
+  everything.
+
+The covariance worker's inner "skip summing if total_processed.pt exists" check is dropped: a
+  partial directory is always cleared before the step re-runs, so it described a mid-step resume
+  this design does not support.
+
+---------
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+
 ## v0.21.0 (2026-08-03)
 
 ### Documentation
