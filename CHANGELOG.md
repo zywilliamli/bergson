@@ -1,6 +1,23 @@
 # CHANGELOG
 
 
+## v0.22.0 (2026-08-03)
+
+### Features
+
+- **magic**: Replicate WikiText MAGIC at the paper's eps_root 1e-8
+  ([#394](https://github.com/EleutherAI/bergson/pull/394),
+  [`cc649d7`](https://github.com/EleutherAI/bergson/commit/cc649d754843bf3cd83f9feef44a2116e99161c0))
+
+Switch the GPT-2/WikiText MAGIC replication from the eps_root 1e-6 / bs64 stand-in to the paper's
+  damping (eps_root 1e-8) with the batch size recovered by our sweep. At eps_root 1e-8, per-query
+  MAGIC LDS rises from ~0.17 at bs64 to 0.95 at bs256 (num_epochs fixed at 4, so the data is
+  identical -- it is the larger batch, not more training). N=100 leave-1%-out bank; m=50 per-query
+  evaluation.
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+
 ## v0.21.2 (2026-08-03)
 
 ### Bug Fixes
