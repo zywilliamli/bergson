@@ -1,6 +1,31 @@
 # CHANGELOG
 
 
+## v0.21.0 (2026-08-03)
+
+### Documentation
+
+- 5-seed replication ground truth; validate averages over retrain runs
+  ([#385](https://github.com/EleutherAI/bergson/pull/385),
+  [`12966d2`](https://github.com/EleutherAI/bergson/commit/12966d296f5c517df279801b4432874a961e50a0))
+
+validate gains a subsets path to reuse a prior draw, retrained_dir accepts a list whose query losses
+  are averaged (Eq. 8's expectation over training randomness), and the retrain config runs seeds
+  1004-1008. Adds the LDS table to the README.
+
+### Features
+
+- Save_models on every training command; one name for token attribution
+  ([#387](https://github.com/EleutherAI/bergson/pull/387),
+  [`e429cfc`](https://github.com/EleutherAI/bergson/commit/e429cfc0ca2d03e50c9693c4d9761e7b0d0967eb))
+
+save_models moves to TrainingConfig: train, magic, and metasmoothness save the trained (unperturbed)
+  model to <run_path>/model; validate keeps the leave-k-out family at retrained/{base,subset_<i>}.
+  MagicConfig.per_token becomes attribute_tokens, the name the rest of the codebase uses for the
+  same toggle. Subclass-only fields are read behind isinstance instead of getattr-with-default,
+  which silently returned the default after renames.
+
+
 ## v0.20.0 (2026-08-03)
 
 ### Documentation
