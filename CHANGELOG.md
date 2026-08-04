@@ -1,6 +1,46 @@
 # CHANGELOG
 
 
+## v0.24.0 (2026-08-04)
+
+### Features
+
+- Add per-query MAGIC scoring (query_method="none")
+  ([#401](https://github.com/EleutherAI/bergson/pull/401),
+  [`3053ade`](https://github.com/EleutherAI/bergson/commit/3053adea586e1d969824c78e5db02d132538ec20))
+
+* Add per-query MAGIC scoring (query_method="none")
+
+MAGIC previously reduced the query set to one gradient before the backward (query_method mean/sum),
+  yielding a single aggregate-query score. Aggregate-query LDS over a handful of subsets is noisy
+  and not comparable to the per-query LDS the rest of the pipeline reports, so per-query is the
+  right unit — but it was not available for MAGIC (EK-FAC already had query_aggregation="none").
+
+Add query_method="none": one backward per query, sharing a single forward, into a [num_train_docs,
+  num_query_docs] score matrix that the existing multi_query validate path consumes. Because the
+  backward is linear in the query cotangent the result is exact; per-query scores are written
+  incrementally to per_query/q{i}.pt (a crash or preemption only loses the in-flight query, and a
+  rerun skips finished ones), the final state is restored before each query since the backward walks
+  it back down the trajectory, and per-query GPU state copies and the backward's temp checkpoints
+  are freed each iteration (an unbounded loop otherwise OOMs).
+
+Tests (CPU): the mean over queries of the per-query scores reproduces the aggregate-query score to
+  1e-6 (equal-length queries), and per-query files are written incrementally.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+* Default query_method to none; single-query distributed tests
+
+Aggregate query_method over a 512-doc query set would run one backward per query in the distributed
+  tests; point them at a single query doc instead. Per-query iterates dataset rows, so it assumes
+  one chunk per query doc: multi-chunk docs score only their first chunk, and num_query_docs > chunk
+  count scatters out of range.
+
+---------
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+
 ## v0.23.1 (2026-08-04)
 
 ### Bug Fixes
