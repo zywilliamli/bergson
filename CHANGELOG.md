@@ -1,6 +1,31 @@
 # CHANGELOG
 
 
+## v0.24.1 (2026-08-04)
+
+### Bug Fixes
+
+- **magic**: Bound double-backward memory with double_backward_batch_size
+  ([#402](https://github.com/EleutherAI/bergson/pull/402),
+  [`d1d625c`](https://github.com/EleutherAI/bergson/commit/d1d625c1c4b953b390f38ef225487812c2cf10fa))
+
+Stage B of microbatch_step_vjp rebuilds each micro-batch's gradient graph with create_graph=True,
+  and the CE double backward keeps ~11 vocab-sized tensors alive per graph (~36 GiB for 16 GPT-2
+  sequences of 1024 tokens), OOMing at the first replayed step regardless of how references are
+  freed.
+
+Re-split micro-batches down to double_backward_batch_size sequences for Stage B only. The batch
+  gradient is a weighted sum over sequences, so any partition is exact; under dropout the flag is
+  ignored because the replay must reuse the forward's micro-batches to draw the same masks. Stage 0
+  keeps the forward's split either way.
+
+Also thread grad_accum_steps into the per-query backward, which silently fell back to the
+  single-shot traced step.
+
+gpt2_wikitext_tiny.yaml (bs 64, ga 4, double_backward_batch_size 4): 48.5 -> 26.4 GiB peak, ~5%
+  slower backward; scores match the unsplit path to fp32 associativity.
+
+
 ## v0.24.0 (2026-08-04)
 
 ### Features
