@@ -1,6 +1,36 @@
 # CHANGELOG
 
 
+## v0.24.2 (2026-08-04)
+
+### Bug Fixes
+
+- **magic**: Pass grad_accum_steps to per-query query gradients
+  ([#403](https://github.com/EleutherAI/bergson/pull/403),
+  [`1b7cf60`](https://github.com/EleutherAI/bergson/commit/1b7cf60bf9dfd95b9272712f451616ec8bac80d3))
+
+* fix(magic): pass grad_accum_steps to per-query query gradients
+
+compute_per_query_magic_scores forwarded each padded query batch as a single micro-batch, so
+  batch_size x seq_len logits OOMed at GPT-2 scale. The aggregate pass already splits by
+  grad_accum_steps; results are exact either way since accumulate_grads rescales micro-batches by
+  token count.
+
+* fix(magic): score only real query docs, not batch padding
+
+pad_dataset_to_batch_size returns the padded length as num_docs when the query set has no doc_ids
+  column, so compute_per_query_magic_scores ran one trajectory backward per pad row (batch_size
+  backwards for a single query) and produced duplicate score columns that validate_scores then
+  rejects.
+
+* fix(magic): await in-flight async checkpoint save when training crashes
+
+An exception escaping the training loop left the DCP async_save writer thread running; an in-process
+  resume() then raced its rmtree cleanup of the incomplete checkpoint against that writer (OSError:
+  Directory not empty). Surfaced as test_magic_resume_preserves_checkpoint_schedule flaking under
+  pytest -n 8.
+
+
 ## v0.24.1 (2026-08-04)
 
 ### Bug Fixes
