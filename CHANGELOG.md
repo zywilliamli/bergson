@@ -1,6 +1,45 @@
 # CHANGELOG
 
 
+## v0.23.1 (2026-08-04)
+
+### Bug Fixes
+
+- **magic**: Oom with grad accumulation at large batch size
+  ([#400](https://github.com/EleutherAI/bergson/pull/400),
+  [`2a7022f`](https://github.com/EleutherAI/bergson/commit/2a7022ff6a5f79dc1ef303b8956da3532d360615))
+
+The query-gradient pass always ran a full batch_size forward/backward, ignoring grad_accum_steps;
+  micro-batch it with accumulate_grads.
+
+Free Stage A's traced update graph and gradient copies before Stage B's per-micro-batch double
+  backward in microbatch_step_vjp, restoring memory parity with the single-shot traced step.
+
+- **magic**: Preserve fp64 logits in the loss
+  ([#399](https://github.com/EleutherAI/bergson/pull/399),
+  [`e95e478`](https://github.com/EleutherAI/bergson/commit/e95e4785485da8a909268f14960d05cf2d76e0f4))
+
+* fix(magic): preserve fp64 logits in the loss
+
+weighted_causal_lm_ce did `logits.float()` unconditionally, silently downcasting fp64 logits to fp32
+  and capping the precision of an fp64 metagradient run. At eps_root=1e-8 (ill-conditioned,
+  per-example scores ~1e4) an fp64 run with the fp32 loss leaves a ~1.3% ga1-vs-ga2 metagradient
+  scale residual (forward divergence 2.9e-5); keeping fp64 in the loss closes it (scale 1.000,
+  forward 9.7e-10). fp16/bf16 still promote to fp32 for cross-entropy stability.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+* [pre-commit.ci] auto fixes from pre-commit.com hooks
+
+for more information, see https://pre-commit.ci
+
+---------
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+Co-authored-by: pre-commit-ci[bot] <66853113+pre-commit-ci[bot]@users.noreply.github.com>
+
+
 ## v0.23.0 (2026-08-04)
 
 ### Features
