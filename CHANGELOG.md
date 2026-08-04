@@ -1,6 +1,41 @@
 # CHANGELOG
 
 
+## v0.23.0 (2026-08-04)
+
+### Features
+
+- **magic**: Add fp64 precision for ill-conditioned metagradients
+  ([#398](https://github.com/EleutherAI/bergson/pull/398),
+  [`a153f7f`](https://github.com/EleutherAI/bergson/commit/a153f7f86193afa7745bcfbcac08d1028054a9f1))
+
+* feat(magic): add fp64 precision for ill-conditioned metagradients
+
+At eps_root=1e-8 the MAGIC metagradient is severely ill-conditioned (per-example scores reach ~1e4).
+  In fp32, grad_accum's micro-batch summation-order difference (fp non-associativity) is amplified
+  chaotically by that ill-conditioning: over 288 steps the ga=1 vs ga=2 trained models diverge ~1.6%
+  and their metagradients differ by a ~0.77 scale (rank-preserving, so LDS is unaffected, but
+  magnitudes are not comparable across grad_accum). fp64 collapses it -- forward divergence 1.6e-2
+  -> 1e-9, metagradient scale 0.77 -> 1.000 -- confirming the effect is finite-precision, not an
+  algorithmic difference between the grad_accum paths.
+
+- precision: add "fp64" (config Literal + worker_utils model-load match; the
+  convert_precision_to_torch converter already handled it) - tests: ga=1 vs ga>1 weight_grads must
+  match (guards microbatch_step_vjp's weight-gradient path, previously untested), fp32 and fp64 arms
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+* [pre-commit.ci] auto fixes from pre-commit.com hooks
+
+for more information, see https://pre-commit.ci
+
+---------
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+Co-authored-by: pre-commit-ci[bot] <66853113+pre-commit-ci[bot]@users.noreply.github.com>
+
+
 ## v0.22.1 (2026-08-04)
 
 ### Bug Fixes
