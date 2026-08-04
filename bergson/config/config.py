@@ -457,6 +457,15 @@ class ValidationConfig(TrainingConfig, ABC):
     subset_strategy: Literal["random"] = "random"
     """Strategy for selecting leave-k-out subsets for validation."""
 
+    subset_weight: float = 0.0
+    """Training weight assigned to each subset's documents during the retrain
+    (the rest stay at 1.0). ``0.0`` (default) is standard leave-k-out removal."""
+
+    weight_lrs: list[float] = field(default_factory=list)
+    """Gradient step on the data weights: for each lr, retrain once with doc
+    weights ``1 - lr * score`` (mean over query columns) instead of leave-k-out
+    subsets, and compare the query loss change to its first-order prediction."""
+
     exclude_zero_scores: bool = False
     """When True, drop doc_ids with score == 0 from the validation
     permutation. These scores may be produced by items with fewer than
