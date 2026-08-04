@@ -440,8 +440,9 @@ class ValidationConfig(TrainingConfig, ABC):
     """Query/eval dataset for computing attribution target gradients.
     If not specified, defaults to the training dataset."""
 
-    query_method: Literal["mean", "sum"] = "mean"
-    """Method for reducing query gradients across batches."""
+    query_method: Literal["mean", "sum", "none"] = "none"
+    """How query gradients are combined before the MAGIC backward.
+    ``none`` will perform one backward per query."""
 
     num_subsets: int = 100
     """Number of leave-k-out subsets for Spearman correlation."""
