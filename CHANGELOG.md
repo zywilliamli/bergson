@@ -1,6 +1,31 @@
 # CHANGELOG
 
 
+## v0.22.1 (2026-08-04)
+
+### Bug Fixes
+
+- Metasmoothness worker no longer re-expands epochs
+  ([#397](https://github.com/EleutherAI/bergson/pull/397),
+  [`10be667`](https://github.com/EleutherAI/bergson/commit/10be66785660f2515dbaaa27f3a449c9e2e7be01))
+
+#393 moved epoch expansion into run_metasmoothness (shuffled_epochs builds num_epochs independently
+  shuffled copies) but left the worker's train_dataset.repeat(num_epochs). Since training length is
+  len(dataset) // batch_size, the worker then trained num_epochs**2 epochs (e.g. 250 steps instead
+  of 125 for a 2-epoch 4k/bs64 config), so measured metasmoothness no longer matched the config it
+  claimed to measure.
+
+Drop the redundant repeat and add a worker-level regression test asserting the training stream is
+  built from exactly num_epochs*N docs.
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+### Documentation
+
+- Five-seed replication LDS results ([#395](https://github.com/EleutherAI/bergson/pull/395),
+  [`b402f91`](https://github.com/EleutherAI/bergson/commit/b402f91d39e76ad9c84e0b79569e42aba27e1dc3))
+
+
 ## v0.22.0 (2026-08-03)
 
 ### Features
