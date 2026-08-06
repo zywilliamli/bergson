@@ -1,6 +1,38 @@
 # CHANGELOG
 
 
+## v0.24.5 (2026-08-06)
+
+### Bug Fixes
+
+- **magic**: Let worker() run on CPU-only machines
+  ([#411](https://github.com/EleutherAI/bergson/pull/411),
+  [`513954f`](https://github.com/EleutherAI/bergson/commit/513954f250fc62aad26c55800f844f2aee2f6c0f))
+
+worker() called torch.cuda.set_device() unconditionally as its first statement, so any CPU-only
+  machine died with
+
+AttributeError: module 'torch._C' has no attribute '_cuda_setDevice'
+
+before a single line of work ran. Every other device lookup in the file already degrades gracefully
+  — get_device() returns "cpu" when CUDA is unavailable — so this one call was the sole blocker.
+
+Guarding it makes `bergson magic` run end to end on CPU for small models, which matters for two
+  reasons: contributors without a GPU can exercise the CLI, and the MAGIC output-file behaviour
+  becomes testable in CI without a GPU runner (the existing tests reimplement worker()'s logic
+  rather than calling it, so they cannot catch regressions in what it writes to disk).
+
+Verified by running a full per-token attribution on CPU:
+
+bergson magic <run> --data.dataset NeelNanda/pile-10k \ --data.split "train[:16]"
+  --data.chunk_length 64 \ --model EleutherAI/pythia-14m --batch_size 4 \ --attribute_tokens true
+  --query_method mean --skip_validation true
+
+which trains, backprops through the trajectory, and saves scores.pt.
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+
 ## v0.24.4 (2026-08-06)
 
 ### Bug Fixes
