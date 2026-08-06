@@ -1,6 +1,137 @@
 # CHANGELOG
 
 
+## v0.25.0 (2026-08-06)
+
+### Features
+
+- **magic**: Per-token per-query MAGIC, and score-format cleanups
+  ([#415](https://github.com/EleutherAI/bergson/pull/415),
+  [`b333a20`](https://github.com/EleutherAI/bergson/commit/b333a20b25db4877b947306146211ec797228c15))
+
+* feat(magic): support per-token per-query MAGIC
+
+attribute_tokens=True with query_method="none" produced an unusable score tensor. Per-token weights
+  are [rows, seq_len] and the per-query stack used dim=1, giving [rows, num_queries, seq_len] —
+  query axis in the middle, which nothing downstream reads. validate_scores takes shape[-1] as the
+  query count, so it compared seq_len against the query document count and died naming the wrong
+  dimension:
+
+ValueError: scores has 8 query columns but the query dataset has 2 documents
+
+on a run with 2 queries and seq_len 8.
+
+Stack on dim=-1 instead. The query axis then comes last in both modes — [rows, num_queries] per-doc,
+  [rows, seq_len, num_queries] per-token — matching the layout Scores.to_grid already produces for
+  multi-query token score directories, which load_attribution_scores already flags multi_query.
+  validate_scores needed no change: shape[-1] is the query count and reshape(-1, num_queries)
+  flattens the leading axes into leave-out units, documents or token positions as appropriate.
+  dim=-1 is identical to dim=1 for 1-D inputs, so per-doc per-query scores are unchanged.
+
+Fix the padding trim in the same path, which applied weight_pad_count regardless of rank while the
+  main scoring path picks by rank. The two differ once doc_ids are present (pad rows route to one
+  synthetic doc id), so a 5-doc dataset at batch_size 4 kept 7 of its 8 padded rows instead of
+  trimming to 5, leaving pad rows in the saved scores.
+
+Teach both .pt classifiers about 3-D: scores_are_per_token so a reloaded run sizes its weights
+  per-token, and _pt_scores_are_per_query so it is recognised as multi-query. 3-D needs no config
+  lookup to disambiguate, unlike 2-D.
+
+The aggregation test is the numerical gate: per-token per-query scores summed over each document's
+  tokens reproduce the per-doc per-query run. Both new end-to-end tests fail on the parent commit
+  with shape (7, 2, 8) against the expected (5, 8, 2) — wrong axis order and untrimmed padding
+  together.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+* refactor(magic): decide score format from the config, not the shape
+
+Score layout was inferred from tensor rank in several places, which is guesswork: a 2-D .pt is
+  [docs, seq_len] or [docs, queries] depending only on how the run was configured. #407 established
+  the fix for one of those call sites — read the config.yaml that save_run_config writes next to
+  scores.pt — but scores_are_per_token was left sniffing shapes, and the parsing lived inline rather
+  than beside the other config readers.
+
+Add read_first_step_config to config_io, next to read_config and load_subconfig, and route both
+  classifiers through it. The flags say everything the rank could:
+
+query_method attribute_tokens layout none yes [docs, seq_len, queries] none no [docs, queries]
+  mean/sum yes [docs, seq_len] mean/sum no [docs]
+
+so a run is per-query iff query_method is none, whatever rank results, and per-token iff
+  attribute_tokens is set. Neither needs the shape. Score directories keep reading info.json, and
+  load_attribution_scores now takes the query count from the store's num_scores rather than
+  re-deriving it from the grid it just built.
+
+Shape survives in exactly one place: a .pt with no config beside it, where nothing else is knowable
+  and only rank 3 is unambiguous.
+
+cfg_attributes_tokens reads attribute_tokens with the deprecated per_token as an alias, in one
+  place, so a run written with the current field name is no longer missed.
+
+test_load_attribution_scores_pt_per_query asserted that a 2-D tensor whose config said query_method:
+  none and per_token: true was single-query. No run produces that pair — attributing tokens per
+  query yields rank 3 — so the case was describing an unreachable artifact and pinning the
+  shape-derived answer for it. Repointed at the 3-D tensor such a run does produce.
+
+Drop six tests that asserted torch's own view()/reshape() indexing semantics. They called no bergson
+  code, so they could not fail unless PyTorch itself changed, and the behaviour they stood in for is
+  covered end to end by the per-query aggregation test.
+
+* refactor(score): stop duplicating the token score store format
+
+save_sequence_scores delegates to MemmapSequenceScoreWriter, but its token counterpart reimplemented
+  MemmapTokenScoreWriter inline: the memmap creation, offsets.npy, and an info.json payload
+  identical field for field. So the on-disk token score format was written from two places that had
+  to be kept in step by hand.
+
+That matters more now that scores_are_per_token reads info.json["attribute_tokens"] as
+  authoritative: a drift between the two writers stops being a cosmetic inconsistency and becomes a
+  misclassification.
+
+Delegating needs the writer to accept what it actually uses. It only ever took a Dataset to call
+  compute_num_token_grads on it, while save_token_scores already holds the offsets those counts came
+  from, so __init__ now takes num_token_grads and a from_dataset classmethod covers the callers that
+  hold a dataset.
+
+Also gives the token writer the overwrite flag its sequence twin already had, which delegation
+  needs: save_token_scores wrote with mode="w+" unconditionally, and without overwrite the writer
+  would silently reuse a stale scores.bin instead of replacing it.
+
+Net 19 lines out of score_writer.py, and one place left that knows the format.
+
+* refactor(score): drop .npy attribution score support
+
+bergson never writes a .npy score file — every writer emits a score directory — so .npy was an
+  ingest-only path for arrays produced outside the scoring pipeline, and nothing in the repo feeds
+  one: no config sets scores: to a .npy, and the examples that save scores.npy read it straight back
+  with np.load rather than through load_attribution_scores.
+
+Remove the branch from load_attribution_scores, scores_are_per_token and worker's score-path
+  dispatch, and with it ArrayScores, which existed only to give a bare array the Scores interface.
+
+It also carried its own rules. A .npy could not have a score_cfg, so it alone skipped the
+  higher_is_better negation and had to be supplied in the loss-diff convention already; and it was
+  the one input whose multi-query flag came from a raw column count. Score directories record
+  num_scores in info.json, so the surviving formats all describe themselves.
+
+The bank-loss-cache tests used .npy as a convenient way to hand a score matrix to
+  evaluate_retrained. They now write a score directory via save_sequence_scores, which is what a
+  caller would reach for, and the multi_query parametrization still passes both ways.
+
+* refactor(magic): inline the per-token config lookup
+
+cfg_attributes_tokens had one caller left once _pt_scores_are_per_query was inlined, and reaching
+  across from magic.cli into validate for a two key dict lookup bought nothing.
+
+Drop the scores_are_per_token docstring with it: the branches say what they read, and the function
+  had none before this PR.
+
+---------
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+
 ## v0.24.6 (2026-08-06)
 
 ### Bug Fixes
