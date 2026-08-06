@@ -1,6 +1,18 @@
 # CHANGELOG
 
 
+## v0.24.4 (2026-08-06)
+
+### Bug Fixes
+
+- **metasmoothness**: Forward grad_accum_steps and max_grad_norm to train
+  ([#410](https://github.com/EleutherAI/bergson/pull/410),
+  [`c059b63`](https://github.com/EleutherAI/bergson/commit/c059b6377cf56541eca54d7c0bcc5b24758c02b8))
+
+The worker's trainer.train call dropped both, so each rank ran its full batch in one graph (OOM at
+  1024-ctx batch 256 on 48GB GPUs) and ignored clipping the MAGIC trajectory would apply.
+
+
 ## v0.24.3 (2026-08-06)
 
 ### Bug Fixes
