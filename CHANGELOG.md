@@ -1,6 +1,54 @@
 # CHANGELOG
 
 
+## v0.24.6 (2026-08-06)
+
+### Bug Fixes
+
+- **magic**: Write doc_ids.pt on fresh per-token runs
+  ([#412](https://github.com/EleutherAI/bergson/pull/412),
+  [`80d72ba`](https://github.com/EleutherAI/bergson/commit/80d72bae9168ac9d6cd54e44f43f7e131612921b))
+
+doc_ids.pt lets downstream code turn per-token scores into per-doc scores with one scatter_add,
+  without replaying the shuffle seed or re-tokenizing the raw dataset. 25936cf7 added it directly
+  after the torch.save(scores) in worker()'s compute path; a later refactor turned that region into
+  an if/elif chain over score_path and the save came to rest in the trailing else — the branch that
+  only runs when scores are LOADED from an existing .pt. Walking the chain as it stands:
+
+if not score_path and query_method == 'none' doc_ids.pt: no elif not score_path doc_ids.pt: no elif
+  isdir(score_path) or endswith('.npy') doc_ids.pt: no else (load existing .pt) doc_ids.pt: yes
+
+So `bergson magic --attribute_tokens true` — the case the file exists for — never wrote it, while
+  `bergson validate --scores foo.pt` did. Confirmed end to end: a per-token run produced scores.pt
+  of shape (148, 64) and no doc_ids.pt.
+
+Hoist the save out of the branch chain to a single call site keyed on per_token, the flag the run
+  already computed to size the weight tensor. Sitting inside the chain is what let the save drift
+  away from the path it belonged to; there is now one place to look and no per-branch condition to
+  keep in sync.
+
+per_token is the whole condition. doc_ids maps the [docs, seq_len] training weight axes back to
+  documents, so it applies to any per-token scores no matter what else the tensor carries — a query
+  axis rides alongside without changing what doc_ids means. Scores.to_grid() already produces
+  exactly that layout, [docs, seq_len, num_scores], for multi-query token score directories, so
+  conditioning on the score tensor's rank (or excluding multi_query) would suppress doc_ids in the
+  case that needs it most and would need revisiting the moment per-token multi-query MAGIC lands.
+
+Two incidental corrections fall out: the save is now rank-0 only (every rank previously raced to
+  write the same path), and a loaded (n, 1) column vector no longer produces a doc_ids.pt, since
+  such scores are per-doc and the mapping is meaningless.
+
+The existing tests could not catch this: _run_magic_cli reimplements worker()'s
+  pad/train/backward/trim sequence rather than calling it, so nothing asserted on worker()'s actual
+  output directory. The new test calls worker() and checks the files on disk. It fails on the parent
+  commit with "wrote scores.pt but no doc_ids.pt" and passes here.
+
+Scores are byte-identical before and after (baseline loss 3.709878112140455 either way); this only
+  adds the companion file.
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+
 ## v0.24.5 (2026-08-06)
 
 ### Bug Fixes
