@@ -2,9 +2,10 @@ import torch
 import torch.nn.functional as F
 from datasets import Dataset
 
+from bergson.data import load_scores_loss_signed
 from bergson.magic.data_stream import DataStream
 from bergson.score.score_writer import MemmapSequenceScoreWriter
-from bergson.validate import load_attribution_scores, per_doc_query_losses
+from bergson.validate import per_doc_query_losses
 
 
 def test_per_doc_query_losses_matches_hf_loss(model):
@@ -47,36 +48,28 @@ def test_per_doc_query_losses_packed_rows(model):
         torch.testing.assert_close(losses[d], expected, rtol=1e-4, atol=1e-5)
 
 
-def test_load_attribution_scores_score_dir(tmp_path):
+def test_load_scores_loss_signed_score_dir(tmp_path):
     """Score dirs load all query columns and flag multi-query."""
     writer = MemmapSequenceScoreWriter(tmp_path, num_items=6, num_scores=3)
     values = torch.arange(18, dtype=torch.float32).reshape(6, 3)
     writer(list(range(6)), values)
     writer.flush()
 
-    scores, multi_query = load_attribution_scores(str(tmp_path))
+    scores, multi_query = load_scores_loss_signed(str(tmp_path))
     assert multi_query
     assert scores.shape == (6, 3)
     # No score_cfg saved, so no higher_is_better negation is applied.
     torch.testing.assert_close(scores, values)
 
 
-def test_load_attribution_scores_single_column_dir(tmp_path):
+def test_load_scores_loss_signed_single_column_dir(tmp_path):
     writer = MemmapSequenceScoreWriter(tmp_path, num_items=4, num_scores=1)
     writer(list(range(4)), torch.ones(4, 1))
     writer.flush()
 
-    scores, multi_query = load_attribution_scores(str(tmp_path))
+    scores, multi_query = load_scores_loss_signed(str(tmp_path))
     assert not multi_query
     assert scores.shape == (4, 1)
-
-
-def test_load_attribution_scores_pt_without_config(tmp_path):
-    # 2D tensors in .pt files are per-token MAGIC scores, never multi-query.
-    pt_path = tmp_path / "scores.pt"
-    torch.save(torch.zeros(5, 2), pt_path)
-    scores, multi_query = load_attribution_scores(str(pt_path))
-    assert not multi_query
 
 
 def test_weighted_ce_sum_of_means_reduction():
@@ -148,33 +141,28 @@ def test_metasmoothness_score():
     assert metasmoothness_score(theta0, theta0, theta0) == 1.0
 
 
-def test_load_attribution_scores_pt_per_query(tmp_path):
-    """A per-query [docs, queries] scores.pt is flagged multi-query when the
-    run config beside it says query_method: none; per-token and configless
-    tensors stay single-query."""
+def test_load_scores_loss_signed_legacy_pt(tmp_path):
+    """Runs that predate score directories still load from ``scores.pt``. A
+    2-D tensor is per-token unless the run config beside it says the run was
+    per-query; a 3-D tensor is unambiguous.
+
+    TODO: Lucia Quirke remove December 2026
+    """
     import yaml
 
-    values = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-    torch.save(values, tmp_path / "scores.pt")
+    per_token = torch.randn(6, 5)
+    torch.save(per_token, tmp_path / "scores.pt")
 
-    # No config.yaml: ambiguous, keep the per-token interpretation.
-    _, multi_query = load_attribution_scores(str(tmp_path / "scores.pt"))
+    scores, multi_query = load_scores_loss_signed(str(tmp_path / "scores.pt"))
     assert not multi_query
+    torch.testing.assert_close(scores, per_token)
 
-    cfg = {"steps": [{"magic": {"query_method": "none", "per_token": False}}]}
+    cfg = {"steps": [{"magic": {"query_method": "none"}}]}
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
-    scores, multi_query = load_attribution_scores(str(tmp_path / "scores.pt"))
-    assert multi_query
-    torch.testing.assert_close(scores, values)
-
-    # Attributing tokens as well makes it 3-D, and still per-query.
-    cfg = {"steps": [{"magic": {"query_method": "none", "attribute_tokens": True}}]}
-    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
-    torch.save(torch.zeros(4, 3, 2), tmp_path / "tok.pt")
-    _, multi_query = load_attribution_scores(str(tmp_path / "tok.pt"))
+    _, multi_query = load_scores_loss_signed(str(tmp_path / "scores.pt"))
     assert multi_query
 
-    cfg = {"steps": [{"magic": {"query_method": "mean"}}]}
-    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
-    _, multi_query = load_attribution_scores(str(tmp_path / "scores.pt"))
-    assert not multi_query
+    torch.save(torch.randn(4, 6, 3), tmp_path / "tok.pt")
+    scores, multi_query = load_scores_loss_signed(str(tmp_path / "tok.pt"))
+    assert multi_query
+    assert scores.shape == (4, 6, 3)

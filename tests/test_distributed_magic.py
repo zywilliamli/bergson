@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from bergson.config import DataConfig, DistributedConfig, LRScheduleConfig
+from bergson.data import load_scores_loss_signed
 from bergson.magic.cli import MagicConfig, run_magic
 
 # Both tests consume the module-scoped noclip_scores fixture, so they must run
@@ -81,7 +82,7 @@ def noclip_scores(tmp_path_factory) -> dict[str, torch.Tensor]:
     scores = {}
     for mode, fsdp in [("ddp", False), ("fsdp", True)]:
         run_magic(magic_cfg(f"{tmpdir}/{mode}", fsdp=fsdp, clip=False))
-        scores[mode] = torch.load(f"{tmpdir}/{mode}/scores.pt", weights_only=True)
+        scores[mode] = load_scores_loss_signed(f"{tmpdir}/{mode}/scores")[0]
     return scores
 
 
@@ -130,8 +131,8 @@ def test_fsdp_ddp_scores_match_with_grad_clipping(noclip_scores, tmp_path):
     run_magic(magic_cfg(f"{tmp_path}/ddp", fsdp=False, clip=True))
     run_magic(magic_cfg(f"{tmp_path}/fsdp", fsdp=True, clip=True))
 
-    ddp_scores = torch.load(f"{tmp_path}/ddp/scores.pt", weights_only=True)
-    fsdp_scores = torch.load(f"{tmp_path}/fsdp/scores.pt", weights_only=True)
+    ddp_scores = load_scores_loss_signed(f"{tmp_path}/ddp/scores")[0]
+    fsdp_scores = load_scores_loss_signed(f"{tmp_path}/fsdp/scores")[0]
 
     assert fsdp_scores.shape == ddp_scores.shape
 
@@ -167,8 +168,8 @@ def test_grad_accum_matches_full_batch(noclip_scores, tmp_path):
     run_magic(magic_cfg(f"{tmp_path}/ddp", fsdp=False, clip=False, grad_accum=2))
     run_magic(magic_cfg(f"{tmp_path}/fsdp", fsdp=True, clip=False, grad_accum=2))
 
-    ddp_scores = torch.load(f"{tmp_path}/ddp/scores.pt", weights_only=True)
-    fsdp_scores = torch.load(f"{tmp_path}/fsdp/scores.pt", weights_only=True)
+    ddp_scores = load_scores_loss_signed(f"{tmp_path}/ddp/scores")[0]
+    fsdp_scores = load_scores_loss_signed(f"{tmp_path}/fsdp/scores")[0]
 
     assert fsdp_scores.shape == ddp_noclip.shape
 
@@ -226,7 +227,7 @@ def test_grad_accum_matches_across_fsdp_ddp_under_dropout(tmp_path):
                 lr=1e-5,
             )
         )
-        return torch.load(f"{path}/scores.pt", weights_only=True)
+        return load_scores_loss_signed(f"{path}/scores")[0]
 
     ddp1 = run("ddp1", fsdp=False, grad_accum=1)
     ddp2 = run("ddp2", fsdp=False, grad_accum=2)
