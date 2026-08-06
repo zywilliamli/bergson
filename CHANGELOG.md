@@ -1,6 +1,44 @@
 # CHANGELOG
 
 
+## v0.24.3 (2026-08-06)
+
+### Bug Fixes
+
+- **trainer**: Forward save_interval when fast-forwarding resume schedule
+  ([#409](https://github.com/EleutherAI/bergson/pull/409),
+  [`eee6d3e`](https://github.com/EleutherAI/bergson/commit/eee6d3ef2fdfdcf1e3856a400da70bf36b13eb35))
+
+The resume branch's schedule fast-forward called next_save_index without save_interval, so resuming
+  any save_mode='interval' run raised "save_mode='interval' requires save_interval > 0".
+
+- **validate**: Detect per-query .pt scores via the run config
+  ([#407](https://github.com/EleutherAI/bergson/pull/407),
+  [`94a1b8a`](https://github.com/EleutherAI/bergson/commit/94a1b8a62aa25cb07c4dfd5b1316643990ffe1f9))
+
+A 2-D scores.pt is [docs, seq_len] for per-token runs but [docs, queries] for query_method: none,
+  and load_attribution_scores always chose the per-token reading, so evaluate_retrained rejected
+  per-query MAGIC scores with 'expects per-doc (1D) scores'. Disambiguate with the config.yaml
+  written next to scores.pt.
+
+### Documentation
+
+- **magic**: Record the WikiText MAGIC LDS in gpt2_wikitext.yaml
+  ([#406](https://github.com/EleutherAI/bergson/pull/406),
+  [`eeb6cc5`](https://github.com/EleutherAI/bergson/commit/eeb6cc595c12e97ae7caf23198bd256c0dc31e09))
+
+Per-query MAGIC LDS = 0.952 (95% CI [0.944, 0.959]), m=50 queries against an N=100 leave-1%-out
+  retrain bank, for this config's eps_root=1e-8 / bs256 recipe.
+
+Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+### Testing
+
+- Per-query MAGIC scores only real queries when query set is padded
+  ([#405](https://github.com/EleutherAI/bergson/pull/405),
+  [`ba22bc0`](https://github.com/EleutherAI/bergson/commit/ba22bc0b334e7f1d6294fbcfd3dd8e99cecc3c1b))
+
+
 ## v0.24.2 (2026-08-04)
 
 ### Bug Fixes
