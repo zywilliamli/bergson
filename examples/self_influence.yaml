@@ -27,7 +27,8 @@
 run_path: runs/self_influence
 steps:
   # Step 1/2: build the gradient index that doubles as the query set.
-  # Gradients are random-projected to `projection_dim` dims per module, which
+  # Each module's gradient is randomly projected to projection_dim x
+  # projection_dim (48 tracked modules here, so 49,152 dims per example), which
   # makes the scores JL estimates of the true inner products: raise it for
   # fidelity, lower it for speed and disk. The projection is seeded from each
   # module's name, so step 2 reproduces it as long as the projection settings
