@@ -63,7 +63,7 @@ Load the gradients:
    :maxdepth: 2
    :caption: Pipeline & Tools
 
-   pipeline
+   building_blocks
    gradient-collection
    preprocessing
    training
