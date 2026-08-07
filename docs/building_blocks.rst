@@ -1,8 +1,8 @@
 Building Blocks
 ===============
 
-Bergson's exposes generic building blocks like ``build``, ``score`` and ``hessian`` that can be used to
-produce diverse attribution pipelines. This page explains several basic commands and how to assemble them into multi-step pipelines.
+Bergson exposes generic building blocks like ``train``, ``build``, ``score`` and ``hessian`` that can be used to
+produce diverse attribution pipelines. This page explains some basic commands and how to assemble them into multi-step pipelines.
 
 Overview
 --------
@@ -20,6 +20,42 @@ The difference between them is **what they do with the collected gradients**:
 
 The supporting command ``hessian`` computes Hessian approximations which can be passed into score or used with a gradient store at query time (``autocorrelation`` — the gradient second-moment
  — ``kfac``, ``tkfac``, or ``shampoo``, selected with the required ``--method`` flag).
+
+Pipeline
+--------
+
+You can define a pipeline in a YAML file like so:
+
+.. code-block:: yaml
+
+   run_path: runs/minimal
+
+   steps:
+     - build:
+         index_cfg:
+           run_path: runs/minimal/query
+           model: EleutherAI/pythia-14m
+           data:
+             dataset: NeelNanda/pile-10k
+             split: "train[:64]"
+             truncation: true
+         preprocess_cfg:
+           aggregation: mean
+
+     - score:
+         score_cfg:
+           query_path: runs/minimal/query
+         index_cfg:
+           run_path: runs/minimal/scores
+           model: EleutherAI/pythia-14m
+           data:
+             dataset: NeelNanda/pile-10k
+             split: "train[:64]"
+             truncation: true
+
+Run it with ``bergson pipeline.yaml``. Each step takes the same options as its
+CLI counterpart, but grouped into config sections rather than passed as flat
+flags. A finished run can be replayed with ``bergson <run_path>/config.yaml``.
 
 .. _build-command:
 
