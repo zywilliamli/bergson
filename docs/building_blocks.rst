@@ -62,7 +62,7 @@ flags. A finished run can be replayed with ``bergson <run_path>/config.yaml``.
 ``build`` — Build a Gradient Store
 -------------------------------------------
 
-``build`` runs every example in your dataset through the model, collects a gradient for each one, and stores the resulting vectors in a memory-mapped index on disk. The index is keyed by example and supports fast nearest-neighbour search via ``bergson query``.
+``build`` runs every example in your dataset through the model, collects a gradient for each one, and stores the resulting vectors in a memory-mapped index on disk. The index is keyed by example and supports fast nearest-neighbour search via ``bergson query``. It's good for when you have enough disk space for the gradient store and want to run many serial queries.
 
 ``build`` with ``--aggregation mean`` or ``sum`` accumulates every gradient into a **single row store**, discarding the per-example gradients. This is the usual way to produce a query for ``score``.
 
@@ -160,7 +160,7 @@ After building, use ``bergson query`` to interactively search the index:
 ----------------------------------------------------------------
 
 ``score`` computes a scalar influence score for every example in a dataset by comparing
-its gradient against a set of pre-computed **query gradients** loaded from disk.
+its gradient against a set of pre-computed **query gradients** loaded from disk. It's good if a gradient store would exceed your available disk space, such as if you are not using random project to compress gradients.
 
 The query gradients were previously produced by ``build``, either per-example or
 aggregated into a single row. The scoring process in ``score`` applies preconditioning
