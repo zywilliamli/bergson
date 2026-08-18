@@ -1,6 +1,28 @@
 # CHANGELOG
 
 
+## v0.26.1 (2026-08-18)
+
+### Bug Fixes
+
+- Stray barrier in one-shot score savers deadlocks aggregate-query MAGIC
+  ([#424](https://github.com/EleutherAI/bergson/pull/424),
+  [`3d7ff2a`](https://github.com/EleutherAI/bergson/commit/3d7ff2ac2ef518a3ba6231ddefc8c6f592456c35))
+
+The memmap score writers barrier so rank 0 can create scores.bin before the other ranks open it.
+  save_sequence_scores / save_token_scores construct a writer from a single caller, e.g. rank 0
+  saving aggregate-query MAGIC scores, so that barrier is a stray collective no other rank issues:
+  another rank's cleanup barrier pairs with it, that rank exits, and rank 0 spins forever in its own
+  cleanup barrier while the peer hangs in destroy_process_group.
+
+Add a distributed flag to both writers that skips the barrier and rank gating, and set it in the
+  one-shot helpers. Callers that construct writers collectively are unchanged.
+
+Claude-Session: https://claude.ai/code/session_01Wuxoneq2RYxPbxikMKr4NT
+
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+
+
 ## v0.26.0 (2026-08-07)
 
 ### Features
