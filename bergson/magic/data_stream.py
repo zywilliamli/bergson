@@ -5,6 +5,20 @@ from datasets import Dataset
 from ..data import pad_and_tensor
 
 
+def mask_padded_rows(batch: dict) -> tuple[dict, bool]:
+    """Remove ``example_weight`` and mask out the rows it zeroes, so all ranks
+    keep the same batch width. Returns the batch and whether any row is left.
+    """
+    weight = batch.pop("example_weight", None)
+    if weight is None:
+        return batch, True
+    live = (weight != 0).reshape(len(weight), -1).any(dim=1)
+    batch["labels"] = batch["labels"].masked_fill(~live[:, None], -100)
+    if "shift_loss_mask" in batch:
+        batch["shift_loss_mask"] = batch["shift_loss_mask"] & live[:, None]
+    return batch, bool(live.any())
+
+
 def pad_dataset_to_batch_size(
     dataset: Dataset,
     batch_size: int,

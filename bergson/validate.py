@@ -32,7 +32,8 @@ from transformers.utils.logging import (
 from .config.config import ValidationConfig
 from .config.config_io import save_run_config
 from .data import load_scores_loss_signed, pad_and_tensor
-from .magic.data_stream import DataStream, pad_dataset_to_batch_size
+from .magic.data_stream import DataStream, mask_padded_rows, pad_dataset_to_batch_size
+from .magic.grad_accum import loss_denom, split_batch
 from .magic.trainer import TrainerState, prepare_trainer
 from .utils.csv_writer import CSVWriter
 from .utils.utils import get_device, simple_parse_kwargs_string
@@ -89,6 +90,7 @@ def per_doc_query_losses(
     model: torch.nn.Module,
     query_stream: DataStream,
     num_docs: int,
+    grad_accum_steps: int = 1,
 ) -> torch.Tensor:
     """Compute the mean cross-entropy loss of each query document.
 
@@ -116,29 +118,49 @@ def per_doc_query_losses(
                 rows_t = torch.tensor(rows, device=device)
                 doc_ids = rows_t[:, None].expand(-1, x.shape[1])
 
-            logits = model(input_ids=x).logits
-            shifted_labels = y[:, 1:]
-            token_loss = F.cross_entropy(
-                logits[:, :-1].flatten(0, 1).float(),
-                shifted_labels.flatten(),
-                reduction="none",
-                ignore_index=-100,
-            ).view_as(shifted_labels)
+            inputs = {"input_ids": x, "labels": y, "doc_ids": doc_ids}
+            for micro in split_batch(inputs, grad_accum_steps):
+                logits = model(input_ids=micro["input_ids"]).logits
+                shifted_labels = micro["labels"][:, 1:]
+                token_loss = F.cross_entropy(
+                    logits[:, :-1].flatten(0, 1).float(),
+                    shifted_labels.flatten(),
+                    reduction="none",
+                    ignore_index=-100,
+                ).view_as(shifted_labels)
 
-            # A token's loss belongs to the document of the *label* token, so
-            # packed rows attribute boundary positions to the following doc.
-            mask = shifted_labels != -100
-            ids = doc_ids[:, 1:][mask]
-            loss_sums.scatter_add_(0, ids, token_loss[mask])
-            token_counts.scatter_add_(
-                0, ids, torch.ones_like(ids, dtype=token_counts.dtype)
-            )
+                # A token's loss belongs to the document of the label token,
+                # so packed rows attribute boundary positions to the next doc.
+                mask = shifted_labels != -100
+                ids = micro["doc_ids"][:, 1:][mask]
+                loss_sums.scatter_add_(0, ids, token_loss[mask])
+                token_counts.scatter_add_(
+                    0, ids, torch.ones_like(ids, dtype=token_counts.dtype)
+                )
 
     if dist.is_initialized():
         dist.all_reduce(loss_sums)
         dist.all_reduce(token_counts)
 
     return loss_sums / token_counts.clamp_min(1.0)
+
+
+def mean_query_loss(
+    model: torch.nn.Module, query_stream: DataStream, grad_accum_steps: int = 1
+) -> torch.Tensor:
+    """Mean loss over the query stream's batches, reduced across ranks."""
+    total = torch.zeros((), device=query_stream.device)
+    live_batches = torch.zeros((), device=query_stream.device)
+    with torch.no_grad():
+        for batch in query_stream:
+            batch, live = mask_padded_rows(batch)
+            live_batches += float(live)
+            for micro in split_batch(batch, grad_accum_steps):
+                total += model(**micro).loss * loss_denom(micro) / loss_denom(batch)
+    if dist.is_initialized():
+        dist.all_reduce(total)
+        dist.all_reduce(live_batches)
+    return total / live_batches
 
 
 def report_multi_query_validation(
@@ -195,7 +217,6 @@ def validate_scores(
     *,
     global_rank: int,
     rank: int,
-    world_size: int,
     schedule: Callable,
     stream: DataStream,
     query_stream: DataStream,
@@ -229,7 +250,7 @@ def validate_scores(
             )
         with fwd_state.activate(model):
             baseline_per_doc = per_doc_query_losses(
-                model, query_stream, num_query_docs
+                model, query_stream, num_query_docs, run_cfg.grad_accum_steps
             )[:num_real_query_docs].cpu()
     elif scores.ndim == 2 and scores.shape[1] > 1:
         pass  # Per-token [docs, seq_len]; kept 2-D.
@@ -284,7 +305,12 @@ def validate_scores(
 
             if multi_query:
                 with fwd_state.activate(model):
-                    per_doc = per_doc_query_losses(model, query_stream, num_query_docs)
+                    per_doc = per_doc_query_losses(
+                        model,
+                        query_stream,
+                        num_query_docs,
+                        run_cfg.grad_accum_steps,
+                    )
                 diff_vec = baseline_per_doc - per_doc[:num_real_query_docs].cpu()
                 for q in range(num_real_query_docs):
                     csv_writer.writerow(
@@ -296,13 +322,10 @@ def validate_scores(
                         f"(predicted {lr * predicted.mean().item():.6f})"
                     )
             else:
-                with fwd_state.activate(model), torch.no_grad():
-                    loss = torch.tensor(0.0, device=stream.weights.device)
-                    for batch in query_stream:
-                        del batch["example_weight"]
-                        loss += model(**batch).loss.detach() / len(query_stream)
-                if world_size > 1:
-                    dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                with fwd_state.activate(model):
+                    loss = mean_query_loss(
+                        model, query_stream, run_cfg.grad_accum_steps
+                    )
                 diff = baseline - loss.item()
                 csv_writer.writerow(lr, diff, lr * predicted.mean().item())
                 if global_rank == 0:
@@ -417,7 +440,12 @@ def validate_scores(
 
         if multi_query:
             with fwd_state.activate(model):
-                per_doc = per_doc_query_losses(model, query_stream, num_query_docs)
+                per_doc = per_doc_query_losses(
+                    model,
+                    query_stream,
+                    num_query_docs,
+                    run_cfg.grad_accum_steps,
+                )
             diff_vec = baseline_per_doc - per_doc[:num_real_query_docs].cpu()
             score_sum_vec = flat_scores[subset].sum(dim=0)
             for q in range(num_real_query_docs):
@@ -442,15 +470,8 @@ def validate_scores(
                     pbar.set_postfix({"mean_rho": "n/a"})
             continue
 
-        with fwd_state.activate(model), torch.no_grad():
-            loss = torch.tensor(0.0, device=stream.weights.device)
-            for batch in query_stream:
-                del batch["example_weight"]
-
-                loss += model(**batch).loss.detach() / len(query_stream)
-
-        if world_size > 1:
-            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        with fwd_state.activate(model):
+            loss = mean_query_loss(model, query_stream, run_cfg.grad_accum_steps)
 
         diff = baseline - loss.item()
         score_sum = flat_scores[subset].sum().item()
@@ -590,19 +611,14 @@ def evaluate_retrained(
     def query_loss(model: torch.nn.Module) -> float:
         """Mean query loss for an already-loaded model."""
         model.eval()
-        total = torch.tensor(0.0, device=device)
-        with torch.no_grad():
-            for batch in query_stream:
-                del batch["example_weight"]
-                total += model(**batch).loss.detach() / len(query_stream)
-        return float(total)
+        return float(mean_query_loss(model, query_stream, run_cfg.grad_accum_steps))
 
     def query_losses_per_doc(model: torch.nn.Module) -> torch.Tensor:
         """Per-document query losses for an already-loaded model."""
         model.eval()
-        return per_doc_query_losses(model, query_stream, query_n)[
-            :num_real_query_docs
-        ].cpu()
+        return per_doc_query_losses(
+            model, query_stream, query_n, run_cfg.grad_accum_steps
+        )[:num_real_query_docs].cpu()
 
     def compute_bank_losses(
         models_root: Path,

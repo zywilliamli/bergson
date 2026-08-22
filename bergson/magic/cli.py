@@ -47,7 +47,7 @@ from ..utils.utils import (
 from ..utils.worker_utils import setup_data_pipeline
 from ..validate import validate_scores
 from .config import MagicConfig
-from .data_stream import DataStream, pad_dataset_to_batch_size
+from .data_stream import DataStream, mask_padded_rows, pad_dataset_to_batch_size
 from .grad_accum import accumulate_grads
 from .trainer import BackwardState, TrainerState, prepare_trainer, write_lr_history
 
@@ -65,19 +65,16 @@ def compute_query_gradients(
     Iterates over the query stream, computing per-batch parameter gradients
     and reducing them (mean or sum) into a single gradient dict.
     """
-    denom = len(query_stream)
     grad_accum: dict[str, torch.Tensor] | None = None
     loss_accum = 0.0
+    denom = 0
 
-    if dist.is_initialized():
-        denom *= dist.get_world_size()
-        main = dist.get_rank() == 0
-    else:
-        main = True
+    main = not dist.is_initialized() or dist.get_rank() == 0
 
     with fwd_state.activate(model) as params:
         for batch in tqdm(query_stream, desc="Query", disable=not main):
-            del batch["example_weight"]
+            batch, live = mask_padded_rows(batch)
+            denom += int(live)
             grads, loss = accumulate_grads(
                 model, params, batch, grad_accum_steps, create_graph=False
             )
@@ -91,6 +88,11 @@ def compute_query_gradients(
             loss_accum += loss
 
     assert grad_accum is not None, "Query stream was empty"
+
+    if dist.is_initialized():
+        denom_t = torch.tensor(denom, device=current_device())
+        dist.all_reduce(denom_t)
+        denom = int(denom_t.item())
 
     if method == "mean":
         for k in grad_accum:
@@ -181,13 +183,17 @@ def compute_per_query_magic_scores(
         fwd_state.copy_(restored)
         del restored
 
+        # A one-document stream indexes its weights by row, not by doc id, and
+        # one row per rank is its full width: wider is zero-weight padding.
         one = query_dataset.select([qi])
+        if "doc_ids" in one.column_names:
+            one = one.remove_columns("doc_ids")
         one, n_one, one_pad, one_wpad = pad_dataset_to_batch_size(
-            one, run_cfg.batch_size, 1, f"Query {qi}", global_rank
+            one, world_size, 1, f"Query {qi}", global_rank
         )
         qstream = DataStream(
             one,
-            run_cfg.batch_size,
+            world_size,
             device=device,
             input_key=run_cfg.query.prompt_column,
             weight_shape=(n_one,),
@@ -615,7 +621,6 @@ def worker(
         multi_query,
         global_rank=global_rank,
         rank=rank,
-        world_size=world_size,
         schedule=schedule,
         stream=stream,
         query_stream=query_stream,
