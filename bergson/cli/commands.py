@@ -306,18 +306,23 @@ class Validate(ValidationConfig):
     baseline_model: str = ""
     """Optional path to baseline model trained on the full dataset."""
 
+    @property
+    def retrained_dirs(self) -> list[str]:
+        if isinstance(self.retrained_dir, str):
+            return [d for d in self.retrained_dir.split(",") if d]
+        return list(self.retrained_dir)
+
     def execute(self):
         """Run the validation."""
         assert self.scores, "Path to attribution scores must be provided."
-        if self.retrained_dir:
-            retrained_dir = self.retrained_dir
-            if isinstance(retrained_dir, str) and "," in retrained_dir:
-                retrained_dir = retrained_dir.split(",")
-            evaluate_retrained(self, retrained_dir, score_path=self.scores)
+
+        if self.retrained_dirs and self.method == "lds":
+            evaluate_retrained(self, self.retrained_dirs, score_path=self.scores)
         else:
             run_magic(
                 self,
                 score_path=self.scores,
                 validate=True,
                 baseline_model=self.baseline_model,
+                retrained_dir=self.retrained_dirs,
             )

@@ -458,7 +458,9 @@ class ValidationConfig(TrainingConfig, ABC):
     ``none`` will perform one backward per query."""
 
     num_subsets: int = 100
-    """Number of leave-k-out subsets for Spearman correlation."""
+    """Number of leave-k-out subsets for Spearman correlation, or for a
+    filter-* method the number of random filters it is compared against;
+    ``0`` skips them, as does a bank of retrained models."""
 
     subset_weight: float = 0.0
     """Training weight assigned to each subset's documents during the retrain
@@ -486,10 +488,19 @@ class ValidationConfig(TrainingConfig, ABC):
     """One past the last subset index to retrain; ``None`` means ``num_subsets``."""
 
     subset_fraction: float = 0.0
-    """When > 0, each of the ``num_subsets`` leave-k-out subsets is an
-    independent draw (without replacement within a subset, overlapping across
-    subsets) of ``round(subset_fraction * pool)`` docs from the validation
-    pool — e.g. 0.05 drops 5 percent of the data per subset."""
+    """Fraction of data filtered during a retrain. When > 0 subsets are sampled
+    independently without replacement within a subset, but with replacement
+    across subsets, and contain ``round(subset_fraction * pool)`` documents
+    — e.g. 0.05 filters 5 percent of documents per subset. When 0.0, the
+    dataset is randomly partitioned into ``num_subsets`` disjoint subsets
+    for ```lds```, or for a filter-* method the size is 1 / num_subsets."""
+
+    method: Literal["lds", "filter-proponents", "filter-detractors"] = "lds"
+    """``lds`` filters ```num_subsets``` random subsets of the data and
+    correlates the query loss change with the summed attribution scores.
+    ``filter`` methods filter either the top- or bottom-scoring
+    ``subset_fraction`` of data, then retrain and measure the query loss
+    change against ``num_subsets`` random filters of the same size."""
 
 
 @dataclass
