@@ -38,7 +38,7 @@ from .magic.grad_accum import loss_denom, split_batch
 from .magic.trainer import TrainerState, prepare_trainer
 from .utils.csv_writer import CSVWriter
 from .utils.utils import get_device, simple_parse_kwargs_string
-from .utils.worker_utils import setup_data_pipeline
+from .utils.worker_utils import apply_logit_scale, setup_data_pipeline
 
 
 def bank_loss_cache_key(
@@ -84,6 +84,7 @@ def _load_banked_model(
         model = PeftModel.from_pretrained(base, out_dir)
     else:
         model = AutoModelForCausalLM.from_pretrained(out_dir, **load_kwargs)
+    apply_logit_scale(model, getattr(run_cfg, "logit_scale", 1.0))
     return model.to(device)  # type: ignore
 
 

@@ -179,6 +179,9 @@ class ModelConfig(ABC):
     model_kwargs: str = ""
     """HF Model kwargs for in the format 'arg1=val1,arg2=val2'."""
 
+    logit_scale: float = 1.0
+    """Multiply the output logits by this factor. Experimental, subject to removal."""
+
 
 @dataclass
 class LRScheduleConfig(Serializable):
