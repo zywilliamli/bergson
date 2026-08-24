@@ -137,6 +137,8 @@ def next_save_index(
     checkpoint schedule for a run of `n` steps starting from step 0.
     """
     match save_mode:
+        case "final":
+            return n
         case "all":
             # Save every step
             return current + 1
@@ -622,9 +624,9 @@ class Trainer:
         if save_dir is not None:
             os.makedirs(save_dir, exist_ok=True)
 
-        # Always save the first state
-        next_save = 0
+        # Save the first state unless mode is 'final'.
         n = len(data)
+        next_save = n if save_mode == "final" else 0
 
         start = 0
         if resume and save_dir is not None:
@@ -701,7 +703,7 @@ class Trainer:
 
         # Snapshots are written before each step; when the interval cadence
         # lands on n, write the post-training state too.
-        if save_dir and save_mode == "interval" and next_save == n:
+        if save_dir and save_mode in ("interval", "final") and next_save == n:
             p = os.path.join(save_dir, f"step_{n}.ckpt")
             if optimizer_cfg is not None:
                 # Local import: at module scope this cycles back into

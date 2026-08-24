@@ -10,7 +10,7 @@ from simple_parsing import Serializable, field
 
 from ..hessians.inversion import Inversion
 
-SaveMode = Literal["all", "sqrt", "log", "interval"]
+SaveMode = Literal["all", "sqrt", "log", "interval", "final"]
 
 
 def default_nproc_per_node() -> int:
@@ -382,6 +382,7 @@ class TrainingConfig(AttributionConfig, Serializable):
       O(sqrt N) space and O(N) time.
     - 'interval' saves every `save_interval` steps, plus the final state. Not
       supported by MAGIC.
+    - 'final' only saves the final state. Not usable with MAGIC.
 
     The original MAGIC paper used 'log', but 'sqrt' is often a better choice when disk
     space is not a concern.
