@@ -31,7 +31,11 @@ from transformers.utils.logging import (
 
 from ..config.config import TrainingConfig, ValidationConfig
 from ..config.config_io import save_run_config
-from ..data import compute_num_token_grads, load_scores_loss_signed
+from ..data import (
+    compute_num_token_grads,
+    load_scores_loss_signed,
+    sorted_checkpoints,
+)
 from ..distributed import launch_distributed_run
 from ..score.score_writer import save_sequence_scores, save_token_scores
 from ..utils.load_from_optimizer import (
@@ -60,12 +64,40 @@ def compute_query_gradients(
     method: str = "mean",
     fsdp: bool = False,
     grad_accum_steps: int = 1,
+    ckpts_path: str | None = None,
+    ckpt_avg_k: int = 1,
 ) -> tuple[dict[str, torch.Tensor], float]:
     """Compute reduced query gradients over the query dataset.
 
     Iterates over the query stream, computing per-batch parameter gradients
-    and reducing them (mean or sum) into a single gradient dict.
+    and reducing them into a single gradient dict. If ``ckpt_avg_k > 1``, the
+    result is averaged over the last ``ckpt_avg_k`` checkpoints in
+    ``ckpts_path``.
     """
+    if ckpt_avg_k > 1:
+        assert ckpts_path is not None
+        paths = [p for _, p in sorted_checkpoints(ckpts_path)[-ckpt_avg_k:]]
+        if len(paths) < ckpt_avg_k:
+            raise ValueError(
+                f"ckpt_avg_k={ckpt_avg_k} but only {len(paths)} checkpoints "
+                f"saved under {ckpts_path}"
+            )
+
+        final = fwd_state.to("cpu")
+        grads, loss = {}, 0.0
+        try:
+            for path in paths:
+                fwd_state.load(path)
+                g, l = compute_query_gradients(
+                    fwd_state, model, query_stream, method, fsdp, grad_accum_steps
+                )
+                grads = {k: grads[k] + v for k, v in g.items()} if grads else g
+                loss += l
+        finally:
+            fwd_state.copy_(final)
+
+        return {k: v / len(paths) for k, v in grads.items()}, loss / len(paths)
+
     grad_accum: dict[str, torch.Tensor] | None = None
     loss_accum = 0.0
     denom = 0
@@ -536,6 +568,8 @@ def worker(
         run_cfg.query_method,
         run_cfg.fsdp,
         run_cfg.grad_accum_steps,
+        ckpts_path,
+        run_cfg.ckpt_avg_k,
     )
 
     multi_query = False
