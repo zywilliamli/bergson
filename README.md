@@ -52,7 +52,7 @@ At a lower level, you can build your own gradient store for efficient serial que
 
 Per-module and per-attention head gradients can be extracted from the store.
 
-**Note: influence functions can be sensitive to both Hessian approximation inversion hyperparameters and metasmoothness. Untuned hyperparameters can result in a linear datamodeling score of zero.**
+**Note: influence functions can be sensitive to both Hessian approximation inversion hyperparameters (in tiny models) and metasmoothness. Untuned hyperparameters can result in a disappointing linear datamodeling score.**
 
 ### Evaluate
 
