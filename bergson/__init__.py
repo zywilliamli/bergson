@@ -1,21 +1,62 @@
-__version__ = "0.0.0"
+__version__ = "0.26.1"
 
-from .attributor import Attributor
+import logging
+
+from .builder import Builder
 from .collection import collect_gradients
-from .data import DataConfig, IndexConfig, load_gradients
-from .faiss_index import FaissConfig
-from .gradcheck import FiniteDiff
-from .gradients import GradientCollector, GradientProcessor, HeadConfig
+from .collector.collector import CollectorComputer
+from .collector.gradient_collectors import GradientCollector
+from .collector.in_memory_collector import InMemoryCollector
+from .config.config import (
+    AttentionConfig,
+    DataConfig,
+    IndexConfig,
+    PreprocessConfig,
+    QueryConfig,
+    ScoreConfig,
+)
+from .data import (
+    ModuleGradients,
+    TokenGradients,
+    load_gradient_dataset,
+    load_gradients,
+    load_module_gradients,
+    load_token_gradients,
+)
+from .gradients import GradientProcessor
+from .process_grads import mix_autocorrelation_matrices
+from .query.attributor import Attributor
+from .query.faiss_index import FaissConfig
+from .score.scorer import Scorer
+from .utils.gradcheck import FiniteDiff
+from .utils.load_from_optimizer import load_from_optimizer
+
+# Silence noisy HF logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 __all__ = [
     "collect_gradients",
     "load_gradients",
+    "load_gradient_dataset",
+    "load_module_gradients",
+    "load_token_gradients",
+    "ModuleGradients",
+    "TokenGradients",
+    "Builder",
+    "load_from_optimizer",
     "Attributor",
     "FaissConfig",
     "FiniteDiff",
-    "GradientCollector",
     "GradientProcessor",
+    "GradientCollector",
+    "InMemoryCollector",
+    "CollectorComputer",
     "IndexConfig",
     "DataConfig",
-    "HeadConfig",
+    "AttentionConfig",
+    "PreprocessConfig",
+    "Scorer",
+    "ScoreConfig",
+    "QueryConfig",
+    "mix_autocorrelation_matrices",
 ]

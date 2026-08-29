@@ -1,18 +1,13 @@
-import json
-import os
 from abc import ABC, abstractmethod
-from contextlib import ContextDecorator
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Literal, Mapping, NamedTuple
+from pathlib import Path
+from typing import Literal, Mapping
 
 import torch
 import torch.nn as nn
+import yaml
 from torch import Tensor
-from torch.utils.hooks import RemovableHandle
 from transformers.pytorch_utils import Conv1D as HFConv1D
-
-from .math import reshape_to_nearest_square
-from .utils import assert_type, create_projection_matrix
 
 NORMALIZER_TYPES: dict[str, type["Normalizer"]] = {}
 
@@ -39,16 +34,32 @@ class Normalizer(ABC):
         if (cls := NORMALIZER_TYPES.get(class_name)) is None:
             raise ValueError(f"Unknown normalizer class: '{class_name}'")
 
+        # Migration: avg_sq was renamed to weight_avg_sq
+        if "avg_sq" in state_dict:
+            state_dict["weight_avg_sq"] = state_dict.pop("avg_sq")
+
         return cls(**state_dict)
 
     @abstractmethod
-    def normalize_(
+    def normalize_weight(
         self,
         grad: Tensor,
         eps: float = 1e-8,
     ) -> Tensor:
         """
-        Normalize gradients in-place, adding a small epsilon to avoid division by zero.
+        Normalize weight gradients in-place.
+        Adds a small epsilon to avoid division by zero.
+        """
+
+    @abstractmethod
+    def normalize_bias(
+        self,
+        grad: Tensor,
+        eps: float = 1e-8,
+    ) -> Tensor:
+        """
+        Normalize bias gradients in-place.
+        Adds a small epsilon to avoid division by zero.
         """
 
     def state_dict(self) -> dict[str, str | Tensor]:
@@ -64,20 +75,229 @@ class Normalizer(ABC):
 
 
 @dataclass
+class GradientProcessor:
+    """Configuration for processing and compressing gradients."""
+
+    normalizers: Mapping[str, Normalizer] = field(default_factory=dict)
+    """
+    Dictionary of normalizers for each matrix-valued parameter in the model. The keys
+    should match the names of the parameters in the model. If a parameter does not have
+    a normalizer, it will be skipped.
+    """
+
+    hessians: dict[str, Tensor] = field(default_factory=dict)
+    """
+    Dictionary of hessians for each matrix-valued parameter in the model.
+    These are applied after the normalization and random projection steps.
+    """
+
+    hessians_eigen: Mapping[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
+    """
+    Dictionary of eigen decompositions of hessians for each matrix-valued
+    parameter in the model. Each value is a tuple of (eigenvalues, eigenvectors).
+    These are used to efficiently apply inverse square-root of the hessians
+    to the gradients."""
+
+    projection_dim: int | None = None
+    """Number of rows and columns to project the gradients to. If `None`, keep the
+    original shape of the gradients."""
+
+    reshape_to_square: bool = False
+    """Whether to reshape the gradients into a nearly square matrix before projection.
+    This is useful when the matrix-valued parameters are far from square, like in the
+    case of LoRA adapters."""
+
+    projection_type: Literal["normal", "rademacher"] = "rademacher"
+    """
+    Type of random projection to use for compressing gradients. Can be either "normal"
+    for Gaussian projections or "rademacher" for Rademacher projections, which use a
+    uniform distribution over {-1, 1}.
+    """
+
+    projection_target: Literal["per_module", "global"] = "per_module"
+
+    projection_scale: Literal["jl", "row_norm"] = "jl"
+    """Scaling of the random projection entries. See ``IndexConfig``."""
+    """
+    Projection target. ``per_module`` does a double-sided random projection of each
+    module's gradient independently. ``global`` does an independent
+    single-sided right projection of each module's flattened gradient then sums the
+    results, producing one ``[proj_dim]`` vector per example.
+    """
+
+    include_bias: bool = False
+    """Whether to include bias gradients when present on a module."""
+
+    def __post_init__(self):
+        self._projection_matrices: dict[
+            tuple[str, Literal["left", "right", "single"], torch.device], Tensor
+        ] = {}
+
+    @classmethod
+    def load(
+        cls,
+        path: Path | str,
+        *,
+        map_location: str | torch.device | None = None,
+        skip_hessians: bool = False,
+    ) -> "GradientProcessor":
+        """
+        Load the normalizers and hessians from a file.
+        """
+        path = Path(path)
+        cfg_path = path / "processor_config.yaml"
+        norm_path = path / "normalizers.pth"
+
+        # Fall back to legacy "preconditioners*.pth" filenames if the new
+        # "hessians*.pth" files don't exist on disk.
+        # TODO Lucia Quirke: remove on the 28 October 2026
+        hess_path = path / "hessians.pth"
+        if not hess_path.exists():
+            hess_path = path / "preconditioners.pth"
+        hess_eigen_path = path / "hessians_eigen.pth"
+        if not hess_eigen_path.exists():
+            hess_eigen_path = path / "preconditioners_eigen.pth"
+
+        with cfg_path.open("r") as f:
+            cfg = yaml.safe_load(f)
+
+        # Backward compatibility
+        if "projection_type" not in cfg:
+            cfg["projection_type"] = "normal"
+        if "include_bias" not in cfg:
+            cfg["include_bias"] = False
+        if "projection_scale" not in cfg:
+            cfg["projection_scale"] = "row_norm"
+        # Defensive: rename any legacy preconditioner* keys that may appear in
+        # configs saved by older versions of this code.
+        for legacy_key in list(cfg.keys()):
+            if "preconditioner" in legacy_key or "precond" in legacy_key:
+                new_key = (
+                    legacy_key.replace("preconditioners", "hessians")
+                    .replace("preconditioner", "hessian")
+                    .replace("precond", "hess")
+                )
+                cfg[new_key] = cfg.pop(legacy_key)
+
+        # Load normalizers
+        norm_state = torch.load(
+            norm_path,
+            map_location=map_location,
+            weights_only=True,
+        )
+        normalizers = {
+            name: Normalizer.from_state_dict(state)
+            for name, state in norm_state.items()
+        }
+
+        hessians, hessians_eigen = {}, {}
+        if not skip_hessians:
+            hessians = torch.load(
+                hess_path,
+                map_location=map_location,
+                weights_only=True,
+            )
+            hessians_eigen = torch.load(
+                hess_eigen_path,
+                map_location=map_location,
+                weights_only=True,
+            )
+
+        return cls(
+            normalizers=normalizers,
+            hessians=hessians,
+            hessians_eigen=hessians_eigen,
+            **cfg,
+        )
+
+    def save(self, path: Path):
+        """
+        Save the normalizers and hessians to a file.
+        """
+        path.mkdir(parents=True, exist_ok=True)
+
+        cfg_path = path / "processor_config.yaml"
+        norm_path = path / "normalizers.pth"
+        hess_path = path / "hessians.pth"
+        hess_eigen_path = path / "hessians_eigen.pth"
+
+        # Save configuration separately
+        cfg = asdict(self)
+        del cfg["normalizers"]
+        del cfg["hessians"]
+        del cfg["hessians_eigen"]
+        with cfg_path.open("w") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+
+        # Save normalizers
+        norm_state = {
+            name: normalizer.state_dict()
+            for name, normalizer in self.normalizers.items()
+        }
+        torch.save(norm_state, norm_path)
+        torch.save(self.hessians, hess_path)
+        torch.save(self.hessians_eigen, hess_eigen_path)
+
+
+class LayerAdapter:
+    supported_modules = (nn.Linear, HFConv1D, nn.Conv1d, nn.Conv2d, nn.Conv3d)
+
+    @staticmethod
+    def in_attr(layer: nn.Module) -> str:
+        match layer:
+            case nn.Linear():
+                return "in_features"
+            case HFConv1D():
+                return "nx"
+            case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
+                return "in_channels"
+            case _:
+                raise ValueError(f"Unsupported layer type: {type(layer)}")
+
+    @staticmethod
+    def out_attr(layer: nn.Module) -> str:
+        match layer:
+            case nn.Linear():
+                return "out_features"
+            case HFConv1D():
+                return "nf"
+            case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
+                return "out_channels"
+            case _:
+                raise ValueError(f"Unsupported layer type: {type(layer)}")
+
+    @staticmethod
+    def weight_transposed(layer: nn.Module) -> bool:
+        """Whether the layer stores its weight ``[in, out]`` (HF Conv1D)
+        rather than ``[out, in]``."""
+        return isinstance(layer, HFConv1D)
+
+
+@dataclass
 class AdafactorNormalizer(Normalizer):
     """
     Row and column sums of second moments of gradients for a matrix-valued parameter.
+    Weight normalization mutates gradient values in-place.
+
+    Args:
+        row: Row statistics [O]
+        col: Column statistics [I]
+        bias_avg_sq: Optional second moments for bias [O]
     """
 
     row: Tensor  # shape [O]
     col: Tensor  # shape [I]
+    bias_avg_sq: Tensor | None = None  # shape [O]
 
     def __post_init__(self):
         assert self.row.ndim == 1, f"Expected 1D tensor for row, got {self.row.ndim}D"
         assert self.col.ndim == 1, f"Expected 1D tensor for col, got {self.col.ndim}D"
+        if self.bias_avg_sq is not None:
+            assert (
+                self.bias_avg_sq.ndim == 1
+            ), f"Expected 1D tensor for bias_avg_sq, got {self.bias_avg_sq.ndim}D"
 
-    @torch.compile
-    def normalize_(
+    def normalize_weight(
         self,
         grad: Tensor,
         eps: float = 1e-30,
@@ -111,467 +331,90 @@ class AdafactorNormalizer(Normalizer):
         b = c.rsqrt_()
 
         # Implicitly do the Hadamard product
-        grad *= a[:, None]  # [N, O] * [O] → [N, O]
-        grad *= b[None, :]
+        grad *= a[:, None]  # [O, I] * [O, 1] → [O, I]
+        grad *= b[None, :]  # [O, I] * [1, I] → [O, I]
+
         return grad
+
+    def normalize_bias(
+        self,
+        grad: Tensor,
+        eps: float = 1e-8,
+    ) -> Tensor:
+        """Normalize the gradients by the square root of the second moments."""
+        assert self.bias_avg_sq is not None
+
+        # Adafactor-style epsilon is added inside the square root.
+        # Differs slightly from the PyTorch implementation which uses clamp.
+        return grad * self.bias_avg_sq.add(eps).rsqrt_()
 
     def to_adam(self) -> "AdamNormalizer":
         """
         Convert this Adafactor normalizer to an Adam normalizer by materializing the
         rank-one second moment matrix.
+
+        Preserves bias_avg_sq if present.
         """
         # Compute the second moment matrix as a square matrix of shape [O, I]
         # NOTE: We don't add the epsilon here, since the AdamNormalizer is going to
         # add it outside the square root. This could cause infs though if there are
         # any exactly zero rows or columns, so we should be careful.
-        avg_sq = torch.outer(self.row, self.col) / self.row.mean()
-        return AdamNormalizer(avg_sq=avg_sq)
+        weight_avg_sq = torch.outer(self.row, self.col) / self.row.mean()
+        return AdamNormalizer(weight_avg_sq=weight_avg_sq, bias_avg_sq=self.bias_avg_sq)
 
 
 @dataclass
 class AdamNormalizer(Normalizer):
     """
-    Contains the second moments of the gradients.
+    Contains the second moments of the gradients. Weight normalization mutates gradient
+    values in-place.
+
+    Args:
+        weight_avg_sq: Second moments for weights [O, I]
+        bias_avg_sq: Optional second moments for bias [O]
     """
 
-    avg_sq: Tensor
+    weight_avg_sq: Tensor
+    bias_avg_sq: Tensor | None = None
 
-    @torch.compile
-    def normalize_(
+    def normalize_weight(
         self,
         grad: Tensor,
         eps: float = 1e-8,
     ) -> Tensor:
         """Normalize the gradients by the square root of the second moments."""
         # Adam-style epsilon is added outside the square root
-        denom = self.avg_sq.sqrt()
+        denom = self.weight_avg_sq.sqrt()
         return grad.div_(denom.add_(eps))
+
+    def normalize_bias(
+        self,
+        grad: Tensor,
+        eps: float = 1e-8,
+    ) -> Tensor:
+        """Normalize the gradients by the square root of the second moments."""
+        assert self.bias_avg_sq is not None
+        denom = self.bias_avg_sq.sqrt()
+
+        # Adam-style epsilon is added outside the square root
+        return grad / (denom.add_(eps))
 
     def to_adafactor(self) -> AdafactorNormalizer:
         """
         Convert this Adam normalizer to an Adafactor normalizer, minimizing the
         I-divergence (generalized Kullback-Leibler divergence) between the original
         and the factored second moments.
+
+        Preserves bias_avg_sq if present.
         """
-        # We assume avg_sq is a square matrix of shape [O, I]
+        # We assume weight_avg_sq is a square matrix of shape [O, I]
         assert (
-            self.avg_sq.ndim == 2
-        ), f"Expected 2D tensor for avg_sq, got {self.avg_sq.ndim}D"
+            self.weight_avg_sq.ndim == 2
+        ), f"Expected 2D tensor for avg_sq, got {self.weight_avg_sq.ndim}D"
 
         # Compute row and column means
         return AdafactorNormalizer(
-            row=self.avg_sq.mean(dim=1),  # shape [O]
-            col=self.avg_sq.mean(dim=0),  # shape [I]
+            row=self.weight_avg_sq.mean(dim=1),  # shape [O]
+            col=self.weight_avg_sq.mean(dim=0),  # shape [I]
+            bias_avg_sq=self.bias_avg_sq,
         )
-
-
-@dataclass
-class GradientProcessor:
-    """Configuration for processing and compressing gradients."""
-
-    normalizers: Mapping[str, Normalizer] = field(default_factory=dict)
-    """
-    Dictionary of normalizers for each matrix-valued parameter in the model. The keys
-    should match the names of the parameters in the model. If a parameter does not have
-    a normalizer, it will be skipped.
-    """
-
-    preconditioners: dict[str, Tensor] = field(default_factory=dict)
-    """
-    Dictionary of preconditioners for each matrix-valued parameter in the model.
-    These are applied after the normalization and random projection steps.
-    """
-
-    preconditioners_eigen: Mapping[str, tuple[Tensor, Tensor]] = field(
-        default_factory=dict
-    )
-    """
-    Dictionary of eigen decompositions of preconditioners for each matrix-valued
-    parameter in the model. Each value is a tuple of (eigenvalues, eigenvectors).
-    These are used to efficiently apply inverse square-root of the preconditioners
-    to the gradients."""
-
-    projection_dim: int | None = None
-    """Number of rows and columns to project the gradients to. If `None`, keep the
-    original shape of the gradients."""
-
-    reshape_to_square: bool = False
-    """Whether to reshape the gradients into a nearly square matrix before projection.
-    This is useful when the matrix-valued parameters are far from square, like in the
-    case of LoRA adapters."""
-
-    projection_type: Literal["normal", "rademacher"] = "rademacher"
-    """
-    Type of random projection to use for compressing gradients. Can be either "normal"
-    for Gaussian projections or "rademacher" for Rademacher projections, which use a
-    uniform distribution over {-1, 1}.
-    """
-
-    def __post_init__(self):
-        self._projection_matrices: dict[
-            tuple[str, Literal["left", "right"], torch.device], Tensor
-        ] = {}
-
-    @classmethod
-    def load(
-        cls,
-        path: str,
-        *,
-        map_location: str | torch.device | None = None,
-    ) -> "GradientProcessor":
-        """
-        Load the normalizers and preconditioners from a file.
-        """
-        cfg_path = os.path.join(path, "processor_config.json")
-        norm_path = os.path.join(path, "normalizers.pth")
-        precond_path = os.path.join(path, "preconditioners.pth")
-        precond_eigen_path = os.path.join(path, "preconditioners_eigen.pth")
-
-        # Load configuration
-        with open(cfg_path, "r") as f:
-            cfg = json.load(f)
-
-        # Backward compatibility
-        if "projection_type" not in cfg:
-            cfg["projection_type"] = "normal"
-
-        # Load normalizers
-        norm_state = torch.load(
-            norm_path,
-            map_location=map_location,
-            weights_only=True,
-        )
-        normalizers = {
-            name: Normalizer.from_state_dict(state)
-            for name, state in norm_state.items()
-        }
-
-        return cls(
-            normalizers=normalizers,
-            preconditioners=torch.load(
-                precond_path,
-                map_location=map_location,
-                weights_only=True,
-            ),
-            preconditioners_eigen=torch.load(
-                precond_eigen_path,
-                map_location=map_location,
-                weights_only=True,
-            ),
-            **cfg,
-        )
-
-    def save(self, path: str):
-        """
-        Save the normalizers and preconditioners to a file.
-        """
-        os.makedirs(path, exist_ok=True)
-
-        cfg_path = os.path.join(path, "processor_config.json")
-        norm_path = os.path.join(path, "normalizers.pth")
-        precond_path = os.path.join(path, "preconditioners.pth")
-        precond_eigen_path = os.path.join(path, "preconditioners_eigen.pth")
-
-        # Save configuration separately
-        cfg = asdict(self)
-        del cfg["normalizers"]
-        del cfg["preconditioners"]
-        del cfg["preconditioners_eigen"]
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f, indent=2)
-
-        # Save normalizers
-        norm_state = {
-            name: normalizer.state_dict()
-            for name, normalizer in self.normalizers.items()
-        }
-        torch.save(norm_state, norm_path)
-        torch.save(self.preconditioners, precond_path)
-        torch.save(self.preconditioners_eigen, precond_eigen_path)
-
-
-class HeadConfig(NamedTuple):
-    num_heads: int
-    """The number of heads."""
-    head_size: int
-    """The size of each head."""
-    head_dim: int
-    """The dimension along which heads are tiled."""
-
-class LayerAdapter():
-    supported_modules = (nn.Linear, HFConv1D, nn.Conv1d, nn.Conv2d, nn.Conv3d)
-
-    @staticmethod
-    def in_attr(layer: nn.Module) -> str:
-        match layer:
-            case nn.Linear():
-                return "in_features"
-            case HFConv1D():
-                return 'nx'
-            case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
-                return 'in_channels'
-            case _:
-                raise ValueError(f"Unsupported layer type: {type(layer)}")
-
-    @staticmethod
-    def out_attr(layer: nn.Module) -> str:
-        match layer:
-            case nn.Linear():
-                return "out_features"
-            case HFConv1D():
-                return 'nf'
-            case nn.Conv1d() | nn.Conv2d() | nn.Conv3d():
-                return 'out_channels'
-            case _:
-                raise ValueError(f"Unsupported layer type: {type(layer)}")
-
-@dataclass
-class GradientCollector(ContextDecorator):
-    """
-    Adds forward and backward hooks to `model` that efficiently collect per-sequence
-    gradients for all the matrix-valued parameters, randomly projecting them using a
-    fixed seed to compress them into lower-dimensional blocks of shape [p×q]. We use
-    a dictionary of `AdafactorNormalizer` to scale the gradients by the second moments
-    of the parameters, which are expected to be precomputed and passed in.
-
-    We assume that the input to `model` is of shape `[N, S, I]`, where `N` is the
-    batch size, `S` is the sequence length, and `I` is the input dimension. We take the
-    mean over the sequence length to obtain a single gradient per sequence.
-    """
-
-    model: nn.Module
-
-    closure: Callable
-    """Closure to call on the gradient as it is collected."""
-
-    processor: GradientProcessor = field(default_factory=GradientProcessor)
-    """Configuration for processing and compressing gradients."""
-
-    target_modules: set[str] | None = None
-    """
-    List of parameter names to collect gradients for. Should consist only of weight
-    matrices in modules supported by LayerAdapter. If `None`, the gradients for all weight matrices
-    will be collected.
-    """
-
-    head_cfgs: dict[str, HeadConfig] = field(default_factory=dict)
-    """
-    Dictionary of head configurations for each module to be split into head matrices.
-    """
-
-    def __post_init__(self):
-        self._fwd_hooks: list[RemovableHandle] = []
-        self._bwd_hooks: list[RemovableHandle] = []
-
-        self.target_info: dict[str, tuple[torch.device, torch.Size]] = {}
-
-        # Before we add any hooks, we need to peek at what modules we need to track.
-        for name, layer in self.model.named_modules():
-            if not isinstance(layer, LayerAdapter.supported_modules):
-                continue
-
-            if self.target_modules is not None and name not in self.target_modules:
-                continue
-
-            # Users of this class really like to know ahead of time what the shapes are
-            self.target_info[name] = layer.weight.device, layer.weight.shape
-
-    def shapes(self) -> Mapping[str, torch.Size]:
-        """Return the shapes of the gradients collected by this collector."""
-        proj_shape = (
-            torch.Size((p_dim, p_dim))
-            if (p_dim := self.processor.projection_dim) is not None
-            else None
-        )
-
-        shapes = {}
-        for name, (_, target_shape) in self.target_info.items():
-            if name in self.head_cfgs:
-                num_heads, head_size, head_dim = self.head_cfgs[name]
-
-                if not proj_shape:
-                    head_shape = list(target_shape)
-                    # Exclude batch and sequence dimensions since we're working
-                    # with the weight shape
-                    head_shape[head_dim - 2] = head_size
-                    shape = torch.Size(head_shape)
-                else:
-                    shape = proj_shape
-
-                shapes.update(
-                    {self.get_head_name(name, h): shape for h in range(num_heads)}
-                )
-            else:
-                shapes[name] = proj_shape or target_shape
-
-        return shapes
-
-    def projection(
-        self,
-        name: str,
-        m: int,
-        n: int,
-        side: Literal["left", "right"],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tensor:
-        """Return the `side` projection matrix for parameter `name` of shape [m, n]."""
-        key = (name, side, device)
-        if key in self.processor._projection_matrices:
-            return self.processor._projection_matrices[key]
-
-        identifier = f"{name}/{side}"
-
-        A = create_projection_matrix(
-            identifier, m, n, dtype, device, self.processor.projection_type
-        )
-        self.processor._projection_matrices[key] = A
-        return A
-
-    def get_head_name(self, name: str, head_idx: int) -> str:
-        """Get the name of an attention head with index `head_idx` in a
-        module with name `name`."""
-        return f"{name}.head_{head_idx}"
-
-    def __enter__(self):
-        # Install a hook on every Linear
-        for name in self.target_info:
-            layer = self.model.get_submodule(name)
-
-            # Save the name of the layer for later use
-            layer._name = name  # type: ignore[attr-defined]
-
-            # register forward hook to save V = X @ B^T
-            fwd_hook = layer.register_forward_hook(self._save_input)
-            self._fwd_hooks.append(fwd_hook)
-
-            # register backward hook to compute P = sum(U @ V^T)
-            bwd_hook = layer.register_full_backward_hook(self._process_grad)
-            self._bwd_hooks.append(bwd_hook)
-
-        return self
-
-    def _save_input(self, module: nn.Module, inp: tuple, _):
-        """Save the input to the module for later use in the backward pass."""
-        x = inp[0].detach()
-        assert x.ndim == 3, f"Expected input of shape [N, S, I], got {x.shape}"
-
-        # Pre-scale the input by the Adafactor column stats
-        name = assert_type(str, module._name)
-        norm = self.processor.normalizers.get(name)
-        if isinstance(norm, AdafactorNormalizer):
-            b = norm.col.add(1e-30)
-            b.rsqrt_()
-
-            x = x * b.type_as(x)  # [N, S, I] * [I] → [N, S, I]
-
-        # If we're not using AdamNormalizer, we can randomly project the input here
-        # to save memory, rather than waiting until the backward pass.
-        p = self.processor.projection_dim
-        if p is not None and not isinstance(norm, AdamNormalizer):
-            i = getattr(module, LayerAdapter.in_attr(module))
-            x = x @ self.projection(name, p, i, "right", x.device, x.dtype).T  # type: ignore
-
-        module._inputs = x
-
-    def _process_grad(self, module: nn.Module, _, grad_out):
-        """Process the incoming gradient wrt the output of the module."""
-        # Sanity checks
-        assert isinstance(module, LayerAdapter.supported_modules), f"Expected a module of type {LayerAdapter.supported_modules}, got {type(module)}"
-        G = grad_out[0]  # [N, S, O]
-        I = module._inputs  # [N, S, I/q]
-
-        name = assert_type(str, module._name)
-
-        if name in self.head_cfgs:
-            num_heads, head_size, head_dim = self.head_cfgs[name]
-
-            # Recurse into heads with module mutation and restoration
-            module_name, module_inputs, module_out_features = (
-                module._name,
-                module._inputs,
-                getattr(module, LayerAdapter.out_attr(module)),
-            )
-            setattr(module, LayerAdapter.out_attr(module), head_size)
-            for h in range(num_heads):
-                module._name = self.get_head_name(name, h)  # type: ignore
-                module._inputs = module_inputs
-
-                try:
-                    head_G = torch.narrow(G, head_dim, h * head_size, head_size)
-                except Exception as e:
-                    print(
-                        f"Error processing gradient of shape {G.shape} for head {h}"
-                        f"in module {name}. Provided head config may be incorrect. "
-                        f"Head config: head dim {head_dim}, head size {head_size},"
-                        f" num heads {num_heads}."
-                    )
-                    raise e
-
-                self._process_grad(module, None, (head_G,))
-            module._name, module._inputs = (
-                module_name,
-                module_inputs
-            )
-            setattr(module, LayerAdapter.out_attr(module), module_out_features)
-
-            return
-
-        p = self.processor.projection_dim
-        i = getattr(module, LayerAdapter.in_attr(module))
-        o = getattr(module, LayerAdapter.out_attr(module))
-
-        # Pre-scale G by the Adafactor row statistics
-        norm = self.processor.normalizers.get(name)
-        if isinstance(norm, AdafactorNormalizer):
-            # Compare to the normalize_ method in AdafactorNormalizer
-            r = norm.row.add(1e-30)
-            a = r.mean().sqrt() * r.rsqrt_()
-
-            G = G * a.type_as(G)  # [N, S, O] * [O] → [N, S, O]
-
-        # For Adam, we need to materialize the full gradient and then project
-        if isinstance(norm, AdamNormalizer):
-            P = G.mT @ I  # [N, O, S] @ [N, S, I] → [N, O, I]
-
-            # Normalize the gradients using the second moment matrix
-            P /= norm.avg_sq.sqrt().add_(1e-8)
-
-            if self.processor.reshape_to_square:
-                P = reshape_to_nearest_square(P)
-                o, i = P.shape[-2:]
-
-            # Project the gradients to the lower-dimensional space
-            if p is not None:
-                A = self.projection(name, p, o, "left", P.device, G.dtype)
-                B = self.projection(name, p, i, "right", P.device, G.dtype)
-                P = A @ P @ B.T  # [N, p, q]
-
-        # Both Adafactor and no normalizer, we can project G first
-        else:
-            if p is not None:
-                A = self.projection(name, p, o, "left", G.device, G.dtype)
-                G = G @ A.T  # [N, S, p]
-
-            P = G.mT @ I  # [N, O/p, S] @ [N, S, I/q] → [N, O/p, I/q]
-
-        self.closure(name, P)
-
-        # Save memory ASAP
-        del module._inputs
-
-    def __exit__(self, exc_type, exc, tb):
-        # clean up secret attributes
-        for layer in self.model.modules():
-            if hasattr(layer, "_inputs"):
-                del layer._inputs
-            if hasattr(layer, "_name"):
-                del layer._name
-
-        # clean up hooks
-        for h in self._fwd_hooks:
-            h.remove()
-        for h in self._bwd_hooks:
-            h.remove()
-
-        return False

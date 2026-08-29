@@ -1,128 +1,120 @@
 # Bergson
-This library enables you to trace the memory of deep neural nets with gradient-based data attribution techniques. We currently focus on TrackStar, as described in [Scalable Influence and Fact Tracing for Large Language Model Pretraining](https://arxiv.org/abs/2410.17413v3) by Chang et al. (2024), although we plan to add support for other methods inspired by influence functions in the near future.
+Bergson is a python library which provides scalable, state-of-the-art data attribution methods for large language models. Data attribution methods estimate the effect on a behavior of interest of removing data points from a model's training corpus. We support [EK-FAC](https://arxiv.org/abs/2308.03296) (2023), [TrackStar](https://arxiv.org/abs/2410.17413v3) (2024), [SOURCE](https://arxiv.org/abs/2405.12186) (2024), [MAGIC](https://arxiv.org/abs/2504.16430) (2025), gradient cosine similarity, and more.
 
-We view attribution as a counterfactual question: **_If we "unlearned" this training sample, how would the model's behavior change?_** This formulation ties attribution to some notion of what it means to "unlearn" a training sample. Here we focus on a very simple notion of unlearning: taking a gradient _ascent_ step on the loss with respect to the training sample. To mimic the behavior of popular optimizers, we precondition the gradient using Adam or Adafactor-style estimates of the second moments of the gradient.
+We try to make research and application straightforward. You can reproduce any of your runs with a single line, use a few CLI flags to save and re-use useful intermediate artifacts, do everything using just the CLI or just code, train models here or use existing ones, tune and evaluate your methods, and scale them up to multi-node runs with 70B+ parameters. More information is available in the [Bergson](https://bergson.readthedocs.io) docs.
 
-# Announcements
-
-**September 2025**
-- Saving per-head gradients: https://github.com/EleutherAI/bergson/pull/40
-- Eigendecompositions of preconditioners: https://github.com/EleutherAI/bergson/pull/34
-- Dr. GRPO-based loss gradients: https://github.com/EleutherAI/bergson/pull/35
-- Choosing between summing and averaging losses across tokens: https://github.com/EleutherAI/bergson/pull/36
-- Saving the order training data is seen in while using the gradient collector callback for HF's Trainer/SFTTrainer: https://github.com/EleutherAI/bergson/pull/40
-  - Saving training gradients adds a ~17% wall clock overhead
-- Improved static index build ETA accuracy: https://github.com/EleutherAI/bergson/pull/41
-- Several small quality of life improvements for querying indexes: https://github.com/EleutherAI/bergson/pull/38
+<!-- To get the best out of our methods, check out our tuning guide. -->
 
 # Installation
+
+Bergson can be installed using pip:
 
 ```bash
 pip install bergson
 ```
 
-# Usage
-The first step is to build an index of gradients for each training sample. You can do this from the command line, using `bergson` as a CLI tool:
+Or you can clone the repository and install locally:
 
 ```bash
-bergson <output_path> --model <model_name> --dataset <dataset_name>
+git clone https://github.com/EleutherAI/bergson.git
+cd bergson
+pip install -e .
 ```
 
-This will create a directory at `<output_path>` containing the gradients for each training sample in the specified dataset. The `--model` and `--dataset` arguments should be compatible with the Hugging Face `transformers` library. By default it assumes that the dataset has a `text` column, but you can specify other columns using `--prompt_column` and optionally `--completion_column`. The `--help` flag will show you all available options.
+## Functionality
 
-You can also use the library programmatically to build the index. The `collect_gradients` function is just a bit lower level the CLI tool, and allows you to specify the model and dataset directly as arguments. The result is a HuggingFace dataset which contains a handful of new columns, including `gradients`, which contains the gradients for each training sample. You can then use this dataset to compute attributions.
+| Method | LDS (GPT-2 fine-tune) | Training Optimizer |
+|:---|:---:|:---:|
+| MAGIC | **0.983 ± 0.005** | Adam |
+| Shampoo | 0.522 ± 0.037 | Muon |
+| EK-FAC | 0.474 ± 0.036 | Muon |
+| SOURCE | 0.387 ± 0.039 | Adam |
+| EK-FAC | 0.257 ± 0.015 | Adam |
+| TrackStar | 0.184 ± 0.015 | Adam |
 
-At the lowest level of abstraction, the `GradientCollector` context manager allows you to efficiently collect gradients for _each individual example_ in a batch during a backward pass, simultaneously randomly projecting the gradients to a lower-dimensional space to save memory. If you use Adafactor normalization, which is the default, we will do this in a very compute-efficient way which avoids computing the full gradient for each example before projecting it to the lower dimension. There are two main ways you can use `GradientCollector`:
+### Attribute through Training
 
-1. Using a `closure` argument, which enables you to make use of the per-example gradients immediately after they are computed, during the backward pass. If you're computing summary statistics or other per-example metrics, this is the most efficient way to do it.
-2. Without a `closure` argument, in which case the gradients are collected and returned as a dictionary mapping module names to batches of gradients. This is the simplest and most flexible approach but is a bit more memory-intensive.
+`bergson magic` runs a powerful attribution method that backpropagates through the training process to compute the gradient of a model behavior loss with respect to a weighting placed on each training item. It is powered by our twice-differentiable trainer, which can also be called directly using `bergson train`.
 
-## Training Gradients
+**Note: unrolled differentiation efficacy is proportional to [metasmoothness](https://bergson.readthedocs.io/en/latest/magic.html#metasmoothness). Untuned training hyperparameters can result in disappointing linear datamodeling scores. Check your run's estimated metasmoothness with `bergson metasmoothness`.**
 
-Gradient collection during training is supported via an integration with HuggingFace's Trainer and SFTTrainer classes. Training gradients are saved in the original order corresponding to their dataset items, and when the `track_order` flag is set the training steps associated with each training item are separately saved.
+`bergson approxunrolling` is an approximation of `bergson magic` that uses a handful of training checkpoints to run the multi-step SOURCE attribution pipeline. This is roughly equivalent to an influence function averaged over several checkpoints.
 
-```python
-from bergson import GradientCollectorCallback, prepare_for_gradient_collection
+To build a train‑time gradient store, use our HF Trainer callback. This will incur a ~17% performance overhead.
 
-callback = GradientCollectorCallback(
-    path="runs/example",
-    track_order=True,
-    use_optimizer_state=False,
-)
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset,
-    eval_dataset=dataset,
-    callbacks=[callback],
-)
-trainer = prepare_for_gradient_collection(trainer)
-trainer.train()
-```
+### Attribute Post-Hoc
 
-## Attention Head Gradients
+Bergson supports on-disk gradient stores and on-the-fly queries, and per-token and per-sequence attribution.
 
-By default Bergson collects gradients for named parameter matrices, but gradients for individual attention heads within a named matrix can be collected too. To collect head gradients add a `head_cfgs` dictionary to the training calllback or static index config.
+`bergson trackstar` and `bergson ekfac` both orchestrate multi-step attribution recipes over a model checkpoint.
 
-```python
-from bergson import HeadConfig, IndexConfig, DataConfig
-from transformers import AutoModelForCausalLM
+At a lower level, you can build your own gradient store for efficient serial queries using `bergson build`. Collection-time gradient compression makes the store space-efficient, and a FAISS integration enables fast KNN search over large stores - see `bergson query`, or `Attributor` in the programmatic interface. For small queries and methods that don't use gradient compression (e.g., EK-FAC), you can score a dataset in a single pass using an in-memory query index of precomputed gradients. Dataset items may be scored using max, mean, and individual scoring strategies, enabling [LESS](https://arxiv.org/pdf/2402.04333)-style data filtering. See `bergson score` and `bergson build`.
 
-model = AutoModelForCausalLM.from_pretrained("RonenEldan/TinyStories-1M", trust_remote_code=True, use_safetensors=True)
+Per-module and per-attention head gradients can be extracted from the store.
 
-collect_gradients(
-    model=model,
-    data=data,
-    processor=processor,
-    path="runs/example_with_heads",
-    head_cfgs={
-        # Head configuration for the TinyStories-1M transformer
-        "h.0.attn.attention.out_proj": HeadConfig(num_heads=16, head_size=4, head_dim=2),
-    },
-)
-```
+**Note: influence functions can be sensitive to both Hessian approximation inversion hyperparameters (in tiny models) and metasmoothness. Untuned hyperparameters can result in a disappointing linear datamodeling score.**
 
-## GRPO
+### Evaluate
 
-Where a reward signal is available we compute gradients using a weighted advantage estimate based on Dr. GRPO:
+Use `bergson validate` and `bergson recall` to compute LDS and recall@k metrics respectively.
+
+# Examples
+
+There are many example YAMLs in the `examples` directory. use `bergson <yaml_path>` to try them. For example, to MAGIC-attribute a GPT-2 WikiText fine-tune:
 
 ```bash
-bergson <output_path> --model <model_name> --dataset <dataset_name> --reward_column <reward_column_name>
+bergson examples/magic/gpt2_wikitext_tiny.yaml
 ```
 
-## Queries
+Or check out a notebook for programmatic usage:
 
-We provide a query Attributor which supports unit normalized gradients and KNN search out of the box.
+| | Notebook | Description |
+|---|----------|-------------|
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/EleutherAI/bergson/blob/colab-notebooks-v2/notebooks/poison_detection.ipynb) | **Poison Detection** | Detect poisoned training examples with gradient attribution (T4, ~5 min) |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/EleutherAI/bergson/blob/colab-notebooks-v2/notebooks/style_ablation.ipynb) | **Style Ablation** | Suppress style to recover semantic matching (A100, ~20 min) |
 
-```
-from bergson import Attributor, FaissConfig
+Construct and query an on-disk index of randomly projected gradients:
 
-attr = Attributor(args.index, device="cuda")
-
-...
-query_tokens = tokenizer(query, return_tensors="pt").to("cuda:0")["input_ids"]
-
-# Query the index
-with attr.trace(model.base_model, 5) as result:
-    model(query_tokens, labels=query_tokens).loss.backward()
-    model.zero_grad()
+```bash
+bergson build runs/index --model EleutherAI/pythia-14m --dataset NeelNanda/pile-10k --truncation --token_batch_size 4096 --projection_dim 16
+bergson query --index runs/index --unit_norm
 ```
 
-To efficiently query on-disk indexes, perform ANN searches, and explore many other scalability features add a FAISS config:
+Collect TrackStar attribution scores for an I.I.D sample query:
 
-```
-attr = Attributor(args.index, device="cuda", faiss_cfg=FaissConfig("IVF1,SQfp16", mmap_index=True))
-
-with attr.trace(model.base_model, 5) as result:
-    model(query_tokens, labels=query_tokens).loss.backward()
-    model.zero_grad()
+```bash
+bergson trackstar runs/trackstar --model EleutherAI/pythia-14m --query.dataset NeelNanda/pile-10k --data.dataset NeelNanda/pile-10k --data.truncation --token_batch_size 4096 --query.truncation --query.split "train[:20]"
 ```
 
 # Development
 
 ```bash
-pip install -e .[dev]
+pip install -e ".[dev]"
+pre-commit install
 pytest
+pyright
 ```
 
 We use [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/) for releases.
+
+If you have multiple GPUs, you can run pytest in distributed mode: `pytest -n 8 --dist loadgroup`.
+
+# Citation
+
+If you found Bergson useful in your research, please cite us:
+
+```bibtex
+@misc{quirke2026bergsonopensourcelibrary,
+      title={Bergson: An Open Source Library for Data Attribution},
+      author={Lucia Quirke and Louis Jaburi and David Johnston and William Z. Li and Gonçalo Paulo and Guillaume Martres and Girish Gupta and Stella Biderman and Nora Belrose},
+      year={2026},
+      eprint={2606.11660},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.11660},
+}
+```
+
+# Support
+
+If you have suggestions, questions, or would like to collaborate, please email lucia@eleuther.ai or drop us a line in the #data-attribution channel of the EleutherAI Discord!

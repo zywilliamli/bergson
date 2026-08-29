@@ -2,13 +2,13 @@ import math
 import os
 from functools import wraps
 from itertools import chain
+from pathlib import Path
 from typing import Sized
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from datasets import Dataset
-from numpy.typing import DTypeLike
 from peft import PeftModel
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -16,10 +16,16 @@ from transformers.trainer import Trainer
 from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 
-from bergson import GradientCollector, GradientProcessor, HeadConfig
-from bergson.data import create_index
+from bergson import AttentionConfig, GradientProcessor
+from bergson.collector.gradient_collectors import StreamingGradientCollector
+from bergson.data import column_offsets, create_index
 from bergson.gradients import AdafactorNormalizer, AdamNormalizer
-from bergson.peft import detect_peft_modules
+from bergson.utils.load_from_optimizer import (
+    _orient_factored_second_moment,
+    _orient_weight_second_moment,
+)
+from bergson.utils.peft import detect_peft_modules
+from bergson.utils.utils import convert_dtype_to_torch
 
 
 class GradientCollectorCallback(TrainerCallback):
@@ -28,18 +34,21 @@ class GradientCollectorCallback(TrainerCallback):
 
     def __init__(
         self,
-        path: str,
-        head_cfgs: dict[str, HeadConfig] = {},
+        path: Path,
+        attention_cfgs: dict[str, AttentionConfig] = {},
         projection_dim: int = 16,
-        dtype: DTypeLike = np.float16,
+        include_bias: bool = False,
+        dtype: np.dtype = np.dtype(np.float16),
         accumulate_grads: bool = False,
         use_optimizer_state: bool = True,
+        scale_by_lr: bool = True,
         track_order: bool = False,
     ):
         """
         Args:
             path: The path to save the gradients
             projection_dim: The dimension to project the gradients onto
+            include_bias: Whether to append bias gradients when present on a module
             dtype: The dtype of the on-disk gradient store
             accumulate_grads: Whether to take the sum of the gradients
                 of the same example across epochs. If `False`, the
@@ -47,41 +56,44 @@ class GradientCollectorCallback(TrainerCallback):
             use_optimizer_state: Whether to use the optimizer state to
                 normalize the gradients. If `False`, no normalization is
                 applied.
+            scale_by_lr: Scale the normalizer so the stored gradient is the
+                update the optimizer applied, ``lr * g / sqrt(v)``. Each example
+                is captured at the step it was trained on, so this weights it by
+                that step's learning rate. Set False for ``g / sqrt(v)``, which
+                matches ``load_from_optimizer``.
             track_order: Whether to record the shuffled order of training data.
-        head_cfgs: Information used to split matrix-valued parameters into
+        attention_cfgs: Information used to split matrix-valued parameters into
             per-head matrices before down projection.
         """
         super().__init__()
 
         # Initialized in on_train_begin when we learn what the model is
-        self.collector = None
+        self.collector: StreamingGradientCollector
         self.grad_sizes = {}
 
-        self.head_cfgs = head_cfgs
+        self.attention_cfgs = attention_cfgs
         self.accumulate_grads = accumulate_grads
         self.dtype = dtype
         self.path = path
         self.projection_dim = projection_dim
+        self.include_bias = include_bias
         self.use_optimizer_state = use_optimizer_state
+        self.scale_by_lr = scale_by_lr
         self.order: list[dict] | None = [] if track_order else None
-
-        self.eval_grad_buffers: dict[str, np.memmap] = {}
-        self.eval_step_idxs: dict[str, int] = {}
-        self.eval_indices: dict[str, list[int]] = {}
 
         self.mod_grads = {}
         self.batch_indices: Tensor | None = None
 
-        # TODO: Handle this more elegantly
-        self.torch_dtype = torch.float32 if self.dtype == np.float32 else torch.float16
+        self.torch_dtype = convert_dtype_to_torch(self.dtype)
 
     def write_grads(self, grad_buffer: np.memmap):
-        # Ensure the nonblocking copies are all finished
-        torch.cuda.synchronize()
-        for layer_name, g in self.mod_grads.items():
-            grad_buffer[layer_name][self.batch_indices, :] = g.numpy()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        for layer_name, g in self.collector.mod_grads.items():
+            lo, hi = self.grad_offsets[layer_name]
+            grad_buffer[self.batch_indices, lo:hi] = g.numpy()
 
-        self.mod_grads.clear()
+        self.collector.mod_grads.clear()
 
     def on_train_begin(
         self,
@@ -105,20 +117,22 @@ class GradientCollectorCallback(TrainerCallback):
             reshape_to_square = False
             target_modules = None
 
-        self.collector = GradientCollector(
+        self.collector = StreamingGradientCollector(
             model=getattr(model, "base_model", model),
-            closure=self.on_module_backward,
             processor=GradientProcessor(
                 {},
                 projection_dim=self.projection_dim or None,
                 reshape_to_square=reshape_to_square,
+                include_bias=self.include_bias,
             ),
             target_modules=target_modules,
-            head_cfgs=self.head_cfgs,
+            attention_cfgs=self.attention_cfgs,
+            dtype=self.torch_dtype,
         )
         self.grad_sizes = {
             name: math.prod(s) for name, s in self.collector.shapes().items()
         }
+        self.grad_offsets = column_offsets(self.grad_sizes)
 
         # Record forward and backward hooks
         self.collector.__enter__()
@@ -133,7 +147,6 @@ class GradientCollectorCallback(TrainerCallback):
         state: TrainerState,
         control: TrainerControl,
         *,
-        eval_dataloader: DataLoader | dict[str, DataLoader],
         train_dataloader: DataLoader,
         **kwargs,
     ):
@@ -149,32 +162,12 @@ class GradientCollectorCallback(TrainerCallback):
             raise ValueError("Dataset must be sized for gradient collection")
 
         self.train_grad_buffer = create_index(
-            os.path.join(self.path, "train" + epoch_suffix),
+            self.path / ("train" + epoch_suffix),
             num_grads=len(ds),
             grad_sizes=self.grad_sizes,
             dtype=self.dtype,
         )
         self.train_step_idx = 0
-
-        # Set up the gradient buffers for the evaluation datasets
-        if eval_dataloader is None:
-            return
-        elif isinstance(eval_dataloader, dict):
-            eval_datasets = eval_dataloader
-        else:
-            eval_datasets = {"eval": eval_dataloader}
-
-        for dataset_name, dataloader in eval_datasets.items():
-            self.eval_grad_buffers[dataset_name] = create_index(
-                os.path.join(self.path, dataset_name + epoch_suffix),
-                num_grads=len(dataloader),
-                grad_sizes=self.grad_sizes,
-                dtype=self.dtype,
-            )
-            self.eval_step_idxs[dataset_name] = 0
-            self.eval_indices[dataset_name] = [
-                i.item() for batch in dataloader for i in batch["_idx"]
-            ]
 
     def on_epoch_end(
         self,
@@ -187,19 +180,21 @@ class GradientCollectorCallback(TrainerCallback):
         if rank == 0:
             epoch = int(state.epoch or 0) - 1
             epoch_suffix = "" if self.accumulate_grads else f"/epoch_{epoch}"
-            path = os.path.join(self.path, "train" + epoch_suffix)
+            path = self.path / ("train" + epoch_suffix)
 
             assert self.collector is not None
             self.collector.processor.save(path)
 
         # Ensure the gradients are written to disk
         self.train_grad_buffer.flush()
-        for eval_grad_buffer in self.eval_grad_buffers.values():
-            eval_grad_buffer.flush()
 
-    def on_forward_begin(self, _: torch.nn.Module, args, kwargs: dict):
-        # Record the original indices of this batch
-        self.batch_indices = kwargs.pop("_idx").to("cpu", non_blocking=True)
+    def on_forward_begin(self, module: torch.nn.Module, args, kwargs: dict):
+        # Always pop _idx to prevent it from being passed to the model
+        idx = kwargs.pop("_idx", None)
+
+        if module.training and idx is not None:
+            self.batch_indices = idx.to("cpu", non_blocking=True)
+
         return args, kwargs
 
     def on_module_backward(self, name: str, g: Tensor):
@@ -265,7 +260,7 @@ class GradientCollectorCallback(TrainerCallback):
             for name, param in model.named_parameters()
             if param.requires_grad
         }
-        normalizers: dict[str, AdafactorNormalizer] = {}
+        normalizers: dict[str, AdafactorNormalizer | AdamNormalizer] = {}
 
         assert self.collector is not None
         proc = self.collector.processor
@@ -273,38 +268,89 @@ class GradientCollectorCallback(TrainerCallback):
 
         # Read normalizers off of the optimizer state. We need to figure out
         # what type of optimizer this is first.
+        # Collect references to both weight and bias second moments per layer
+        layer_second_moments: dict[str, dict[str, Tensor]] = {}
+
         for group in optimizer.param_groups:
-            lr_sqrt = group["lr"] ** 0.5
+            group_lr = group["lr"]
 
             for param in group["params"]:
-                name = param_to_name[param].removesuffix(".weight")
-                if name not in self.collector.target_info:
+                # The optimizer owns the full model's parameters; anything
+                # outside base_model (e.g. lm_head) is never a target module.
+                param_name = param_to_name.get(param)
+                if param_name is None:
+                    continue
+
+                # Extract layer name (remove .weight or .bias suffix)
+                if param_name.endswith(".weight"):
+                    param_type = "weight"
+                    layer_name = param_name.removesuffix(".weight")
+                elif param_name.endswith(".bias"):
+                    param_type = "bias"
+                    layer_name = param_name.removesuffix(".bias")
+                else:
+                    continue
+
+                if layer_name not in self.collector.target_info:
                     continue
 
                 p_state = optimizer.state[param]
 
-                # Adam-like optimizer
-                if (eas := p_state.get("exp_avg_sq")) is not None:
-                    norm = AdamNormalizer(eas).to_adafactor()
+                # Initialize layer dict if needed, storing this group's learning rate
+                if layer_name not in layer_second_moments:
+                    layer_second_moments[layer_name] = {"lr": group_lr}
 
-                # Adafactor-like optimizer
-                elif (vr := p_state.get("exp_avg_sq_row")) is not None:
+                # Check for Adafactor FIRST (more specific than Adam)
+                # Adafactor-like optimizer: weights have factorized moments
+                if (vr := p_state.get("exp_avg_sq_row")) is not None:
                     vc = p_state.get("exp_avg_sq_col")
-                    norm = AdafactorNormalizer(vr, vc)
-                else:
-                    continue
+                    if param_type == "weight":
+                        # Factorized second moments for weights
+                        layer_second_moments[layer_name]["row"] = vr
+                        layer_second_moments[layer_name]["col"] = vc
+                    elif param_type == "bias":
+                        # Adafactor stores bias as regular exp_avg_sq
+                        bias_eas = p_state.get("exp_avg_sq")
+                        if bias_eas is not None:
+                            layer_second_moments[layer_name]["bias"] = bias_eas
+                # Adam-like optimizer: has exp_avg_sq for both weight and bias
+                elif (eas := p_state.get("exp_avg_sq")) is not None:
+                    layer_second_moments[layer_name][param_type] = eas
 
-                # Scale the gradient by the current learning rate. It's factorized
-                # so we multiply each factor by the square root of the LR.
-                norm.row *= lr_sqrt
-                norm.col *= lr_sqrt
-                normalizers[name] = norm
+        # Build normalizers from collected second moments
+        for layer_name, moments in layer_second_moments.items():
+            # Dividing the second moment by lr^2 makes normalize_weight compute
+            # lr * g / sqrt(v), the update the optimizer applied.
+            scale = moments["lr"] ** 2 if self.scale_by_lr else 1.0
+
+            # Adam-like: has weight exp_avg_sq
+            if "weight" in moments:
+                weight_eas = _orient_weight_second_moment(
+                    moments["weight"], model, layer_name
+                )
+                weight_eas = weight_eas / scale
+                bias_eas = moments.get("bias")
+                bias_eas = bias_eas / scale if bias_eas is not None else None
+
+                norm = AdamNormalizer(weight_eas, bias_eas)
+
+            # Adafactor-like: has row/col factorization
+            elif "row" in moments and "col" in moments:
+                row, col = _orient_factored_second_moment(
+                    moments["row"], moments["col"], model, layer_name
+                )
+                row, col = row / scale, col / scale
+                bias_eas = moments.get("bias")
+                bias_eas = bias_eas / scale if bias_eas is not None else None
+
+                norm = AdafactorNormalizer(row, col, bias_eas)
+            else:
+                # No weight moments found - skip this layer
+                continue
+
+            normalizers[layer_name] = norm
 
         proc.normalizers = normalizers
-
-    def on_prediction_step(self, args, state, control, **kwargs):
-        dataset_name = kwargs["inputs"]["dataset_name"]
-        self.write_grads(self.eval_grad_buffers[dataset_name])
 
     def on_train_end(
         self,

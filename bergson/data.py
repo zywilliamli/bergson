@@ -1,159 +1,185 @@
+import heapq
 import json
 import math
 import os
 import random
-from dataclasses import dataclass
+import re
+from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Any, Iterator, Sequence
 
+import ml_dtypes  # noqa: F401  # registers bfloat16 dtype with numpy
 import numpy as np
 import pyarrow as pa
 import torch
 import torch.distributed as dist
+import yaml
 from datasets import (
     Dataset,
     DatasetDict,
-    IterableDataset,
     IterableDatasetDict,
     concatenate_datasets,
     load_dataset,
+    load_from_disk,
 )
 from numpy.lib.recfunctions import structured_to_unstructured
-from numpy.typing import DTypeLike
-from simple_parsing import field
+from numpy.typing import DTypeLike, NDArray
+from transformers import PreTrainedTokenizerFast, logging
 
-from .gradients import HeadConfig
-from .utils import assert_type
-
-
-@dataclass
-class DataConfig:
-    dataset: str = "EleutherAI/SmolLM2-135M-10B"
-    """Dataset identifier to build the index from."""
-
-    split: str = "train"
-    """Split of the dataset to use for building the index."""
-
-    prompt_column: str = "text"
-    """Column in the dataset that contains the prompts."""
-
-    completion_column: str = ""
-    """Optional column in the dataset that contains the completions."""
-
-    conversation_column: str = ""
-    """Optional column in the dataset that contains the conversation."""
-
-    reward_column: str = ""
-    """Optional column in the dataset that contains the rewards.
-    When specified, gradients are calculated using the policy
-    gradient loss from Dr. GRPO. https://arxiv.org/abs/2503.20783"""
-
-    truncation: bool = False
-    """Whether to truncate long documents to fit the token budget."""
+from .config.config import DataConfig, ScoreConfig
+from .config.config_io import CONFIG_FILENAME, load_subconfig, read_config
+from .utils.utils import (
+    assert_type,
+    simple_parse_kwargs_string,
+)
 
 
-@dataclass
-class QueryConfig:
-    """Config for querying an index on the fly."""
+def compute_num_token_grads(data: Dataset) -> np.ndarray:
+    """Number of per-token gradient rows stored per example.
 
-    query_data: DataConfig = field(default_factory=DataConfig)
-    """Data to use for the query."""
+    Position ``t``'s row is ``g_t (x) a_t``. ``g_t`` is generally nonzero even
+    at prompt / masked positions, because the completion-token losses backprop
+    through them via causal attention -- masking is applied to the *loss*, not
+    to the gradient. Storing every position therefore makes the per-token rows
+    sum to the per-document gradient. Only the final position (which predicts
+    nothing after ``logits[:, :-1]``) and right-padding are excluded, so
+    ``num_token_grads = length - 1`` regardless of the label mask.
 
-    query_method: Literal["mean", "nearest"] = "mean"
-    """Method to use for computing the query."""
+    Documents shorter than 2 tokens contribute **zero** rows: they have no
+    valid next-token label, and :func:`_allocate_batches_world` drops them from
+    the forward pass. ``length - 1`` is clamped at 0 accordingly.
 
-    apply_query_preconditioner: Literal["none", "existing", "precompute"] = "none"
-    """Whether to apply (or compute and apply) a preconditioner
-    computed over the query dataset."""
-
-    apply_index_preconditioner: Literal["none", "existing", "precompute"] = "none"
-    """Whether to apply (or compute and apply) a preconditioner
-    computed over the index dataset."""
-
-    query_preconditioner_path: str | None = None
-    """Path to a precomputed preconditioner. This does not affect
-    the ability to compute a new preconditioner during the scan.
-    The precomputed preconditioner is applied to the query dataset
-    gradients."""
-
-    index_preconditioner_path: str | None = None
-    """Path to a precomputed preconditioner. This does not affect
-    the ability to compute a new preconditioner during the scan.
-    The precomputed preconditioner is applied to the query dataset
-    gradients."""
-
-    mixing_coefficient: float = 0.5
-    """Coefficient to weight the application of the query preconditioner
-    and the pre-computed index preconditioner. 0.0 means only use the
-    query preconditioner and 1.0 means only use the index preconditioner."""
+    Returns
+    -------
+    np.ndarray of shape ``(len(data),)`` with dtype int64.
+    """
+    if "length" in data.column_names:
+        lengths = np.asarray(data["length"], dtype=np.int64)
+    elif "input_ids" in data.column_names:
+        lengths = np.asarray([len(x) for x in data["input_ids"]], dtype=np.int64)
+    else:
+        lengths = np.asarray([len(x) for x in data["labels"]], dtype=np.int64)
+    return np.maximum(lengths - 1, 0)
 
 
-@dataclass
-class IndexConfig:
-    """Config for building the index and running the model/dataset pipeline."""
+def create_token_index(
+    root: Path,
+    num_token_grads: np.ndarray,
+    grad_sizes: dict[str, int],
+    dtype: DTypeLike,
+) -> tuple[np.memmap, np.ndarray]:
+    """Allocate a flat memory-mapped file for ragged per-token gradients.
 
-    run_path: str = field(positional=True)
-    """Name of the run. Used to create a directory for the index."""
+    Same on-disk format as :func:`create_index` (``gradients.bin`` +
+    ``info.json`` with ``num_grads``/``grad_sizes``/``base_dtype``), plus
+    ``offsets.npy`` so row ``offsets[i]:offsets[i+1]`` -- rather than row
+    ``i`` -- is example *i*'s gradients. ``info["attribute_tokens"]`` marks
+    that distinction for readers.
 
-    save_index: bool = True
-    """Whether to write the gradients to disk."""
+    Parameters
+    ----------
+    root : Path
+        Directory in which ``gradients.bin``, ``offsets.npy`` and
+        ``info.json`` will be created.
+    num_token_grads : np.ndarray
+        Number of valid gradient rows per example, shape ``(num_items,)``.
+    grad_sizes : dict[str, int]
+        Per-module gradient dimensions (same as :func:`create_index`).
+    dtype : DTypeLike
+        Element dtype for the gradient array.
 
-    save_processor: bool = True
-    """Whether to write the gradient processor to disk."""
+    Returns
+    -------
+    (memmap, offsets) where *memmap* has shape ``(total_tokens, total_grad_dim)``
+    and *offsets* is ``cumsum([0] + num_token_grads)`` of length
+    ``num_items + 1``.
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    total_grad_dim = sum(grad_sizes.values())
+    offsets = np.zeros(len(num_token_grads) + 1, dtype=np.int64)
+    np.cumsum(num_token_grads, out=offsets[1:])
+    total_tokens = int(offsets[-1])
 
-    data: DataConfig = field(default_factory=DataConfig)
-    """Specification of the data on which to build the index."""
+    np_dtype = np.dtype(dtype)
+    grad_path = root / "gradients.bin"
 
-    model: str = "HuggingFaceTB/SmolLM2-135M"
-    """Name of the model to load."""
+    if rank == 0:
+        root.mkdir(parents=True, exist_ok=True)
+        nbytes = np_dtype.itemsize * total_tokens * total_grad_dim
+        with open(grad_path, "wb") as f:
+            f.truncate(nbytes)
+            os.fsync(f.fileno())
 
-    fsdp: bool = False
-    """Whether to use Fully Sharded Data Parallel (FSDP) for collecing gradients."""
+        np.save(root / "offsets.npy", offsets)
 
-    precision: Literal["auto", "bf16", "fp16", "fp32", "int4", "int8"] = "auto"
-    """Precision to use for the model parameters."""
+        with (root / "info.json").open("w") as f:
+            json.dump(
+                {
+                    "attribute_tokens": True,
+                    "num_items": len(num_token_grads),
+                    "num_grads": total_tokens,
+                    "grad_sizes": grad_sizes,
+                    "base_dtype": np_dtype.name,
+                },
+                f,
+                indent=2,
+            )
 
-    projection_dim: int = 16
-    """Dimension of the random projection for the index, or 0 to disable it."""
+    if dist.is_initialized():
+        dist.barrier()
 
-    reshape_to_square: bool = False
-    """Whether to reshape the gradients to a square matrix."""
+    mmap = np.memmap(
+        grad_path,
+        dtype=np_dtype,
+        mode="r+",
+        shape=(total_tokens, total_grad_dim),
+    )
+    return mmap, offsets
 
-    projection_type: Literal["normal", "rademacher"] = "rademacher"
-    """Type of random projections to use for the gradients."""
 
-    token_batch_size: int = 8192
-    """Batch size in tokens for building the index."""
+def load_token_gradients(
+    root_dir: Path | str,
+) -> tuple[np.memmap, np.ndarray, np.ndarray]:
+    """Load per-token gradients stored by :func:`create_token_index`.
 
-    processor_path: str = ""
-    """Path to a precomputed processor."""
+    Returns
+    -------
+    (mmap, num_token_grads, offsets)
+        *mmap* has shape ``(total_tokens, total_grad_dim)``.
+        Example *i*'s gradients are ``mmap[offsets[i]:offsets[i+1]]`` with
+        shape ``(num_token_grads[i], total_grad_dim)``.
+    """
+    root_dir = Path(root_dir)
+    mmap = load_gradients(root_dir)
+    offsets = np.load(root_dir / "offsets.npy")
+    num_token_grads = np.diff(offsets).astype(np.int64)
+    return mmap, num_token_grads, offsets
 
-    skip_preconditioners: bool = False
-    """Whether to skip computing preconditioners for the gradients."""
 
-    stats_sample_size: int | None = 10_000
-    """Number of examples to use for estimating processor statistics."""
+class TokenGradients:
+    """Convenience wrapper around the flat per-token gradient memmap.
 
-    drop_columns: bool = False
-    """Only return the new dataset columns."""
+    Provides ``__getitem__`` to retrieve a single example's gradients as
+    a contiguous array of shape ``(num_token_grads[i], grad_dim)``.
 
-    loss_fn: Literal["ce", "kl"] = "ce"
-    """Loss function to use."""
+    Parameters
+    ----------
+    root_dir : Path | str
+        Directory produced by :func:`create_token_index`.
+    """
 
-    loss_reduction: Literal["mean", "sum"] = "mean"
-    """Reduction method for the loss function."""
+    def __init__(self, root_dir: Path | str):
+        self.mmap, self._num_token_grads, self._offsets = load_token_gradients(root_dir)
 
-    streaming: bool = False
-    """Whether to use streaming mode for the dataset."""
+    @property
+    def num_token_grads(self) -> np.ndarray:
+        return self._num_token_grads
 
-    stream_shard_size: int = 100_000
-    """Shard size for streaming the dataset into Dataset objects."""
+    def __len__(self) -> int:
+        return len(self._num_token_grads)
 
-    revision: str | None = None
-    """Revision of the model."""
-
-    head_cfgs: dict[str, HeadConfig] = field(default_factory=dict)
-    """Configuration for each attention module to be split into head matrices."""
+    def __getitem__(self, i: int) -> np.ndarray:
+        return np.asarray(self.mmap[self._offsets[i] : self._offsets[i + 1]])
 
 
 def ceildiv(a: int, b: int) -> int:
@@ -161,7 +187,12 @@ def ceildiv(a: int, b: int) -> int:
     return -(-a // b)  # Equivalent to math.ceil(a / b) but faster for integers
 
 
-def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[list[int]]:
+def allocate_batches(
+    doc_lengths: list[int],
+    N: int,
+    seed: int = 42,
+    max_batch_size: int | None = None,
+) -> list[list[int]]:
     """
     Allocate documents into batches that are then distributed evenly across
     a fixed number of workers.
@@ -174,7 +205,8 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
     N : int
         Hard memory budget per *batch*, expressed as
         ``max(length in batch) * (# docs in batch) ≤ N``.
-
+    seed : int
+        Random seed for shuffling batches within each worker's allocation.
     Returns
     -------
     list[list[int]]
@@ -198,10 +230,47 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    if len(doc_lengths) < world_size:
-        raise RuntimeError("Not enough documents to distribute across workers.")
+    (batches,) = _allocate_batches_world(
+        doc_lengths, N, world_size, seed, ranks=[rank], max_batch_size=max_batch_size
+    )
+    return batches
 
-    docs_sorted = sorted(enumerate(doc_lengths), key=lambda x: x[1], reverse=True)
+
+def _allocate_batches_world(
+    doc_lengths: list[int],
+    N: int,
+    world_size: int,
+    seed: int = 42,
+    ranks: list[int] | None = None,
+    max_batch_size: int | None = None,
+) -> list[list[list[int]]]:
+    """Lower-level version of allocate_batches that returns batches for specified ranks.
+
+    If ranks is None, returns batches for all ranks.
+    """
+    if ranks is None:
+        ranks = list(range(world_size))
+    # Skip documents shorter than 2 tokens: they cannot produce a valid
+    # next-token label so they contribute no gradient.  Keeping them would
+    # also be problematic for length-0 documents which create [N, 0] tensors
+    # that hang the model forward pass.  These documents are simply omitted
+    # from batches; their gradient index entries stay at the pre-initialized
+    # zero value.
+    docs_sorted = sorted(
+        ((i, l) for i, l in enumerate(doc_lengths) if l >= 2),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    n_skipped = len(doc_lengths) - len(docs_sorted)
+    if n_skipped > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+        print(
+            f"Skipping {n_skipped} documents with fewer than 2 tokens "
+            f"(no valid next-token labels)."
+        )
+    if len(docs_sorted) < world_size:
+        raise RuntimeError(
+            "Not enough documents (with 2+ tokens) to distribute across workers."
+        )
     if docs_sorted[0][1] > N:  # a single document would overflow any batch
         raise RuntimeError(
             f"At least one document is too long for the token batch size {N}."
@@ -221,7 +290,10 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
         else:
             # Check if adding this document would exceed the budget
             new_cost = max(length, doc_lengths[cur_batch[0]]) * (len(cur_batch) + 1)
-            if new_cost <= N:
+            within_count = (
+                max_batch_size is None or len(cur_batch) + 1 <= max_batch_size
+            )
+            if new_cost <= N and within_count:
                 # It fits, so add it to the current batch
                 cur_batch.append(idx)
             else:
@@ -237,17 +309,30 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
     # 2) Ensure every worker gets ≥ 1 batch
     # ---------------------------------------------------------------------
     if len(batches) < world_size:
-        # split the largest batches (by size) until we have ≥ workers batches
-        batches.sort(key=len, reverse=True)
-        while len(batches) < world_size:
-            big = batches.pop(0)  # take the current largest
-            if len(big) == 1:  # cannot split a singleton
+        # Heapify
+        counter = 0
+        heap: list[tuple[int, int, list[int]]] = []
+        for batch in batches:
+            heapq.heappush(heap, (-len(batch), counter, batch))
+            counter += 1
+
+        # Split large batches until we have >= workers batches.
+        # Use an inverted min heap rather than a max heap for old
+        # python version support.
+        while len(heap) < world_size:
+            _, _, big = heapq.heappop(heap)
+            if len(big) == 1:
+                # Every remaining bin in the heap is a singleton,
+                # so the constraint is unsatisfiable.
                 raise RuntimeError(
                     "Not enough documents to give each worker at least one batch."
                 )
-            batches.append([big.pop()])  # move one doc into new batch
-            batches.append(big)  # put the remainder back
-            # preserve cost constraint automatically
+            singleton = [big.pop()]
+            heapq.heappush(heap, (-len(big), counter, big))
+            counter += 1
+            heapq.heappush(heap, (-1, counter, singleton))
+            counter += 1
+        batches = [b for _, _, b in heap]
 
     # ---------------------------------------------------------------------
     # 3) Pad the number of batches to a multiple of `workers`
@@ -257,7 +342,7 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
 
     # Split arbitrary (non-singleton) batches until we reach the target
     i = 0
-    while len(batches) < target_batches:
+    while len(batches) < target_batches and i < len(batches):
         batch = batches[i % len(batches)]
         if len(batch) == 1:
             i += 1  # try another batch
@@ -265,7 +350,11 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
         batches.append([batch.pop()])  # split off a singleton
         i += 1
 
-    assert len(batches) == target_batches
+    assert len(batches) == target_batches, (
+        "Could not construct a number of batches divisible by the world size."
+        " If variability of item lengths in your dataset is low "
+        "consider using a different dataset size or token batch size."
+    )
     assert all(
         max(doc_lengths[i] for i in batch) * len(batch) <= N for batch in batches
     )
@@ -280,35 +369,50 @@ def allocate_batches(doc_lengths: list[int], N: int, seed: int = 42) -> list[lis
     # Sanity: equal # of batches per worker
     assert len({len(b) for b in allocation}) == 1
 
-    # Break any systematic ordering of batches
-    random.seed(seed)
-    random.shuffle(allocation[rank])
+    # Break any systematic ordering of batches (shuffle only requested ranks)
+    for rank in ranks:
+        random.seed(seed)
+        random.shuffle(allocation[rank])
 
-    return allocation[rank]
+    return [allocation[rank] for rank in ranks]
+
+
+def column_offsets(grad_sizes: dict[str, int]) -> dict[str, tuple[int, int]]:
+    """Map each module name to its ``(start, end)`` column range in a flat
+    ``(num_grads, total_grad_dim)`` gradient array laid out in `grad_sizes`
+    order (the on-disk layout of :func:`create_index`)."""
+    offsets = {}
+    start = 0
+    for name, size in grad_sizes.items():
+        offsets[name] = (start, start + size)
+        start += size
+    return offsets
 
 
 def create_index(
-    root: str, num_grads: int, grad_sizes: dict[str, int], dtype: DTypeLike
+    root: Path,
+    num_grads: int,
+    grad_sizes: dict[str, int],
+    dtype: DTypeLike,
 ) -> np.memmap:
-    """Create a memory-mapped file for storing structured gradients
-    and persist metadata."""
-    grad_path = os.path.join(root, "gradients.bin")
-    rank = dist.get_rank() if dist.is_initialized() else 0
+    """Create a memory-mapped ``(num_grads, total_grad_dim)`` gradient file
+    (modules laid out in `grad_sizes` order) and persist metadata.
 
-    # Build a json-serializable structured dtype
-    struct_dtype = {
-        "names": [name for name in grad_sizes.keys()],
-        "formats": [f"({size},){np.dtype(dtype).str}" for size in grad_sizes.values()],
-        "itemsize": np.dtype(dtype).itemsize * sum(grad_sizes.values()),
-    }
+    Same on-disk format as :func:`create_token_index` minus ``offsets.npy``:
+    row ``i`` is example *i*'s gradients directly (``num_grads ==
+    num_items``), rather than a range picked out by ``offsets``.
+    """
+    grad_path = root / "gradients.bin"
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    itemsize = np.dtype(dtype).itemsize * sum(grad_sizes.values())
 
     # ── 1. Rank-0 creates file & metadata exactly once ─────────────────────────
     if rank == 0:
         # Ensure the directory exists
-        os.makedirs(root, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True)
 
         # Allocate (extends file to right size without writing zeros byte-by-byte)
-        nbytes = np.dtype(struct_dtype).itemsize * num_grads  # type: ignore
+        nbytes = itemsize * num_grads
         with open(grad_path, "wb") as f:
             f.truncate(nbytes)
 
@@ -316,8 +420,18 @@ def create_index(
             os.fsync(f.fileno())
 
         # Persist metadata for future runs
-        with open(root + "/info.json", "w") as f:
-            json.dump({"num_grads": num_grads, "dtype": struct_dtype}, f, indent=2)
+        with (root / "info.json").open("w") as f:
+            json.dump(
+                {
+                    "attribute_tokens": False,
+                    "num_items": num_grads,
+                    "num_grads": num_grads,
+                    "grad_sizes": grad_sizes,
+                    "base_dtype": np.dtype(dtype).name,
+                },
+                f,
+                indent=2,
+            )
 
     # ── 2. Everyone blocks until the file is definitely there & sized ─────────────
     if dist.is_initialized():
@@ -325,23 +439,32 @@ def create_index(
 
     return np.memmap(
         grad_path,
-        dtype=np.dtype(struct_dtype),  # type: ignore
+        dtype=np.dtype(dtype),
         mode="r+",
-        shape=(num_grads,),
+        shape=(num_grads, sum(grad_sizes.values())),
     )
 
 
 def load_data_string(
-    data_str: str, split: str = "train", streaming: bool = False
-) -> Dataset | IterableDataset:
+    data_str: str,
+    split: str = "train",
+    subset: str | None = None,
+    data_kwargs: str = "",
+) -> Dataset:
     """Load a dataset from a string identifier or path."""
     if data_str.endswith(".csv"):
-        ds = assert_type(Dataset, Dataset.from_csv(data_str))
+        ds = load_dataset("csv", data_files=data_str, split=split)
     elif data_str.endswith(".json") or data_str.endswith(".jsonl"):
-        ds = assert_type(Dataset, Dataset.from_json(data_str))
+        ds = load_dataset("json", data_files=data_str, split=split)
+    elif Path(data_str).is_dir() and (
+        (Path(data_str) / "dataset_info.json").exists()
+        or (Path(data_str) / "dataset_dict.json").exists()
+    ):
+        ds = load_from_disk(data_str, keep_in_memory=False)
     else:
         try:
-            ds = load_dataset(data_str, split=split, streaming=streaming)
+            kwargs = simple_parse_kwargs_string(data_kwargs)
+            ds = load_dataset(data_str, subset, split=split, **kwargs)
 
             if isinstance(ds, DatasetDict) or isinstance(ds, IterableDatasetDict):
                 raise NotImplementedError(
@@ -350,64 +473,271 @@ def load_data_string(
         except ValueError as e:
             # Automatically use load_from_disk if appropriate
             if "load_from_disk" in str(e):
-                ds = Dataset.load_from_disk(data_str, keep_in_memory=False)
+                ds = load_from_disk(data_str, keep_in_memory=False)
             else:
                 raise e
 
+    if isinstance(ds, DatasetDict):
+        if "[" in split or "+" in split:
+            raise NotImplementedError(
+                f"Split slicing/concatenation expressions are not supported "
+                f"for load_from_disk paths: {split!r}"
+            )
+        ds = ds[split]
+
+    ds = assert_type(Dataset, ds)
     return ds
 
 
-def load_gradients(root_dir: str) -> np.memmap:
-    """Map the structured gradients stored in `root_dir` into memory."""
+def load_gradients(root_dir: Path | str) -> np.memmap:
+    """Map the gradients stored in `root_dir` into memory as a flat
+    ``(num_grads, total_grad_dim)`` array, with modules laid out in
+    ``grad_sizes`` order (see :func:`column_offsets` for per-module slicing).
 
-    with open(os.path.join(root_dir, "info.json")) as f:
+    :func:`create_index` and :func:`create_token_index` write the same
+    ``gradients.bin`` layout -- ``num_grads`` is the row count either way
+    (``== num_items`` for a plain index, ``== total_tokens`` for a
+    per-token one). ``info["attribute_tokens"]`` only matters for callers
+    that need ``offsets.npy`` to know which rows belong to which document;
+    this function doesn't care.
+    """
+    root_dir = Path(root_dir)
+    with (root_dir / "info.json").open("r") as f:
         info = json.load(f)
 
-    dtype = info["dtype"]
-    num_grads = info["num_grads"]
+    if "base_dtype" in info:
+        dtype = np.dtype(info["base_dtype"])
+    else:
+        # Old stores lack base_dtype; recover the scalar dtype from a field format
+        dtype = np.dtype(info["dtype"]["formats"][0]).base
 
     return np.memmap(
-        os.path.join(root_dir, "gradients.bin"),
+        root_dir / "gradients.bin",
         dtype=dtype,
         mode="r",
-        shape=(num_grads,),
+        shape=(info["num_grads"], sum(info["grad_sizes"].values())),
     )
 
 
-# TODO 2025-08-01 Set default concatenate_gradients = False
-def load_gradient_dataset(root_dir: str, concatenate_gradients: bool = True) -> Dataset:
+class ModuleGradients:
+    """Dict-like, module-name-keyed view over a flat memmapped gradient store:
+    ``grads[name]`` returns the ``(num_grads, size)`` column slice for that
+    module."""
+
+    def __init__(self, mmap: np.memmap, grad_sizes: dict[str, int]):
+        self.mmap = mmap
+        self.offsets = column_offsets(grad_sizes)
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        lo, hi = self.offsets[name]
+        return self.mmap[:, lo:hi]
+
+    def __len__(self) -> int:
+        return len(self.mmap)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.offsets)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.offsets
+
+    def keys(self):
+        return self.offsets.keys()
+
+
+def load_module_gradients(root_dir: Path | str) -> ModuleGradients:
+    """Load the gradients stored in `root_dir` keyed by module name."""
+    root_dir = Path(root_dir)
+    with (root_dir / "info.json").open("r") as f:
+        grad_sizes = json.load(f)["grad_sizes"]
+
+    return ModuleGradients(load_gradients(root_dir), grad_sizes)
+
+
+def load_gradient_dataset(root_dir: Path) -> Dataset:
     """Load a dataset of gradients from `root_dir`."""
 
-    def load_shard(dir: str) -> Dataset:
+    def load_shard(dir: Path) -> Dataset:
+        ds = Dataset.load_from_disk(str(dir / "data.hf"))
+
+        # Add gradients to HF dataset.
         mmap = load_gradients(dir)
-        ds = Dataset.load_from_disk(dir + "/data.hf")
 
-        # concatenate the extracted module gradients into a single column
-        if concatenate_gradients:
-            unstructured_data = structured_to_unstructured(mmap)
-            flat = pa.array(unstructured_data.reshape(-1))
-            col_arrow = pa.FixedSizeListArray.from_arrays(
-                flat, unstructured_data.shape[1]
-            )
+        def _to_arrow(arr: np.ndarray) -> pa.Array:
+            """Convert numpy array to PyArrow, casting bfloat16 to float32."""
+            if arr.dtype == np.dtype("bfloat16"):
+                arr = arr.astype(np.float32)
+            return pa.array(arr)
 
-            ds = ds.add_column("gradients", col_arrow, new_fingerprint="gradients")
-        # Add a column for each module's gradient vectors
-        else:
-            for field_name in mmap.dtype.names:
-                flat = pa.array(mmap[field_name].reshape(-1))
-                col = pa.FixedSizeListArray.from_arrays(flat, mmap[field_name].shape[1])
-                ds = ds.add_column(field_name, col, new_fingerprint=field_name)
+        flat = _to_arrow(mmap.reshape(-1).copy())
+        col_arrow = pa.FixedSizeListArray.from_arrays(flat, mmap.shape[1])
+        ds = ds.add_column("gradients", col_arrow, new_fingerprint="gradients")
+
         return ds
 
-    root = Path(root_dir)
-
-    if (root / "data.hf").exists():
+    if (root_dir / "data.hf").exists():
         return load_shard(root_dir)
 
     # Flatten indices to avoid CPU OOM
     return concatenate_datasets(
-        [load_shard(str(path)) for path in sorted(root.iterdir()) if path.is_dir()]
+        [load_shard(path) for path in sorted(root_dir.iterdir()) if path.is_dir()]
     ).flatten_indices()
+
+
+class Scores:
+    """Score store written by
+    :class:`bergson.score.score_writer.MemmapSequenceScoreWriter` or
+    :class:`bergson.score.score_writer.MemmapTokenScoreWriter` -- both write
+    the same ``scores.bin`` layout (a structured ``(score_i, written_i))``
+    array), differing only in what a row means. ``offsets`` is set when the
+    store is per-token (``info["attribute_tokens"]``): row
+    ``offsets[i]:offsets[i+1]`` holds document ``i``'s per-token scores.
+    Otherwise row ``i`` is document ``i`` directly."""
+
+    def __init__(
+        self,
+        mmap: np.memmap,
+        info: dict[str, Any],
+        offsets: NDArray | None = None,
+    ):
+        self.mmap = mmap
+        self.info = info
+        self.offsets = offsets
+        self.num_scores = info["num_scores"]
+
+        self._score_fields = [f"score_{i}" for i in range(self.num_scores)]
+
+    def __len__(self) -> int:
+        return self.info["num_items"]
+
+    def __getitem__(self, key: Any) -> NDArray:
+        items = self.mmap[key]
+        return structured_to_unstructured(items[self._score_fields])
+
+    def get(self, key: Any, score_idx: int = 0) -> NDArray:
+        """Get scores for a specific score index."""
+        return self.mmap[key][f"score_{score_idx}"]
+
+    def is_written(self) -> bool:
+        """Check whether every stored cell has been written to."""
+        return all(np.all(self.mmap[f"written_{i}"]) for i in range(self.num_scores))
+
+    def to_grid(self) -> torch.Tensor:
+        """Unpack a per-token store into a zero-padded ``[docs, seq_len]``
+        grid (``[docs, seq_len, num_scores]`` when multi-query), so token
+        ``t`` of doc ``d`` lands at ``grid[d, t]`` -- the per-token training
+        weight layout. Only valid when ``offsets`` is set."""
+        assert self.offsets is not None, "to_grid() requires a per-token store"
+        num_docs = len(self)
+        tokens_per_doc = np.diff(self.offsets).astype(np.int64)
+        seq_len = int(tokens_per_doc.max()) + 1
+
+        grid = np.zeros((num_docs, seq_len, self.num_scores), dtype=np.float32)
+        for doc in range(num_docs):
+            grid[doc, : tokens_per_doc[doc]] = self[
+                self.offsets[doc] : self.offsets[doc + 1]
+            ]
+
+        scores = torch.from_numpy(grid)
+        return scores[..., 0] if self.num_scores == 1 else scores
+
+
+def load_scores(path: Path) -> Scores:
+    """Load a score store written by the standard scoring pipeline.
+
+    A score directory loads its ``scores.bin`` as :class:`Scores`, with
+    ``offsets`` set when ``info["attribute_tokens"]`` marks it as a per-token
+    store.
+    """
+    info_path = path / "info.json"
+    with open(info_path, "r") as f:
+        info = json.load(f)
+
+    mmap = np.memmap(
+        path / "scores.bin",
+        dtype=info["dtype"],
+        mode="r",
+        shape=(info["num_rows"],),
+    )
+    offsets = np.load(path / "offsets.npy") if info.get("attribute_tokens") else None
+
+    return Scores(mmap, info, offsets)
+
+
+def _load_legacy_pt_scores(score_path: str) -> tuple[torch.Tensor, bool]:
+    """Read a bare ``scores.pt`` written by a MAGIC run that predates score
+    directories.
+
+    A 2-D tensor is ambiguous — per-token scores are ``[docs, seq_len]`` and
+    per-query scores are ``[docs, queries]`` — so the run config beside it
+    decides: per-query iff the run used ``query_method: none``. Already in the
+    loss-diff convention, so nothing is negated.
+
+    TODO: Lucia Quirke remove December 2026
+    """
+    scores = torch.load(score_path, map_location="cpu")
+    if not isinstance(scores, torch.Tensor) or scores.ndim not in (2, 3):
+        return scores, False
+    if scores.ndim == 3:
+        return scores, True
+
+    cfg_path = Path(score_path).parent / CONFIG_FILENAME
+    if not cfg_path.is_file():
+        return scores, False
+
+    try:
+        steps = read_config(cfg_path)["steps"]
+    except (ValueError, yaml.YAMLError):
+        return scores, False
+
+    for step in steps:
+        for step_cfg in step.values():
+            if isinstance(step_cfg, dict):
+                return scores, step_cfg.get("query_method") == "none"
+    return scores, False
+
+
+def load_scores_loss_signed(score_path: str) -> tuple[torch.Tensor, bool]:
+    """Loads scores using the sign convention that negative scores reduce
+    query loss (proponents are negative)."""
+    # TODO: Lucia Quirke remove December 2026
+    if score_path.endswith(".pt"):
+        return _load_legacy_pt_scores(score_path)
+
+    loaded = load_scores(Path(score_path))
+    score_cfg = load_subconfig(score_path, "score_cfg", ScoreConfig)
+    negate = score_cfg is not None and score_cfg.higher_is_better
+
+    if loaded.offsets is not None:
+        scores = loaded.to_grid()
+    else:
+        arr = np.asarray(loaded[:])
+        # Copy: the slice is a read-only view onto the memmap.
+        out_dtype = arr.dtype if np.issubdtype(arr.dtype, np.floating) else np.float32
+        scores = torch.from_numpy(arr.astype(out_dtype, copy=True))
+
+    if negate:
+        scores = -scores
+    return scores, loaded.num_scores > 1
+
+
+def sorted_checkpoints(folder: str) -> list[tuple[int, str]]:
+    """
+    Return a list of (step, filepath) sorted by step
+    for files named like: step_<index>.ckpt
+    """
+    pattern = re.compile(r"step_(\d+)\.ckpt$")
+
+    checkpoints = []
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+
+        match = pattern.match(name)
+        if match:
+            step = int(match.group(1))
+            checkpoints.append((step, path))
+
+    return sorted(checkpoints, key=lambda x: x[0])
 
 
 def pad_and_tensor(
@@ -417,18 +747,43 @@ def pad_and_tensor(
     padding_value: int = 0,
     dtype: torch.dtype | None = torch.long,
     device: torch.device | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    sync_max_len: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pad a list of sequences to the same length and convert them to tensors.
-    Returns a tuple of padded sequences and labels. The labels are the same as the
-    sequences, but with -100 for the padding positions, which is useful for ignoring
-    padding in loss calculations.
+    Returns a tuple of (padded sequences, padded labels, shift_loss_masks,
+    collection_masks). The labels are the same as the sequences, but with -100
+    for the padding positions, which is useful for ignoring padding in loss
+    calculations.
+
+    Both masks are aligned with input positions. ``shift_loss_masks[i]`` is
+    True iff ``labels[i+1] != -100``, i.e. it marks the input positions whose
+    next-token prediction is supervised. ``collection_masks`` marks every
+    non-padding position but each sequence's last, independent of label
+    masking (the gradient-carrying positions).
+
+    When ``sync_max_len`` is True (default) and a process group is
+    initialized, the padding length is reduced to the global max across
+    ranks via an ``all_reduce``. This is required by callers that need
+    matching activation shapes across ranks (MAGIC, see PR #227). The
+    build-time gradient collector passes ``sync_max_len=False`` because
+    its bin-packer enforces a per-rank token budget
+    (``max_len × batch_size ≤ N``) that the global all-reduce silently
+    violates when ranks are assigned batches with very different
+    max_lens — a single long-example batch on one rank forces every
+    short-example batch on its peers to pad up to the long length,
+    blowing the budget by orders of magnitude.
     """
     if labels is None:
         labels = sequences
 
     # find max length
     max_len = max(len(seq) for seq in sequences)
+    if sync_max_len and dist.is_initialized():
+        max_len_tensor = torch.tensor(max_len, device=device)
+        dist.all_reduce(max_len_tensor, op=dist.ReduceOp.MAX)
+        max_len = int(max_len_tensor)
+
     # pad each sequence
     padded = [seq + [padding_value] * (max_len - len(seq)) for seq in sequences]
     labels = [label + [-100] * (max_len - len(label)) for label in labels]
@@ -436,16 +791,36 @@ def pad_and_tensor(
     # convert to tensor
     padded_tokens = torch.tensor(padded, dtype=dtype, device=device)
     padded_labels = torch.tensor(labels, dtype=dtype, device=device)
-    return padded_tokens, padded_labels
+
+    # shift_loss_masks[i] = labels[i+1] != -100
+    N, S = padded_tokens.shape
+    shift_loss_masks = torch.zeros(N, S, dtype=torch.bool, device=device)
+    shift_loss_masks[:, :-1] = padded_labels[:, 1:] != -100
+
+    # Compute collection_masks: every non-padding position but each
+    # sequence's last, regardless of label masking.
+    lengths = torch.tensor([len(seq) for seq in sequences], device=device)
+    positions = torch.arange(S, device=device)
+    collection_masks = (positions.unsqueeze(0) + 1) < lengths.unsqueeze(1)
+
+    return padded_tokens, padded_labels, shift_loss_masks, collection_masks
 
 
-def tokenize(batch: dict, *, args: DataConfig, tokenizer):
+def tokenize(
+    batch: dict,
+    *,
+    args: DataConfig,
+    tokenizer,
+    max_length: int | None = None,
+):
     """Tokenize a batch of data with `tokenizer` according to `args`."""
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         return_attention_mask=False,
         return_length=True,
         truncation=args.truncation,
     )
+    if args.truncation and max_length is not None:
+        kwargs["max_length"] = max_length
     if args.completion_column:
         # We're dealing with a prompt-completion dataset
         convos = [
@@ -465,22 +840,34 @@ def tokenize(batch: dict, *, args: DataConfig, tokenizer):
         return tokenizer(batch[args.prompt_column], **kwargs)
 
     # Make sure we only compute loss on the assistant's responses
+    # Chat templates already include special tokens (BOS/EOS) in the rendered
+    # string, so we must disable add_special_tokens to avoid duplicates (e.g.
+    # Llama 3 renders <|begin_of_text|> and would otherwise add a second BOS).
     strings = tokenizer.apply_chat_template(convos, tokenize=False)
-    encodings = tokenizer(strings, **kwargs)
+    encodings = tokenizer(strings, add_special_tokens=False, **kwargs)
     labels_list: list[list[int]] = []
 
     for i, convo in enumerate(convos):
-        # Find the spans of the assistant's responses in the tokenized output
-        pos = 0
+        # Find the spans (start, end) of the assistant's responses in the tokens
         spans: list[tuple[int, int]] = []
 
-        for msg in convo:
+        # We use rfind to find the last match in the string so if the answer is
+        # duplicated in the user prompt we don't select that.
+
+        # We work backwards through the messages and restrict the search to not
+        # use previously matching substrings so if two assistant messages
+        # have the same content they won't both match the right-most substring.
+        search_end = len(strings[i])
+
+        for msg in reversed(convo):
             if msg["role"] != "assistant":
                 continue
 
             ans = msg["content"]
-            start = strings[i].rfind(ans, pos)
+            start = strings[i].rfind(ans, 0, search_end)
             if start < 0:
+                print("String under test: ", strings[i])
+                print("Substring search: ", ans)
                 raise RuntimeError(
                     "Failed to find completion in the chat-formatted conversation. "
                     "Make sure the chat template does not alter the completion, e.g. "
@@ -488,22 +875,183 @@ def tokenize(batch: dict, *, args: DataConfig, tokenizer):
                 )
 
             # move past this match
-            pos = start + len(ans)
+            end = start + len(ans)
 
-            start_token = encodings.char_to_token(i, start)
-            end_token = encodings.char_to_token(i, pos)
-            spans.append((start_token, end_token))
+            start_token_idx = encodings.char_to_token(i, start)
+            end_token_idx = encodings.char_to_token(i, end)
+            # When end falls on the last char, char_to_token returns None;
+            # look up the token for the previous char and advance by one.
+            if end_token_idx is None and end > 0:
+                prev = encodings.char_to_token(i, end - 1)
+                if prev is not None:
+                    end_token_idx = prev + 1
+            spans.append((start_token_idx, end_token_idx))
+
+            # Update the boundary; the next message must be found before this one
+            search_end = start
+
+        spans = list(reversed(spans))
 
         # Labels are -100 everywhere except where the assistant's response is
         tokens = encodings["input_ids"][i]
         labels = [-100] * len(tokens)
         for start, end in spans:
-            if start is not None and end is not None:
-                labels[start:end] = tokens[start:end]
+            if start is None:
+                # Entire span is beyond the truncation boundary, so we skip.
+                continue
+            if end is None:
+                # Span starts in-bounds but extends past truncation, so we
+                # label up to the end of the truncated sequence
+                end = len(tokens)
+            labels[start:end] = tokens[start:end]
 
         labels_list.append(labels)
 
     return dict(**encodings, labels=labels_list)
+
+
+def tokenize_and_chunk(
+    dataset: Dataset,
+    tokenizer: PreTrainedTokenizerFast,
+    chunk_size: int,
+    text_column: str = "text",
+    *,
+    num_proc: int | None = None,
+) -> Dataset:
+    """
+    Tokenizes a text dataset and chunks tokens into uniform-length sequences.
+
+    Uses a streaming generator to carry remainder tokens across document
+    boundaries — no tokens are ever dropped, no padding is used, and memory
+    usage stays flat regardless of dataset size.
+
+    Args:
+        dataset:     HuggingFace Dataset with a text column.
+        tokenizer:   A HuggingFace tokenizer (must have eos_token_id set).
+        chunk_size:  Number of tokens per output chunk.
+        text_column: Name of the column containing raw text.
+        num_proc:    Number of processes for the tokenization .map() pass.
+                     Defaults to half the CPUs, capped so each process gets
+                     at least ~256 documents.
+
+    Returns:
+        A Dataset where every row has a single 'input_ids' list of length chunk_size.
+        The dataset has a doc_ids column of the same size as input_ids, that
+        maps chunk tokens to the corresponding doc ID in the input dataset.
+    """
+    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        raise ValueError("Tokenizer does not have an eos_token_id set.")
+
+    # Suppress long sequence errors
+    original_verbosity = logging.get_verbosity()
+    logging.set_verbosity_error()
+
+    # Add original index as column
+    n_before = len(dataset)
+    dataset = dataset.map(
+        lambda _, idx: {"_orig_idx": idx},
+        with_indices=True,
+        desc="Tagging original indices",
+    )
+
+    # Drop and log empty rows.
+    dataset = dataset.filter(
+        lambda row: isinstance(row[text_column], str)
+        and row[text_column].strip() != "",
+        desc="Filtering empty documents",
+    )
+    n_dropped = n_before - len(dataset)
+    if n_dropped > 0:
+        pct = n_dropped / n_before * 100
+        print(f"Warning: {n_dropped}/{n_before} empty documents " f"({pct:.1f}%).")
+
+    if num_proc is None:
+        num_proc = min(cpu_count() // 2, max(1, len(dataset) // 256))
+
+    # ── Step 1: tokenize each document in parallel ───────────────────────────
+    def tokenize_batch(batch):
+        out = tokenizer(
+            batch[text_column],
+            add_special_tokens=False,
+            truncation=False,
+            padding=False,
+        )
+        out["_orig_idx"] = batch["_orig_idx"]
+        return out
+
+    tokenized = dataset.map(
+        tokenize_batch,
+        batched=True,
+        desc="Tokenizing",
+        num_proc=num_proc,
+        remove_columns=[c for c in dataset.column_names if c != "_orig_idx"],
+    )
+
+    # ── Step 2: concatenate the token stream and slice into fixed-size chunks ──
+    def chunk_batch(batch):
+        # Flatten all token lists in this batch into one stream
+        doc_stream = []
+        token_stream = []
+        for doc_idx, ids in zip(batch["_orig_idx"], batch["input_ids"]):
+            # Mark these tokens as belonging to the current document
+            doc_stream.extend([doc_idx] * (len(ids) + 1))  # +1 for EOS token
+
+            token_stream.extend(ids)
+            token_stream.append(eos_id)  # ensure document boundary tokens
+
+        # Slice into complete chunks; keep the remainder for the next batch
+        # NOTE: .map() does NOT carry state between batches, so any tokens that
+        # don't fill a complete chunk at the end of a batch are dropped.
+        # To avoid this, set batch_size large enough (or process as a single batch)
+        # so that tail loss is negligible, OR use the single-process approach below.
+        n_chunks = len(token_stream) // chunk_size
+        doc_chunks = [
+            doc_stream[i * chunk_size : (i + 1) * chunk_size] for i in range(n_chunks)
+        ]
+        token_chunks = [
+            token_stream[i * chunk_size : (i + 1) * chunk_size] for i in range(n_chunks)
+        ]
+        return {
+            "input_ids": token_chunks,
+            "doc_ids": doc_chunks,
+            "length": [chunk_size] * n_chunks,
+        }
+
+    # Cap parallelism so each worker gets enough documents to fill many chunks,
+    # since tail tokens that don't fill a chunk are dropped per-worker.
+    min_docs_per_worker = chunk_size * 4
+    num_proc = min(num_proc, max(len(tokenized) // min_docs_per_worker, 1))
+    bs = min(10_000, len(tokenized) // num_proc)
+    chunked = tokenized.map(
+        chunk_batch,
+        batched=True,
+        batch_size=bs,
+        num_proc=num_proc,
+        desc="Chunking",
+        remove_columns=tokenized.column_names,
+    )
+    # Make sure HuggingFace didn't change the dataset type!
+    assert isinstance(chunked, type(dataset))
+
+    # Warn if chunking dropped a significant number of documents
+    n_docs = len(dataset)
+    if n_docs > 0 and "doc_ids" in chunked.column_names:
+        represented = set()
+        for doc_ids in chunked["doc_ids"]:
+            represented.update(doc_ids)
+        n_dropped = n_docs - len(represented)
+        if n_dropped > 0:
+            pct = n_dropped / n_docs * 100
+            print(
+                f"Warning: chunking dropped {n_dropped}/{n_docs} short documents"
+                f" ({pct:.1f}%) that didn't fill a {chunk_size}-token chunk "
+                f"when using a document batch size of {bs}."
+            )
+
+    # Restore original logging level
+    logging.set_verbosity(original_verbosity)
+    return chunked
 
 
 def unflatten(x: torch.Tensor, shapes: dict[str, Sequence[int]], dim: int = -1):
