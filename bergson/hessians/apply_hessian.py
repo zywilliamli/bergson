@@ -1,0 +1,273 @@
+import json
+import os
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from simple_parsing import ArgumentParser
+
+from bergson.collector.collector import create_projection_matrix
+from bergson.config import InversionConfig
+from bergson.data import column_offsets, create_index, load_gradients
+from bergson.distributed import init_dist
+from bergson.hessians.preconditioner import (
+    DiagonalFactoredPreconditioner,
+    FactoredPreconditioner,
+)
+from bergson.utils.logger import get_logger
+from bergson.utils.utils import get_device, numpy_to_tensor
+
+
+@dataclass
+class EkfacConfig:
+    hessian_method_path: str
+    gradient_path: str
+    run_path: str
+    ev_correction: bool
+    """If True, use the corrected eigenvalues, this requires
+    `hessian_method_path` to have been created with
+    `HessianConfig.ev_correction=True`."""
+    apply_batch_size: int = 32
+    """Number of query gradients moved on-device and preconditioned at a time."""
+    projection_dim: int = 0
+    """When set, compress each module's IVHP output to a ``[p, p]`` Kronecker
+    random projection (``P_S @ (H^-1 G) @ P_A^T``)."""
+    projection_type: Literal["normal", "rademacher"] = "rademacher"
+    projection_scale: Literal["jl", "row_norm"] = "jl"
+    """Must match the index being scored. See ``IndexConfig``."""
+    preconditioner_path: str = ""
+    """Safetensors of a diagonal optimizer preconditioner (module name ->
+    [out, in] grid), for the Adam SOURCE variant."""
+    debug: bool = False
+
+
+class EkfacApplicator:
+    """Distributed runner that applies a factored inverse Hessian to stored
+    gradients and writes the result to disk.
+
+    Loads each rank's factor shards into a
+    :class:`~bergson.hessians.preconditioner.FactoredPreconditioner`, reads the
+    gradients from the mmap into memory, applies the preconditioner, and
+    writes the transformed gradients to ``run_path``. The low-level logic lives in the
+    preconditioner. Pass ``inversion_cfg`` for a standard inversion, or ``apply_fn``
+    for a custom eigenvalue function (e.g. approximate unrolling). Both only with
+    ``preconditioner_path``, where the EK-FAC inverse from ``inversion_cfg`` is
+    applied after ``apply_fn``'s elementwise multiplier.
+    """
+
+    def __init__(
+        self,
+        cfg: EkfacConfig,
+        inversion_cfg: InversionConfig | None = None,
+        apply_fn=None,
+    ):
+        if (
+            inversion_cfg is not None
+            and apply_fn is not None
+            and not cfg.preconditioner_path
+        ):
+            raise ValueError("Pass either inversion_cfg or apply_fn, not both.")
+
+        if cfg.projection_dim > 0 and cfg.ev_correction:
+            raise ValueError(
+                "projection_dim compression is not supported with EK-FAC "
+                "(ev_correction=True); set ev_correction=False or "
+                "projection_dim=0."
+            )
+
+        self.cfg = cfg
+        self.path = cfg.hessian_method_path
+        self.gradient_path = cfg.gradient_path
+        self.apply_fn = apply_fn
+        self.inversion_cfg = inversion_cfg
+
+        self.logger = get_logger(
+            "EkfacApplicator", level="DEBUG" if cfg.debug else "INFO"
+        )
+        get_logger("FactoredPreconditioner", level="DEBUG" if cfg.debug else "INFO")
+
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.device = get_device(self.rank)
+
+    def compute_ivhp_sharded(self):
+        chain: list = []
+        if self.cfg.preconditioner_path:
+            if self.apply_fn is None:
+                raise ValueError("preconditioner_path requires apply_fn.")
+            diagonal = DiagonalFactoredPreconditioner.from_shards(
+                self.path,
+                self.cfg.preconditioner_path,
+                rank=self.rank,
+                device=self.device,
+                apply_fn=self.apply_fn,
+                ev_correction=self.cfg.ev_correction,
+            )
+            if self.inversion_cfg is not None:
+                # Bae et al. App. D: "use the diagonal Hessian approximation for
+                # computing the matrix exponential ... Note that we still use the
+                # EK-FAC factors to compute H^-1 g in Equation 43."
+                # Eq-43 reads M_mask @ H^-1 @ g_train; applied to the QUERY
+                # gradient that is the adjoint H^-1 @ M_mask @ q, so the
+                # diagonal mask goes first and the EK-FAC inverse second.
+                chain.append(diagonal)
+                preconditioner = FactoredPreconditioner.from_shards(
+                    self.path,
+                    rank=self.rank,
+                    device=self.device,
+                    inversion_cfg=self.inversion_cfg or InversionConfig(),
+                    ev_correction=self.cfg.ev_correction,
+                )
+            else:
+                preconditioner = diagonal
+        else:
+            preconditioner = FactoredPreconditioner.from_shards(
+                self.path,
+                rank=self.rank,
+                device=self.device,
+                inversion_cfg=(
+                    None if self.apply_fn is not None else self.inversion_cfg
+                ),
+                apply_fn=self.apply_fn,
+                ev_correction=self.cfg.ev_correction,
+            )
+
+        o_dims = {
+            name: preconditioner.eigen_g[name].shape[1]
+            for name in preconditioner.eigen_a
+        }
+        i_dims = {
+            name: preconditioner.eigen_a[name].shape[1]
+            for name in preconditioner.eigen_a
+        }
+
+        p = self.cfg.projection_dim
+        grad_sizes = {
+            name: p * p if p > 0 else o_dims[name] * i_dims[name]
+            for name in preconditioner.eigen_a
+        }
+
+        mmap = load_gradients(self.gradient_path)
+        with open(os.path.join(self.gradient_path, "info.json")) as f:
+            info = json.load(f)
+        in_offsets = column_offsets(info["grad_sizes"])
+
+        num_queries = mmap.shape[0]
+        grad_buffer = create_index(
+            Path(self.cfg.run_path),
+            num_grads=num_queries,
+            grad_sizes=grad_sizes,
+            dtype=np.float32,
+        )
+        out_offsets = column_offsets(grad_sizes)
+        self.logger.info(
+            f"Loaded gradients for {num_queries} queries and computing IVHP..."
+        )
+
+        # Precondition the queries
+        for start in range(0, num_queries, self.cfg.apply_batch_size):
+            end = min(start + self.cfg.apply_batch_size, num_queries)
+
+            # The gradients are mmap'd read-only which pytorch doesn't
+            # support: suppress the warning (the preconditioner returns
+            # fresh tensors.
+            grads: dict[str, torch.Tensor] = {}
+            for name in preconditioner.eigen_a:
+                lo, hi = in_offsets[name]
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="The given NumPy array is not writable",
+                        category=UserWarning,
+                    )
+                    grads[name] = numpy_to_tensor(mmap[start:end, lo:hi]).to(
+                        device=self.device, dtype=torch.float32
+                    )
+
+            for pre in chain:
+                grads = pre.apply(grads)
+            transformed = preconditioner.apply(grads)
+            del grads
+
+            self.logger.debug("Finished H^{-1} G = Q_S @ (G' / lambda) @ Q_A^T batch")
+
+            if p > 0:
+                for name, flat in transformed.items():
+                    if name not in o_dims:
+                        continue
+                    g = flat.view(-1, o_dims[name], i_dims[name])
+                    P_l = create_projection_matrix(
+                        f"{name}/left",
+                        p,
+                        o_dims[name],
+                        g.dtype,
+                        g.device,
+                        self.cfg.projection_type,
+                        self.cfg.projection_scale,
+                    )
+                    P_r = create_projection_matrix(
+                        f"{name}/right",
+                        p,
+                        i_dims[name],
+                        g.dtype,
+                        g.device,
+                        self.cfg.projection_type,
+                        self.cfg.projection_scale,
+                    )
+                    transformed[name] = torch.einsum("ps,nsa,ra->npr", P_l, g, P_r)
+                self.logger.debug("Compressed IVHP output to [p, p] per module")
+
+            # Stage the async D2H copies, synchronize once, then read them
+            # into the numpy buffer. `.numpy()` is a host read so the
+            # sync must sit between it and the copies.
+            staged = {
+                name: v.to(device="cpu", non_blocking=True)
+                for name, v in transformed.items()
+            }
+            del transformed
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            for name, t in staged.items():
+                lo, hi = out_offsets[name]
+                grad_buffer[start:end, lo:hi] = t.flatten(1).numpy()
+
+        self.logger.debug("Finished H^{-1} G = Q_S @ (G' / lambda) @ Q_A^T")
+
+        grad_buffer.flush()
+
+        self.logger.info(f"Saved IVHP gradients to {self.cfg.run_path}")
+
+
+def apply_worker(
+    rank: int,  # global
+    local_rank: int,  # local
+    world_size: int,
+    cfg: EkfacConfig,
+    inversion_cfg: InversionConfig,
+):
+    """Worker function for distributed IVHP computation."""
+    init_dist(rank, local_rank, world_size)
+
+    applicator = EkfacApplicator(cfg, inversion_cfg=inversion_cfg)
+    applicator.compute_ivhp_sharded()
+
+
+if __name__ == "__main__":
+    from bergson.config import DistributedConfig
+    from bergson.distributed import launch_distributed_run
+
+    parser = ArgumentParser()
+    parser.add_arguments(EkfacConfig, dest="cfg")
+    parser.add_arguments(InversionConfig, dest="inversion_cfg")
+    args = parser.parse_args()
+
+    launch_distributed_run(
+        "apply_hessian",
+        apply_worker,
+        [args.cfg, args.inversion_cfg],
+        DistributedConfig(),
+    )

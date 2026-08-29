@@ -1,0 +1,63 @@
+# GPT-2 / WikiText MAGIC run with the hyperparameters *as stated in the paper*
+# (Section 5.1 / Table 1): batch size 64, Adam root-epsilon 1e-6, 50 query
+# items, and N = 400 leave-1%-out retrained models for the linear datamodeling
+# score.
+#
+# Provenance: this is the recipe that was in examples/magic/gpt2_wikitext.yaml
+# until 2026-08-03 (eps_root 1e-6 / bs 64), with the validation block written in
+# the current config schema. The other YAMLs in this directory use the later
+# recipe (bs 256 / eps_root 1e-8 / N = 100) whose per-query results are listed
+# in README.md; the two recipes give different LDS values, so use this file
+# when checking the numbers reported in the paper and magic.yaml when
+# checking README.md.
+#
+# Run with `bergson examples/compare_wikitext/magic_paper_bs64_eps1e-6.yaml`
+# (8 GPUs assumed; lower `distributed.nproc_per_node` for smaller machines and
+# raise `grad_accum_steps` to keep the effective batch size at 64).
+
+run_path: runs/compare_wikitext/magic_paper
+steps:
+  - magic:
+      run_path: runs/compare_wikitext/random_paper
+      model: gpt2
+      overwrite: true
+      resume: true
+      cleanup_ckpts: false
+
+      weight_decay: 0.01
+      adam_eps: 1.0e-8
+      # Root epsilon as reported in the paper.
+      eps_root: 1.0e-6
+      loss_reduction: mean
+
+      data:
+        dataset: EleutherAI/bergson-wikitext-512-chunks
+        split: "train"
+        chunk_length: 0
+
+      query:
+        dataset: EleutherAI/bergson-wikitext-512-chunks
+        split: "test[0:50]"
+        chunk_length: 0
+
+      distributed:
+        nproc_per_node: 8
+        nnode: 1
+
+      batch_size: 64
+      double_backward_batch_size: 8
+      num_epochs: 4
+      lr_schedule:
+        lr_scheduler_type: polynomial
+        lr: 0.0008
+        lr_start: 1e-6
+        lr_end: 0.00008
+        warmup_steps: 0.25
+
+      # Leave-1%-out LDS validation over N = 400 retrained models.
+      skip_validation: false
+      num_subsets: 400
+      subset_fraction: 0.01
+
+      save_models: true
+      save_optimizer_state: last
